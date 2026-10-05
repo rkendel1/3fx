@@ -23,6 +23,7 @@ pub const TopLevelKind = enum {
     slack,
     models,
     provider,
+    providers,
     doctor,
     teams,
     session,

@@ -15,7 +15,7 @@ fx is a coding agent CLI written in Zig: a small native binary that is open sour
 
 ## Highlights
 
-- **Any model:** Vercel AI Gateway, ChatGPT or Grok subscriptions, or your own OpenAI-compatible endpoint such as Ollama or OpenRouter
+- **Local or remote models:** credential-free Ollama or a configured OpenAI-compatible endpoint. Existing Gateway and subscription integrations remain optional.
 - **Any interface:** interactive shell, one-shot `fx ask` for scripts, or embedded through libfx and ACP
 - **Shell-like output:** inline rendering that preserves your terminal scrollback
 - **Extensible:** skills, MCP servers, and subagents
@@ -34,27 +34,42 @@ curl -fsSL https://fx.sh/setup.sh | bash
 
 ## Get started
 
-Sign in with one of:
+Choose a model endpoint before starting the agent. No vendor login is required for a local endpoint.
 
-- `fx login`: Vercel AI Gateway
-- `fx login codex`: ChatGPT subscription (OpenAI Codex OAuth)
-- `fx login grok`: Grok subscription (xAI OAuth)
-- `fx setup`: AI Gateway API key
-
-fx loads Grok models from your subscription's live catalog, so new supported models appear without a static model list. Public xAI metadata enriches image support but does not filter subscription models.
-
-Then start the interactive shell from a project:
+With Ollama running and `qwen3-coder` downloaded:
 
 ```bash
 cd your_project
-fx
+fx --provider ollama --model qwen3-coder
 ```
 
-Or make a one-shot request:
+To use plain `fx`, save this profile in `~/.fx/settings.json`:
+
+```json
+{ "provider": "ollama" }
+```
+
+For another OpenAI-compatible endpoint, use the portable configuration:
+
+```json
+{
+  "provider": {
+    "type": "openai-compatible",
+    "baseURL": "http://localhost:1234/v1",
+    "model": "your-local-model"
+  }
+}
+```
+
+Run `fx providers` to inspect the selected connection without contacting an account service. If no provider is configured, `fx` prints configuration guidance instead of starting a login flow.
+
+For one-shot requests, select the provider through your profile or the environment:
 
 ```bash
-fx ask "explain the changes in this repository"
+FX_PROVIDER=ollama FX_MODEL=qwen3-coder fx ask "explain the changes in this repository"
 ```
+
+See [Standalone model providers](docs/standalone-model-providers.md) for remote credentials, source-build checks, and the remaining boundary work. Existing `fx login`, `fx login codex`, `fx login grok`, and `fx setup` commands remain available for users who explicitly choose those integrations.
 
 Inside the shell, run `/help` to browse interactive commands.
 

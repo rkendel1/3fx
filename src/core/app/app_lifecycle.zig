@@ -710,6 +710,7 @@ fn loadStartupStateWithKeychainRead(
 
     // A launch --provider override must bind configured provider names against
     // the registry just like the settings and FX_PROVIDER paths do.
+    try config_runtime.ensureProviderPreset(alloc, settings, provider_override);
     const bound_override = if (provider_override) |override|
         try override.bind(settings.providers orelse .{})
     else
@@ -784,7 +785,7 @@ fn loadStartupStateWithKeychainRead(
     state.ultrafast_mode_source = detailed.sources.ultrafast_mode;
     state.slash_menu_categories = settings.slash_menu_categories orelse true;
     state.collapse_tool_calls = settings.collapse_tool_calls orelse false;
-    state.auto_upgrade = settings.auto_upgrade orelse true;
+    state.auto_upgrade = settings.auto_upgrade orelse (state.provider != .configured);
     state.update_channel = settings.update_channel orelse .stable;
     state.startup_scrollback = settings.startup_scrollback orelse true;
     state.theme = if (settings.theme) |value| try alloc.dupe(u8, value) else null;
@@ -863,7 +864,7 @@ pub fn bootstrapInteractiveApp(cfg: BootstrapConfig) !StartupState {
     );
     errdefer state.deinit(cfg.alloc);
 
-    state.credential_onboarding_skipped = cfg.auth_mode == .host_managed or credentialOnboardingDisabled();
+    state.credential_onboarding_skipped = state.provider == .configured or cfg.auth_mode == .host_managed or credentialOnboardingDisabled();
 
     errdefer shutdownInteractiveShell(
         cfg.terminal,

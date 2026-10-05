@@ -331,7 +331,7 @@ pub fn selectProviderModel(
         .gateway => default_model,
         .codex => run_model orelse return error.CodexModelNotSelected,
         .grok => run_model orelse return error.GrokModelNotSelected,
-        .configured => run_model orelse return error.ConfiguredModelNotSelected,
+        .configured => run_model orelse if (std.mem.eql(u8, provider.label(), "ollama")) "qwen3-coder" else return error.ConfiguredModelNotSelected,
     };
     return .{ .provider = provider, .model = model };
 }
@@ -347,10 +347,18 @@ pub fn modelNotSelectedMessage(err: anyerror) ?[]const u8 {
     };
 }
 
-fn resolve_provider_selection(settings: *Settings) !void {
+pub fn ensureProviderPreset(alloc: Allocator, settings: *Settings, provider: ?model_provider.ProviderId) !void {
+    const selected = provider orelse return;
+    if (selected != .configured or !std.mem.eql(u8, selected.label(), "ollama")) return;
+    if (settings.providers == null) settings.providers = .{};
+    try settings.providers.?.ensure_ollama(alloc);
+}
+
+fn resolve_provider_selection(alloc: Allocator, settings: *Settings) !void {
     if (providerEnvOverride()) |raw| {
         settings.provider = model_provider.parse(raw) orelse return error.InvalidProviderValue;
     }
+    try ensureProviderPreset(alloc, settings, settings.provider);
     if (settings.provider) |provider| settings.provider = try provider.bind(settings.providers orelse .{});
 }
 
@@ -358,13 +366,24 @@ fn resolve_provider_selection(settings: *Settings) !void {
 pub fn loadConfiguredProviders(alloc: Allocator) !configured_provider.Registry {
     var paths = try discoverPaths(alloc, ".");
     defer paths.deinit(alloc);
-    const bytes = (try readOptionalUserSettingsFile(alloc, paths)) orelse return .{};
-    defer alloc.free(bytes);
-    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, bytes, .{ .duplicate_field_behavior = .@"error" });
-    defer parsed.deinit();
-    if (parsed.value != .object) return error.InvalidSettingsShape;
-    const definitions = parsed.value.object.get("providers") orelse return .{};
-    return configured_provider.Registry.parse(alloc, definitions);
+    var registry: configured_provider.Registry = .{};
+    errdefer registry.deinit(alloc);
+    if (try readOptionalUserSettingsFile(alloc, paths)) |bytes| {
+        defer alloc.free(bytes);
+        var parsed = try std.json.parseFromSlice(std.json.Value, alloc, bytes, .{ .duplicate_field_behavior = .@"error" });
+        defer parsed.deinit();
+        if (parsed.value != .object) return error.InvalidSettingsShape;
+        var settings: Settings = .{};
+        defer settings.deinit(alloc);
+        if (parsed.value.object.get("providers")) |value| settings.providers = try configured_provider.Registry.parse(alloc, value);
+        if (parsed.value.object.get("provider")) |value| {
+            if (value == .object) try parseStandaloneProvider(&settings, alloc, value);
+        }
+        registry = settings.providers orelse .{};
+        settings.providers = null;
+    }
+    try registry.ensure_ollama(alloc);
+    return registry;
 }
 
 pub fn loadMergedSettings(alloc: Allocator, workspace_root: []const u8) !Settings {
@@ -629,7 +648,7 @@ fn loadMergedSettingsDetailedWithOptionalHome(
         }
     }
 
-    try resolve_provider_selection(&settings);
+    try resolve_provider_selection(alloc, &settings);
     if (providerEnvOverride() != null) sources.provider = .process_override;
     if (modelEnvOverride() != null) {
         const override_provider = model_provider.NameKey.fromProvider(settings.provider orelse .gateway);
@@ -1291,12 +1310,12 @@ pub fn loadMergedSettingsFromPaths(alloc: Allocator, paths: Paths) !Settings {
         try mergeSettings(&settings, &user_settings, alloc);
 
         try mergeWorkspaceOverridesFromValue(&settings, alloc, parsed.value, paths.workspace_root);
-        try resolve_provider_selection(&settings);
+        try resolve_provider_selection(alloc, &settings);
         return settings;
     }
 
     try mergeSettingsFile(&settings, alloc, paths.workspace_settings);
-    try resolve_provider_selection(&settings);
+    try resolve_provider_selection(alloc, &settings);
     return settings;
 }
 
@@ -1614,6 +1633,13 @@ fn parseSettingsValueForLayer(
     if (layer == .profile) {
         if (root.object.get("providers")) |value| settings.providers = try configured_provider.Registry.parse(alloc, value);
     }
+    // Workspace preferences may select an existing connection, but cannot
+    // introduce or rebind the endpoint that receives project data.
+    if (layer == .profile_workspace) {
+        if (root.object.get("provider")) |value| {
+            if (value == .object) return error.InvalidProviderType;
+        }
+    }
     if (layer != .project) try parseProfileOnlyFields(
         &settings,
         alloc,
@@ -1624,6 +1650,20 @@ fn parseSettingsValueForLayer(
     try parseProjectSafeFields(&settings, alloc, root);
 
     return settings;
+}
+
+/// Normalize the portable single-provider form into the existing registry.
+/// Authentication is an optional environment slot, never a vendor account.
+fn parseStandaloneProvider(settings: *Settings, alloc: Allocator, value: std.json.Value) !void {
+    if (settings.providers != null) return error.InvalidProviderValue;
+    const portable = try configured_provider.Portable.parse(value);
+    var scratch = std.heap.ArenaAllocator.init(alloc);
+    defer scratch.deinit();
+    var definitions: std.json.Value = .{ .object = .empty };
+    try definitions.object.put(scratch.allocator(), "custom", try portable.definition_value(scratch.allocator()));
+    settings.providers = try configured_provider.Registry.parse(alloc, definitions);
+    settings.provider = model_provider.parse("custom").?;
+    try settings.models.putCopy(alloc, settings.provider.?, portable.model);
 }
 
 fn parseProfileOnlyFields(
@@ -1647,9 +1687,11 @@ fn parseProfileOnlyFields(
     }
 
     if (root.object.get("provider")) |provider_value| {
-        if (provider_value != .string) return error.InvalidProviderType;
-        settings.provider = model_provider.parse(provider_value.string) orelse
-            return error.InvalidProviderValue;
+        if (provider_value == .string) {
+            settings.provider = model_provider.parse(provider_value.string) orelse return error.InvalidProviderValue;
+        } else if (provider_value == .object) {
+            try parseStandaloneProvider(settings, alloc, provider_value);
+        } else return error.InvalidProviderType;
     }
 
     if (root.object.get("codex_model")) |model_value| {
@@ -4752,4 +4794,43 @@ test "FX_ULTRAFAST overrides the profile and diagnoses malformed values" {
         if (diagnostic.cause == .invalid_ultrafast_mode_override) diagnosed = true;
     }
     try std.testing.expect(diagnosed);
+}
+
+test "portable OpenAI-compatible profile normalizes into a credential-free registry" {
+    const alloc = std.testing.allocator;
+    var settings = try parseSettingsJson(alloc,
+        \\{"provider":{"type":"openai-compatible","baseURL":"http://localhost:1234/v1/","model":"local-coder"}}
+    );
+    defer settings.deinit(alloc);
+    try resolve_provider_selection(alloc, &settings);
+    const selection = try selectProviderModel("unused", &settings, null, null);
+    try std.testing.expectEqualStrings("custom", selection.provider.label());
+    try std.testing.expectEqualStrings("local-coder", selection.model);
+    const definition = settings.providers.?.get("custom").?;
+    try std.testing.expectEqualStrings("http://localhost:1234/v1", definition.base_url);
+    try std.testing.expect(definition.auth == .none);
+}
+
+test "Ollama preset is opt-in and preserves explicit endpoints" {
+    const alloc = std.testing.allocator;
+    var settings: Settings = .{};
+    defer settings.deinit(alloc);
+    const ollama = model_provider.parse("ollama").?;
+    try ensureProviderPreset(alloc, &settings, ollama);
+    const selection = try selectProviderModel("unused", &settings, ollama, null);
+    try std.testing.expectEqualStrings("qwen3-coder", selection.model);
+    try std.testing.expectEqualStrings("http://localhost:11434/v1", settings.providers.?.get("ollama").?.base_url);
+    var explicit = try configured_provider.Registry.parse_json(alloc,
+        \\{"ollama":{"protocol":"openai-chat-completions","base_url":"http://localhost:11435/v1","auth":{"type":"none"}}}
+    );
+    defer explicit.deinit(alloc);
+    try explicit.ensure_ollama(alloc);
+    try std.testing.expectEqual(@as(usize, 1), explicit.definitions.len);
+    try std.testing.expectEqualStrings("http://localhost:11435/v1", explicit.get("ollama").?.base_url);
+}
+
+test "portable endpoint definitions are profile-global, not workspace preferences" {
+    try std.testing.expectError(error.InvalidProviderType, parseSettingsJsonForLayer(std.testing.allocator,
+        \\{"provider":{"type":"openai-compatible","baseURL":"http://localhost:1234/v1","model":"local-coder"}}
+    , .profile_workspace));
 }

@@ -1047,6 +1047,23 @@ fn applyUserPatchToRoot(
     patch: UserSettingsPatch,
 ) !PatchApplication {
     var application = PatchApplication{};
+    // Selecting a different provider must not discard the portable endpoint:
+    // saved sessions still need its original route authority to resume safely.
+    if (patch.provider != null) {
+        if (root.object.get("provider")) |current| {
+            if (current == .object) {
+                if (root.object.contains("providers")) return error.InvalidSettingsFormat;
+                const portable = try @import("configured_provider.zig").Portable.parse(current);
+                var definitions: std.json.Value = .{ .object = .empty };
+                try definitions.object.put(arena, "custom", try portable.definition_value(arena));
+                try root.object.put(arena, "providers", definitions);
+                _ = try putModelPreference(arena, &root.object, .{ .provider = model_provider.parse("custom").?, .model = portable.model });
+                _ = try putString(arena, &root.object, "provider", "custom");
+                application.changed = true;
+            }
+        }
+    }
+
     if (patch.model_preference) |preference| {
         application.changed = try putModelPreference(arena, &root.object, preference) or application.changed;
     }
@@ -1904,7 +1921,9 @@ fn validateKnownSettingsObject(
         try validateModel(value.string);
     }
     if (object.get("provider")) |value| {
-        if (value != .string or model_provider.parse(value.string) == null) {
+        if (value == .object) {
+            _ = @import("configured_provider.zig").Portable.parse(value) catch return error.InvalidSettingsFormat;
+        } else if (value != .string or model_provider.parse(value.string) == null) {
             return error.InvalidSettingsFormat;
         }
     }

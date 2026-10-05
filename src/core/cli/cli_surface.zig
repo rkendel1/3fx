@@ -76,6 +76,7 @@ pub const Command = union(enum) {
     slack: []const [:0]const u8,
     models: []const [:0]const u8,
     provider: []const [:0]const u8,
+    providers: []const [:0]const u8,
     doctor: []const [:0]const u8,
     teams: []const [:0]const u8,
     session: []const [:0]const u8,
@@ -606,6 +607,7 @@ pub fn parse(command_catalog: CommandCatalog, args: []const [:0]const u8) Comman
         'p' => {
             if (command_specs.matchesTopLevel(command_catalog, command, .pr)) return .{ .pr = args[1..] };
             if (command_specs.matchesTopLevel(command_catalog, command, .permissions)) return .{ .permissions = args[1..] };
+            if (command_specs.matchesTopLevel(command_catalog, command, .providers)) return .{ .providers = args[1..] };
             if (command_specs.matchesTopLevel(command_catalog, command, .provider)) return .{ .provider = args[1..] };
         },
         'r' => {
@@ -734,6 +736,35 @@ fn topLevelHelpRequest(command_catalog: CommandCatalog, args: []const [:0]const 
 }
 
 pub fn runIfRequested(alloc: Allocator, args: []const [:0]const u8, cfg: Config) !RunResult {
+    // The real CLI requires an explicit destination before initializing the TUI
+    // or any vendor credential flow. Informational commands remain available.
+    if (cfg.auth_mode == .local) {
+        var parsed = parseInteractiveLaunch(alloc, args, cfg.command_catalog) catch
+            return runIfRequestedWithDeps(alloc, args, cfg, .{});
+        defer switch (parsed) {
+            .interactive => |*launch| launch.deinit(alloc),
+            .noninteractive => |*launch| launch.deinit(alloc),
+        };
+        const needs_provider = switch (parsed) {
+            .interactive => |launch| launch.requested_resume == null,
+            .noninteractive => |launch| switch (launch.command) {
+                .ask, .pr, .issue, .acp => topLevelHelpRequest(cfg.command_catalog, launch.effective_args) == null,
+                else => false,
+            },
+        };
+        const override = switch (parsed) {
+            .interactive => |launch| launch.modifiers.provider_override,
+            .noninteractive => |launch| launch.global_args.modifiers.provider_override,
+        };
+        if (needs_provider and override == null and config_runtime.providerEnvOverride() == null) {
+            var settings = try config_runtime.loadMergedSettings(alloc, ".");
+            defer settings.deinit(alloc);
+            if (settings.provider == null) {
+                try writeStderr(.{}, "No model provider configured.\nConfigure a local or remote OpenAI-compatible provider in ~/.fx/settings.json.\nOr run fx --provider ollama --model qwen3-coder.\n");
+                return .handled_failure;
+            }
+        }
+    }
     return runIfRequestedWithDeps(alloc, args, cfg, .{});
 }
 
@@ -872,8 +903,10 @@ fn activateProviderSelectionFallible(
     defer settings.deinit(alloc);
 
     if (target == .configured) {
+        try config_runtime.ensureProviderPreset(alloc, &settings, target);
         const bound = try target.bind(settings.providers orelse .{});
-        const selected_model = settings.models.get(bound) orelse return error.ConfiguredModelNotSelected;
+        const selection = try config_runtime.selectProviderModel(cfg.default_model, &settings, bound, config_runtime.modelEnvOverride());
+        const selected_model = selection.model;
         var attempt = config_runtime.attemptUserPreferences(alloc, .{
             .provider = bound,
             .model_preference = .{ .provider = bound, .model = selected_model },
@@ -1324,6 +1357,30 @@ fn runNonInteractiveWithDeps(
                 .provider_login,
                 .fx_login,
             )) return .handled_failure;
+            return .handled_success;
+        },
+        .providers => |rest| {
+            if (rest.len != 0) {
+                try writeStderr(deps, "usage: fx providers\n");
+                return .handled_failure;
+            }
+            var settings = try config_runtime.loadMergedSettings(alloc, ".");
+            defer settings.deinit(alloc);
+            var registry = try config_runtime.loadConfiguredProviders(alloc);
+            defer registry.deinit(alloc);
+            var out: std.Io.Writer.Allocating = .init(alloc);
+            defer out.deinit();
+            try out.writer.writeAll("Providers\n  ollama (local preset)\n  openai-compatible (protocol adapter)\n  openrouter (OpenAI-compatible endpoint)\n  custom (OpenAI-compatible endpoint)\nConfigured:\n");
+            if (settings.provider) |selected| {
+                try out.writer.print("  {s}\n", .{selected.label()});
+                if (config_runtime.selectProviderModel(cfg.default_model, &settings, null, config_runtime.modelEnvOverride())) |selection| {
+                    try out.writer.print("  {s}\n", .{selection.model});
+                } else |_| {}
+                if (registry.get(selected.label())) |definition| {
+                    try out.writer.print("  {s}\n", .{definition.base_url});
+                }
+            } else try out.writer.writeAll("  none\n");
+            try writeStdout(deps, out.written());
             return .handled_success;
         },
         .provider => |rest| {
