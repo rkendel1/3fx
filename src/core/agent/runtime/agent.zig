@@ -10,8 +10,7 @@ const Allocator = std.mem.Allocator;
 /// persistence, permissions, credentials, and host effects live outside it.
 pub const Agent = struct {
     history: std.ArrayList(types.HistoryTurn) = .empty,
-    turn_usage: types.Usage = .{},
-    fresh: bool = true,
+    turn: @import("../turn_state.zig").TurnState = .{},
     /// Last exact provider input-token usage paired with the measured request
     /// it came from. Carried across turns so the first request of a new turn
     /// calibrates from real usage instead of the raw serialization estimate.
@@ -29,12 +28,11 @@ pub const Agent = struct {
     }
 
     pub fn startTurn(self: *Agent) void {
-        self.fresh = false;
-        self.turn_usage = .{};
+        self.turn.start();
     }
 
     pub fn checkpoint(self: *const Agent, alloc: Allocator) checkpoint_codec.Error![]u8 {
-        return checkpoint_codec.encode(alloc, self.history.items, self.turn_usage);
+        return checkpoint_codec.encode(alloc, self.history.items, self.turnUsage());
     }
 
     pub fn restoreCheckpoint(
@@ -42,7 +40,7 @@ pub const Agent = struct {
         alloc: Allocator,
         bytes: []const u8,
     ) (checkpoint_codec.Error || error{AgentNotFresh})!void {
-        if (!self.fresh or self.history.items.len != 0) {
+        if (!self.turn.fresh or self.history.items.len != 0) {
             return error.AgentNotFresh;
         }
         var decoded = try checkpoint_codec.decode(alloc, bytes);
@@ -52,16 +50,31 @@ pub const Agent = struct {
         decoded.history = &.{};
         for (previous.items) |turn| types.freeHistoryTurn(alloc, turn);
         previous.deinit(alloc);
-        self.turn_usage = decoded.usage;
-        self.fresh = false;
+        self.turn.tokens = .{};
+        self.observeUsage(decoded.usage);
+        self.turn.fresh = false;
+    }
+
+    /// Transitional projection for existing presentation/checkpoint callers.
+    /// The stored counters use the canonical model token type, not a ledger.
+    pub fn turnUsage(self: *const Agent) types.Usage {
+        return .{
+            .input_tokens = self.turn.tokens.input_tokens,
+            .output_tokens = self.turn.tokens.output_tokens,
+            .cache_read_tokens = self.turn.tokens.cache_read_tokens,
+            .cache_write_tokens = self.turn.tokens.cache_write_tokens,
+            .reasoning_tokens = self.turn.tokens.reasoning_tokens,
+        };
     }
 
     pub fn observeUsage(self: *Agent, usage: types.Usage) void {
-        addOptional(&self.turn_usage.input_tokens, usage.input_tokens);
-        addOptional(&self.turn_usage.output_tokens, usage.output_tokens);
-        addOptional(&self.turn_usage.cache_read_tokens, usage.cache_read_tokens);
-        addOptional(&self.turn_usage.cache_write_tokens, usage.cache_write_tokens);
-        addOptional(&self.turn_usage.reasoning_tokens, usage.reasoning_tokens);
+        self.turn.observe(.{
+            .input_tokens = usage.input_tokens,
+            .output_tokens = usage.output_tokens,
+            .cache_read_tokens = usage.cache_read_tokens,
+            .cache_write_tokens = usage.cache_write_tokens,
+            .reasoning_tokens = usage.reasoning_tokens,
+        });
     }
 
     pub fn appendHistoryEntry(
@@ -72,7 +85,7 @@ pub const Agent = struct {
         const copy = try types.dupeHistoryTurn(alloc, turn);
         errdefer types.freeHistoryTurn(alloc, copy);
         try self.history.append(alloc, copy);
-        self.fresh = false;
+        self.turn.fresh = false;
     }
 
     pub fn clearHistory(self: *Agent, alloc: Allocator) void {
@@ -138,7 +151,7 @@ pub const Agent = struct {
         previous.deinit(alloc);
         // Replaced history no longer resembles the calibrated request.
         self.request_token_calibration = null;
-        self.fresh = false;
+        self.turn.fresh = false;
     }
 };
 
@@ -156,11 +169,6 @@ pub const RequestTokenCalibrationState = struct {
         return self.model[0..self.model_len];
     }
 };
-
-fn addOptional(total: *?u64, value: ?u64) void {
-    const amount = value orelse return;
-    total.* = std.math.add(u64, total.* orelse 0, amount) catch std.math.maxInt(u64);
-}
 
 test "Agent request token calibration survives startTurn and dies with cleared history" {
     const alloc = std.testing.allocator;
@@ -197,10 +205,10 @@ test "Agent request token calibration survives startTurn and dies with cleared h
 
 test "Agent startTurn consumes freshness and resets usage" {
     var agent: Agent = .{};
-    agent.turn_usage = .{ .input_tokens = 4 };
+    agent.turn.tokens = .{ .input_tokens = 4 };
     agent.startTurn();
-    try std.testing.expect(!agent.fresh);
-    try std.testing.expectEqual(@as(?u64, null), agent.turn_usage.input_tokens);
+    try std.testing.expect(!agent.turn.fresh);
+    try std.testing.expectEqual(@as(?u64, null), agent.turn.tokens.input_tokens);
 }
 
 test "Agent accumulates per-turn usage with saturation" {
@@ -208,14 +216,14 @@ test "Agent accumulates per-turn usage with saturation" {
     agent.startTurn();
     agent.observeUsage(.{ .input_tokens = 4, .output_tokens = 2 });
     agent.observeUsage(.{ .input_tokens = 3, .reasoning_tokens = 1 });
-    try std.testing.expectEqual(@as(?u64, 7), agent.turn_usage.input_tokens);
-    try std.testing.expectEqual(@as(?u64, 2), agent.turn_usage.output_tokens);
-    try std.testing.expectEqual(@as(?u64, 1), agent.turn_usage.reasoning_tokens);
+    try std.testing.expectEqual(@as(?u64, 7), agent.turn.tokens.input_tokens);
+    try std.testing.expectEqual(@as(?u64, 2), agent.turn.tokens.output_tokens);
+    try std.testing.expectEqual(@as(?u64, 1), agent.turn.tokens.reasoning_tokens);
 
     agent.observeUsage(.{ .input_tokens = std.math.maxInt(u64) });
     try std.testing.expectEqual(
         @as(?u64, std.math.maxInt(u64)),
-        agent.turn_usage.input_tokens,
+        agent.turn.tokens.input_tokens,
     );
 }
 

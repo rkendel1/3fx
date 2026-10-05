@@ -2011,7 +2011,7 @@ pub const SessionRuntime = struct {
             self.unversioned_history_len = 0;
         }
         self.agent.history.appendAssumeCapacity(turn);
-        self.agent.fresh = false;
+        self.agent.turn.fresh = false;
         if (turn == .compacted_summary and isCurrentCompactionCheckpoint(turn)) {
             self.unversioned_history_len = 0;
         }
@@ -2023,7 +2023,7 @@ pub const SessionRuntime = struct {
         self.agent.clearHistory(alloc);
         self.agent.history.deinit(alloc);
         self.agent.history = std.ArrayList(HistoryTurn).fromOwnedSlice(history);
-        self.agent.fresh = false;
+        self.agent.turn.fresh = false;
         self.unversioned_history_len = if (uncertain) history.len else 0;
     }
 
