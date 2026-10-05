@@ -13,7 +13,7 @@ const AgentRuntimeDeps = deps_mod.AgentRuntimeDeps;
 const ChatMessage = types.ChatMessage;
 const HistoryTurn = types.HistoryTurn;
 const LifecycleContext = lifecycle_runtime.LifecycleContext;
-const QueuedPrompt = worker_runtime.QueuedPrompt;
+const CompatibilityExecutionJob = worker_runtime.CompatibilityExecutionJob;
 const TraceContext = debug_trace.TraceContext;
 const TurnSummaryAccumulator = telemetry.TurnSummaryAccumulator;
 
@@ -170,7 +170,7 @@ pub fn stopTerminalText(
 pub fn finishAssistantTerminalWithExecution(
     deps: *const AgentRuntimeDeps,
     finalization: *TurnFinalizationGuard,
-    job: QueuedPrompt,
+    job: CompatibilityExecutionJob,
     execution: types.ExecutionMemory,
     summary: *TurnSummaryAccumulator,
     assistant_text: []const u8,
@@ -214,7 +214,7 @@ pub fn finishExecutionOnlyFailureIfNeeded(
     deps: *const AgentRuntimeDeps,
     finalization: *TurnFinalizationGuard,
     arena: Allocator,
-    job: QueuedPrompt,
+    job: CompatibilityExecutionJob,
     current_turn_messages: []const ChatMessage,
     summary: *TurnSummaryAccumulator,
     finish_trace: *PromptFinishTrace,
@@ -249,7 +249,7 @@ pub fn finalizeRetainedCandidateFailure(
     deps: *const AgentRuntimeDeps,
     finalization: *TurnFinalizationGuard,
     arena: Allocator,
-    job: QueuedPrompt,
+    job: CompatibilityExecutionJob,
     current_turn_messages: []const ChatMessage,
     summary: *TurnSummaryAccumulator,
     finish_trace: *PromptFinishTrace,

@@ -110,7 +110,7 @@ const BlockingPromptRun = struct {
     gateway: *FakeGateway,
     hooks: *FakeAgentRuntimeDeps,
     config: runtime_config.Config,
-    job: worker_runtime.QueuedPrompt,
+    job: worker_runtime.CompatibilityExecutionJob,
     finished: *std.atomic.Value(bool),
     failure: ?anyerror = null,
 

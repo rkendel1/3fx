@@ -28,7 +28,7 @@ The worker runtime owns `execution_snapshots`, a typed map from `ExecutionSnapsh
 - `snapshot_file_ownerships`.
 - `recovery_checkpoint`, `recovery_source_already_presented`, `user_prompt_already_presented`.
 
-`QueuedPrompt` remains a compatibility ingress/execution job, not a queue item. Existing producers capture the same values as before. Enqueue separates that job into neutral work and a typed execution snapshot without copying or rereading current configuration.
+`CompatibilityExecutionJob` (formerly `QueuedPrompt`) remains a compatibility ingress/execution shape, not a queue item. Existing producers capture the same values as before. Enqueue separates that job into neutral work and a typed execution snapshot without copying or rereading current configuration.
 
 The history policy is unchanged: the worker's existing shared `queued_history` holds canonical queued history, while stored snapshots have an empty history slice. Dequeue supplies the existing updated history snapshot to the compatibility job.
 
@@ -42,8 +42,8 @@ The existing explicit queued-model, permission, grants, settings, routing, and h
 
 1. Enqueue reserves queue and snapshot-store capacity before transferring ownership. Allocation failure leaves the caller owning the original job.
 2. The worker assigns a monotonically increasing snapshot ID and inserts the typed snapshot alongside the neutral FIFO entry.
-3. At `takeNextPromptLocked`, after preparing the existing begin-prompt event, `takeExecutionSnapshot` removes the stored snapshot and assembles the legacy execution job. The returned job owns the slices and references until the existing `freeQueuedPrompt` cleanup.
-4. Steering consumption, removal, retraction, clearing, and teardown also consume the corresponding snapshot and invoke the same terminal cleanup. No snapshot is left behind after its queue item is removed.
+3. At `takeNextPromptLocked`, after preparing the existing begin-prompt event, `consumeExecutionSnapshot` removes the stored snapshot, and `core/app/execution_compatibility.zig::resolve` assembles the legacy execution job. The returned job owns the slices and references until the existing `freeQueuedPrompt` cleanup.
+4. Steering consumption, removal, retraction, clearing, and teardown also consume the corresponding snapshot and free its captured resources directly, without assembling an execution job. No snapshot is left behind after its queue item is removed.
 5. Active execution and retries use the already-resolved job, not the snapshot store or current host configuration.
 
 The legacy turn orchestrator still receives `QueuedPrompt`. Moving that consumer to neutral model types is a later extraction. This queue change does not alter provider adapters, authentication, billing, recovery, compaction, vision, tools, MCP, TUI, or session-storage behavior.
@@ -52,6 +52,19 @@ The legacy turn orchestrator still receives `QueuedPrompt`. Moving that consumer
 
 Focused production-worker tests cover typed queue shape, captured configuration A versus changed current host model/settings B, FIFO, continuation, cancel reset, snapshot resolution, removal, clearing, and existing steering/queue allocation-failure behavior. The configured-provider integration suite continues to exercise the real binary's coding loop and streaming/error regressions.
 
-The whole-agent guard is unchanged: before 1,506 violations; after 1,506 violations. The neutral queue module introduces no forbidden dependency. The execution snapshot and existing downstream orchestrator still legitimately reach legacy auth, identity, history/recovery, and control-plane types, so removing data from the FIFO does not by itself remove those modules from the whole-agent dependency closure.
+The whole-agent guard is unchanged: before 1,506 violations; after 1,509 violations. The neutral queue module introduces no forbidden dependency. The execution snapshot and existing downstream orchestrator still legitimately reach legacy auth, identity, history/recovery, and control-plane types, so removing data from the FIFO does not by itself remove those modules from the whole-agent dependency closure.
 
-The remaining mutually exclusive categories are credential/auth concepts (697), legacy/auth imports (232), team concepts (175), subscription concepts (150), upgrade concepts (119), account concepts (101), billing concepts (31), and vendor concepts (1). The queue's stored type carries none of them; its owning host worker and compatibility execution path still do. This does not complete PR3.
+The remaining mutually exclusive categories are credential/auth concepts (698), legacy/auth imports (232), team concepts (176), subscription concepts (150), upgrade concepts (119), account concepts (102), billing concepts (31), and vendor concepts (1). The queue's stored type carries none of them; its owning host worker and compatibility execution path still do. This does not complete PR3.
+
+
+## Explicit compatibility boundary
+
+`worker_runtime.CompatibilityExecutionJob` is a real renamed struct, not an alias hiding `QueuedPrompt`. All consumers and cleanup calls use its explicit name. The legacy orchestrator's algorithm is unchanged.
+
+`takeNextPromptLocked` is the only production call to `execution_compatibility.resolve`. It passes the neutral item and the consumed typed snapshot by value. This mapping allocates nothing, rereads no current state, and retains the captured slices and references for existing execution/retry cleanup.
+
+Discard paths use `releaseQueuedTurn` and resource cleanup directly, so no compatibility execution job is reconstructed for queue removal, retraction, steering consumption, clearing, or teardown.
+
+The guard reports three additional per-file concepts because the explicit conversion module references the existing account, credential-source, and team fields. It does not introduce new identity state. Neither the guard nor the neutral queue dependency closure changed.
+
+Legacy host submission APIs still accept the same flat shape, now called `CompatibilityExecutionJob`, before immediately splitting it into queued work and a snapshot. This keeps allocation/error ownership unchanged but does not satisfy the stricter requirement that the type itself appear exclusively after dequeue. Separating host submission from resolved execution remains future work; this PR does not claim that stricter acceptance gate is met.

@@ -16,12 +16,12 @@ const ToolCall = types.ToolCall;
 const TraceContext = debug_trace.TraceContext;
 const AgentRuntimeDeps = runtime_deps.AgentRuntimeDeps;
 const TurnFinalizationGuard = runtime_finalization.TurnFinalizationGuard;
-const QueuedPrompt = worker_runtime.QueuedPrompt;
+const CompatibilityExecutionJob = worker_runtime.CompatibilityExecutionJob;
 
 pub fn persistInterruptedTurnOnce(
     hooks: *const AgentRuntimeDeps,
     finalization: *TurnFinalizationGuard,
-    job: QueuedPrompt,
+    job: CompatibilityExecutionJob,
     partial_assistant: ?[]const u8,
     active_tool_call: ?ToolCall,
     completed_tool_names: [][]u8,
@@ -51,7 +51,7 @@ pub fn persistInterruptedTurnOnce(
 pub fn persistCompactionInterruptedTurnOnce(
     hooks: *const AgentRuntimeDeps,
     finalization: *TurnFinalizationGuard,
-    job: QueuedPrompt,
+    job: CompatibilityExecutionJob,
     completed_tool_names: [][]u8,
     persisted: *bool,
     trace_ctx: TraceContext,
@@ -79,7 +79,7 @@ pub fn persistCompactionInterruptedTurnOnce(
 pub fn persistInterruptedCommandTurnOnce(
     hooks: *const AgentRuntimeDeps,
     finalization: *TurnFinalizationGuard,
-    job: QueuedPrompt,
+    job: CompatibilityExecutionJob,
     partial_assistant: ?[]const u8,
     active_tool_call: ToolCall,
     completed_tool_names: [][]u8,
@@ -110,7 +110,7 @@ pub fn persistInterruptedCommandTurnOnce(
 fn persistInterruptedTurnWithPresentation(
     hooks: *const AgentRuntimeDeps,
     finalization: *TurnFinalizationGuard,
-    job: QueuedPrompt,
+    job: CompatibilityExecutionJob,
     partial_assistant: ?[]const u8,
     active_tool_call: ?ToolCall,
     completed_tool_names: [][]u8,
@@ -226,7 +226,7 @@ fn persistInterruptedTurnWithPresentation(
 pub fn persistFailedPartialTurnOnce(
     hooks: *const AgentRuntimeDeps,
     finalization: *TurnFinalizationGuard,
-    job: QueuedPrompt,
+    job: CompatibilityExecutionJob,
     partial_assistant: []const u8,
     persisted: *bool,
     trace_ctx: TraceContext,
@@ -285,7 +285,7 @@ pub fn persistFailedPartialTurnOnce(
 }
 
 fn traceInterruptedPersistence(
-    job: QueuedPrompt,
+    job: CompatibilityExecutionJob,
     partial_assistant: ?[]const u8,
     active_tool_call: ?ToolCall,
     completed_tool_names: [][]u8,

@@ -155,7 +155,7 @@ const ReasoningEffort = types.ReasoningEffort;
 const ToolPermissionDecision = types.ToolPermissionDecision;
 const PermissionGrant = types.PermissionGrant;
 const PermissionEngine = permissions.PermissionEngine;
-const QueuedPrompt = worker_runtime.QueuedPrompt;
+const CompatibilityExecutionJob = worker_runtime.CompatibilityExecutionJob;
 const WorkItem = worker_runtime.WorkItem;
 const WorkerRuntime = worker_runtime.WorkerRuntime;
 const SessionRuntime = session_runtime.SessionRuntime;
@@ -1417,7 +1417,7 @@ const App = struct {
             0,
             false,
         );
-        errdefer worker_runtime.freeQueuedPrompt(std.heap.c_allocator, queued);
+        errdefer worker_runtime.freeCompatibilityExecutionJob(std.heap.c_allocator, queued);
         try self.worker.admitInteractivePrompt(std.heap.c_allocator, queued);
         HerdrAppRuntime.reportWorking(self);
         return true;
@@ -1460,7 +1460,7 @@ const App = struct {
             turn_id,
             user_prompt_already_presented,
         );
-        errdefer worker_runtime.freeQueuedPrompt(std.heap.c_allocator, queued);
+        errdefer worker_runtime.freeCompatibilityExecutionJob(std.heap.c_allocator, queued);
         try self.worker.enqueuePrompt(std.heap.c_allocator, queued);
         HerdrAppRuntime.reportWorking(self);
         return true;
@@ -1475,7 +1475,7 @@ const App = struct {
         prompt_images: ?[]const types.ImageAttachment,
         turn_id: u64,
         user_prompt_already_presented: bool,
-    ) !worker_runtime.QueuedPrompt {
+    ) !worker_runtime.CompatibilityExecutionJob {
         if (recovery_checkpoint == null) {
             SessionAppRuntime.maybeStartSessionTitleGeneration(self, prompt);
         }

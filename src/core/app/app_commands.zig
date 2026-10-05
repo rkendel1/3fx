@@ -3612,7 +3612,7 @@ test "workspace mutation admission rejects queue-zero processing gap" {
         .grants = try alloc.alloc(types.PermissionGrant, 0),
     });
     const active = (try app.worker.waitAndTakeNextPrompt(alloc)).?;
-    defer worker_runtime.freeQueuedPrompt(alloc, active);
+    defer worker_runtime.freeCompatibilityExecutionJob(alloc, active);
 
     try std.testing.expectEqual(@as(usize, 0), app.worker.queuedPromptCount());
     try std.testing.expect(!tryBeginWorkspaceMutation(&app));
@@ -3658,7 +3658,7 @@ test "workspace list refresh waits for an idle turn" {
         .grants = try alloc.alloc(types.PermissionGrant, 0),
     });
     const queued = (try app.worker.waitAndTakeNextPrompt(alloc)).?;
-    defer worker_runtime.freeQueuedPrompt(alloc, queued);
+    defer worker_runtime.freeCompatibilityExecutionJob(alloc, queued);
 
     try refreshWorkspaceAvailabilityForList(&app);
     try std.testing.expect(app.available);
