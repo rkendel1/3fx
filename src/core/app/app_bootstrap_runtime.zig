@@ -460,14 +460,14 @@ pub fn Runtime(comptime App: type) type {
             // active credential needs no onboarding, so a fresh launch probes
             // the other sources after its first frame.
             const can_defer_inventory = comptime @hasDecl(@TypeOf(app.auth), "deferStartupSourceInventory");
-            const inventory_deferred = can_defer_inventory and
+            const inventory_deferred = startup.provider != .configured and can_defer_inventory and
                 !credential_deferred and
                 app.requested_resume == null and
                 app.auth.view().active_source != null;
             if (comptime can_defer_inventory) {
                 if (inventory_deferred) app.auth.deferStartupSourceInventory();
             }
-            if (!credential_deferred and !inventory_deferred) {
+            if (startup.provider != .configured and !credential_deferred and !inventory_deferred) {
                 if (comptime @hasDecl(@TypeOf(app.auth), "refreshSourceInventory")) {
                     app.auth.refreshSourceInventory(app.alloc) catch |err| {
                         debug_trace.logf("auth", "startup source inventory refresh failed err={s}", .{@errorName(err)});

@@ -101,6 +101,51 @@ pub const Definition = struct {
     }
 };
 
+/// Borrowed, vendor-neutral profile configuration. Secrets stay in environment
+/// variables; an absent slot means the protocol sends no Authorization header.
+pub const Portable = struct {
+    base_url: []const u8,
+    model: []const u8,
+    api_key_env: ?[]const u8 = null,
+
+    /// Temporary JSON tree: caller owns map storage; strings borrow this value.
+    /// Use an arena when normalizing, then let Registry.parse copy the definition.
+    pub fn definition_value(self: Portable, alloc: Allocator) Allocator.Error!std.json.Value {
+        var definition: std.json.Value = .{ .object = .empty };
+        try definition.object.put(alloc, "protocol", .{ .string = "openai-chat-completions" });
+        try definition.object.put(alloc, "base_url", .{ .string = self.base_url });
+        var auth: std.json.Value = .{ .object = .empty };
+        try auth.object.put(alloc, "type", .{ .string = if (self.api_key_env != null) "bearer" else "none" });
+        if (self.api_key_env) |env| try auth.object.put(alloc, "env", .{ .string = env });
+        try definition.object.put(alloc, "auth", auth);
+        var metadata: std.json.Value = .{ .object = .empty };
+        var model_value: std.json.Value = .{ .object = .empty };
+        try model_value.object.put(alloc, "supports_tool_use", .{ .bool = true });
+        try metadata.object.put(alloc, self.model, model_value);
+        try definition.object.put(alloc, "model_metadata", metadata);
+        return definition;
+    }
+
+    pub fn parse(value: std.json.Value) ParseError!Portable {
+        try check_fields(value, &.{ "type", "baseURL", "model", "apiKeyEnv" });
+        const kind = try required(value, "type");
+        if (kind != .string or !std.mem.eql(u8, kind.string, "openai-compatible")) return error.InvalidProtocol;
+        const url = try required(value, "baseURL");
+        if (url != .string) return error.InvalidBaseUrl;
+        const model_value = try required(value, "model");
+        if (model_value != .string) return error.InvalidModelId;
+        try validate_model_id(model_value.string);
+        var result: Portable = .{ .base_url = try validate_url(url.string), .model = model_value.string };
+        if (value.object.get("apiKeyEnv")) |env| {
+            if (env != .string or env.string.len == 0 or env.string.len > max_env_bytes) return error.InvalidEnvironmentName;
+            if (!std.ascii.isAlphabetic(env.string[0]) and env.string[0] != '_') return error.InvalidEnvironmentName;
+            for (env.string) |byte| if (!std.ascii.isAlphanumeric(byte) and byte != '_') return error.InvalidEnvironmentName;
+            result.api_key_env = env.string;
+        }
+        return result;
+    }
+};
+
 pub const Registry = struct {
     definitions: []const Definition = &.{},
 
@@ -149,6 +194,22 @@ pub const Registry = struct {
         for (self.definitions) |definition| definition.deinit(alloc);
         alloc.free(self.definitions);
         self.* = .{};
+    }
+
+    /// Install the credential-free local preset only when it is requested.
+    /// Explicit definitions always win, including a different Ollama endpoint.
+    pub fn ensure_ollama(self: *Registry, alloc: Allocator) !void {
+        if (self.get("ollama") != null) return;
+        var preset = try Registry.parse_json(alloc,
+            \\{"ollama":{"protocol":"openai-chat-completions","base_url":"http://localhost:11434/v1","auth":{"type":"none"},"model_metadata":{"qwen3-coder":{"supports_tool_use":true}}}}
+        );
+        errdefer preset.deinit(alloc);
+        const combined = try alloc.alloc(Definition, self.definitions.len + 1);
+        @memcpy(combined[0..self.definitions.len], self.definitions);
+        combined[self.definitions.len] = preset.definitions[0];
+        alloc.free(self.definitions);
+        alloc.free(preset.definitions);
+        self.definitions = combined;
     }
 
     /// Returns a borrow valid until registry teardown. IDs are case-sensitive.

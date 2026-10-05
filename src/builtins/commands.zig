@@ -172,6 +172,12 @@ pub const top_level_specs = [_]TopLevelSpec{
         .options = &.{json_option},
     },
     .{
+        .kind = .providers,
+        .token = "providers",
+        .usage = "providers",
+        .summary = "Show model connections without contacting an account service",
+    },
+    .{
         .kind = .provider,
         .token = "provider",
         .usage = "provider <name>",
@@ -316,6 +322,7 @@ pub const top_level_help_groups = [_]TopLevelHelpGroup{
     .{ .entries = &.{
         .{ .kind = .login, .usage = "login [vercel|codex|grok]", .summary = "Sign in to a model provider" },
         .{ .kind = .logout, .usage = "logout [vercel|codex|grok]", .summary = "Sign out of a model provider" },
+        .{ .kind = .providers, .usage = "providers", .summary = "Show model connections" },
         .{ .kind = .provider, .usage = "provider <name>", .summary = "Choose the active model provider" },
         .{ .kind = .models, .usage = "models" },
     } },

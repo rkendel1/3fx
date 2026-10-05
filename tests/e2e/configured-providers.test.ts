@@ -632,3 +632,141 @@ describe("configured providers", () => {
     } finally { f.close(); }
   }, 25000);
 });
+
+// Exercise the real binary with isolated profile state, no vendor credentials,
+// and a deterministic local provider. This proves orchestration, not model quality.
+describe("standalone agent", () => {
+  function cleanEnv(f: ReturnType<typeof fixture>) {
+    return {
+      ...f.env,
+      AI_GATEWAY_API_KEY: undefined, VERCEL_OIDC_TOKEN: undefined,
+      OPENAI_API_KEY: undefined, ANTHROPIC_API_KEY: undefined, XAI_API_KEY: undefined,
+      FX_TEST_PROVIDER_TOKEN: undefined,
+      HTTP_PROXY: undefined, HTTPS_PROXY: undefined, ALL_PROXY: undefined,
+    };
+  }
+
+  test("clean startup gives provider guidance, not a login prompt", async () => {
+    const f = fixture();
+    try {
+      writeFileSync(f.settingsPath, "{}", { mode: 0o600 });
+      const result = await runFx([], { cwd: f.workspace, env: cleanEnv(f) });
+      expect(result.code).toBe(1);
+      expect(result.stderr).toContain("No model provider configured.");
+      expect(result.stderr).not.toMatch(/login required|fx login|connect vercel/i);
+      expect(f.requests).toHaveLength(0);
+      const providers = await runFx(["providers"], { cwd: f.workspace, env: cleanEnv(f) });
+      expect(providers.code).toBe(0);
+      expect(providers.stdout).toContain("ollama");
+      expect(providers.stdout).toContain("Configured:\n  none");
+    } finally { f.close(); }
+  });
+
+  test("Ollama preset needs no credential or catalog request", async () => {
+    const f = fixture();
+    try {
+      writeFileSync(f.settingsPath, JSON.stringify({ provider: "ollama" }), { mode: 0o600 });
+      const result = await runFx(["providers"], { cwd: f.workspace, env: cleanEnv(f) });
+      expect(result.code).toBe(0);
+      expect(result.stdout).toContain("qwen3-coder");
+      expect(result.stdout).toContain("http://localhost:11434/v1");
+      expect(f.requests).toHaveLength(0);
+    } finally { f.close(); }
+  });
+
+  test("selecting providers preserves a portable endpoint without an account lookup", async () => {
+    const f = fixture();
+    try {
+      writeFileSync(f.settingsPath, JSON.stringify({
+        provider: { type: "openai-compatible", baseURL: f.settings.providers.local.base_url, model: "local-coder" },
+      }), { mode: 0o600 });
+      for (const name of ["ollama", "custom"]) {
+        const selected = await runFx(["provider", name], { cwd: f.workspace, env: cleanEnv(f) });
+        if (selected.code !== 0) throw new Error(selected.stdout + selected.stderr);
+        expect(selected.stdout).toContain(`Provider set to ${name}.`);
+        expect(f.requests).toHaveLength(0);
+      }
+      const result = await runFx(["ask", "--json", "Hello"], { cwd: f.workspace, env: cleanEnv(f) });
+      if (result.code !== 0) throw new Error(result.stdout + result.stderr);
+      expect(JSON.parse(result.stdout).output).toBe("local reply");
+      expect(f.requests[0].authorization).toBe(null);
+    } finally { f.close(); }
+  });
+
+  test("portable remote authentication uses only its optional environment slot", async () => {
+    const f = fixture();
+    try {
+      writeFileSync(f.settingsPath, JSON.stringify({
+        provider: { type: "openai-compatible", baseURL: f.settings.providers.local.base_url, model: "local-coder", apiKeyEnv: "FX_TEST_PROVIDER_TOKEN" },
+      }), { mode: 0o600 });
+      const missing = await runFx(["ask", "Hello"], { cwd: f.workspace, env: cleanEnv(f) });
+      expect(missing.code).not.toBe(0);
+      expect(f.requests).toHaveLength(0);
+      expect(missing.stderr).not.toMatch(/fx login|connect vercel/i);
+      const result = await runFx(["ask", "--json", "Hello"], {
+        cwd: f.workspace, env: { ...cleanEnv(f), FX_TEST_PROVIDER_TOKEN: "fixture-token" },
+      });
+      if (result.code !== 0) throw new Error(result.stdout + result.stderr);
+      expect(f.requests).toHaveLength(1);
+      expect(f.requests[0].authorization).toBe("Bearer fixture-token");
+    } finally { f.close(); }
+  });
+
+  test("portable config streams a coding task through read, edit, command, fix, and finish", async () => {
+    let turn = 0;
+    const f = fixture(async body => {
+      turn++;
+      const tool = (name: string, args: unknown) => toolCompletion(body.model, name, args, `coding-${turn}`);
+      switch (turn) {
+        case 1: return tool("read_file", { path: "answer.txt" });
+        case 2:
+          expect(body.messages.at(-1).content).toContain("40");
+          return tool("edit_file", { path: "answer.txt", old_string: "40", new_string: "41" });
+        case 3: return tool("shell", { action: "run", command: "test \"$(cat answer.txt)\" = 42 && printf 'check passed'", profile: "clean" });
+        case 4: return tool("read_file", { path: "answer.txt" });
+        case 5:
+          expect(body.messages.at(-1).content).toContain("41");
+          return tool("edit_file", { path: "answer.txt", old_string: "41", new_string: "42" });
+        case 6: return tool("shell", { action: "run", command: "test \"$(cat answer.txt)\" = 42 && printf 'check passed'", profile: "clean" });
+        default: {
+          expect(body.messages.at(-1).content).toContain("check passed");
+          const text = await completion(body.model, "Fixed answer.txt and verified the result.").text();
+          const bytes = new TextEncoder().encode(text);
+          return new Response(new ReadableStream({
+            async start(controller) {
+              for (let i = 0; i < bytes.length; i += 13) {
+                controller.enqueue(bytes.slice(i, i + 13));
+                await Bun.sleep(2);
+              }
+              controller.close();
+            },
+          }), { headers: { "content-type": "text/event-stream" } });
+        }
+      }
+    }, "/alternate-prefix/api/v1");
+    try {
+      const url = f.settings.providers.local.base_url;
+      writeFileSync(f.settingsPath, JSON.stringify({
+        provider: { type: "openai-compatible", baseURL: url, model: "local-coder" },
+        permission_mode: "full-access",
+      }), { mode: 0o600 });
+      writeFileSync(join(f.workspace, "answer.txt"), "40\n");
+      const result = await runFx(["ask", "--json", "Set answer.txt to 42 and verify it with a command."], {
+        cwd: f.workspace, env: cleanEnv(f), timeoutMs: 45000,
+      });
+      if (result.code !== 0) throw new Error(result.stdout + result.stderr);
+      expect(JSON.parse(result.stdout).output).toBe("Fixed answer.txt and verified the result.");
+      expect(readFileSync(join(f.workspace, "answer.txt"), "utf8")).toBe("42\n");
+      expect(f.requests).toHaveLength(7);
+      expect(f.requests.every(request => request.authorization === null)).toBe(true);
+      expect(f.requests.every(request => request.path === "/alternate-prefix/api/v1/chat/completions" && request.body.stream === true)).toBe(true);
+      expect(f.requests[6].body.messages.filter((message: any) => message.role === "tool")).toHaveLength(6);
+      expect(existsSync(join(f.home, ".fx", "api-key"))).toBe(false);
+      const providers = await runFx(["providers"], { cwd: f.workspace, env: cleanEnv(f) });
+      expect(providers.code).toBe(0);
+      expect(providers.stdout).toContain(url);
+      expect(providers.stdout).toContain("local-coder");
+      expect(f.requests).toHaveLength(7);
+    } finally { f.close(); }
+  }, 60000);
+});
