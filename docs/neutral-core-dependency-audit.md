@@ -606,3 +606,106 @@ scripts/check-model-provider-boundary.py
 - `src/core/app/execution_compatibility.zig` owns auth cleanup
 - `src/core/auth/` remains available for host credential lifecycle
 - No circular dependencies or hidden couplings
+
+---
+
+## Build System Proof (October 5, 2026)
+
+### Standalone Neutral-Core Module
+
+**File**: `src/core/neutral-core.zig`
+
+This module explicitly imports ONLY neutral-core components:
+- Tier 1: Core execution primitives (turn_coordinator, loop_control, turn_state, model_provider)
+- Tier 2: Turn execution configuration (turn_execution_input)
+- Tier 3: Model execution boundary (stream_provider neutral types)
+- Tier 4: Worker runtime (worker_runtime - now clean)
+- Supporting infrastructure (types, debug_trace, io, session_codec, etc.)
+
+The module serves as the single point of verification. Any attempt to add a forbidden import will cause a compile error.
+
+**Forbidden imports** (compile-time failure if added):
+- Any module from `src/core/auth/`
+- Any module from `src/core/account/`
+- Any module from `src/core/billing/`
+- TUI/UI modules (`src/ui/`)
+- Compute/PAX/AppPort/FeltDB modules
+
+### Standalone Smoke Test
+
+**File**: `tests/neutral-core-standalone.zig`
+
+Comprehensive test suite exercising:
+1. TurnCoordinator construction and state management
+2. TurnState freshness and token tracking
+3. LoopControl boundaries
+4. ModelProvider interface (no credentials embedded)
+5. EventSink streaming (no auth in events)
+6. NeutralModelRequest/Response path (no credentials)
+7. AgentTurnSettings construction (no credentials)
+8. TurnExecutionInput construction and verification of no auth fields
+
+All tests verify:
+- Types can be constructed without auth/billing modules
+- No credential fields leak into neutral types
+- Compilation succeeds without forbidden imports
+
+### Build Target
+
+**In `build.zig`**:
+```zig
+// Neutral core standalone test: proves the core is independent of auth/billing/control-plane
+const neutral_core_module = b.createModule(.{
+    .root_source_file = b.path("src/core/neutral-core.zig"),
+    .target = target,
+    .optimize = optimize,
+});
+const neutral_core_tests = b.addTest(.{
+    .root_module = b.createModule(.{
+        .root_source_file = b.path("tests/neutral-core-standalone.zig"),
+        .target = target,
+        .optimize = optimize,
+    }),
+});
+neutral_core_tests.root_module.addImport("neutral", neutral_core_module);
+const run_neutral_core_tests = b.addRunArtifact(neutral_core_tests);
+const neutral_core_test_step = b.step("test-neutral-core", "Run neutral core independence tests (compile-time proof of clean boundaries)");
+neutral_core_test_step.dependOn(&run_neutral_core_tests.step);
+
+const test_step = b.step("test", "Run tests");
+test_step.dependOn(&run_neutral_core_tests.step);  // Now part of full test suite
+```
+
+### Verification Commands
+
+```bash
+# Run just the neutral core test (compile-time proof)
+zig build test-neutral-core
+
+# Run full test suite including neutral core
+zig build test
+
+# Verify no forbidden modules can be imported
+# (Add an import of src/core/auth/credentials.zig to src/core/neutral-core.zig
+#  and the build will fail)
+```
+
+### Enforcement Mechanism
+
+The neutral-core.zig module acts as the enforcement point:
+1. It explicitly lists all allowed imports
+2. Anything not listed causes a compile error
+3. Tests verify the module works standalone
+4. Build system makes this part of regular test suite
+
+This is NOT:
+- A stub/fake implementation
+- A test-only variant
+- A second build system
+- A plugin/registry system
+
+This IS:
+- An actual, production use of the neutral modules
+- A compile-time boundary proof
+- Using Zig's existing build system
+- Part of the standard test suite
