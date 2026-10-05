@@ -20,6 +20,11 @@ const types = @import("../shared/types.zig");
 const model_provider = @import("../config/model_provider.zig");
 const assistant_presentation = @import("assistant_presentation.zig");
 const compaction_activity = @import("../output/compaction_activity.zig");
+const neutral = @import("neutral_execution_boundary.zig");
+
+pub const TurnExecutionInput = neutral.TurnExecutionInput;
+pub const NeutralModelRequest = neutral.NeutralModelRequest;
+pub const NeutralModelCompletion = neutral.NeutralModelCompletion;
 
 pub const AgentTurnSettings = struct {
     max_tool_result_bytes: usize = tool_result_limits.default_max_tool_result_bytes,
@@ -98,6 +103,39 @@ pub const SteeringBoundaryResult = union(enum) {
     continue_turn: [][]u8,
     handoff,
     interrupt,
+};
+
+/// Host-level execution job. Contains all authentication, authorization, account,
+/// and billing state. This is the host compatibility layer's responsibility.
+/// The turn loop operates on the neutral TurnExecutionInput extracted from this.
+pub const CompatibilityExecutionJob = struct {
+    turn_id: u64 = 0,
+    delivery: PromptDelivery = .ordinary,
+    prompt: []u8,
+    images: []types.ImageAttachment,
+    authorized_image_catalog: []types.ImageAttachment = &.{},
+    model: []u8,
+    provider: model_provider.ProviderId = .gateway,
+
+    /// Host auth/credential state (never enters neutral boundary)
+    api_key: []u8,
+    gateway_team: ?[]u8 = null,
+    credential_source: ?types.CredentialSource = null,
+    account_id: ?[]u8 = null,
+    permission_mode: types.PermissionMode,
+
+    history: []types.HistoryTurn,
+    unversioned_history_count: usize = std.math.maxInt(usize),
+    root_user_intent_context: []u8 = &.{},
+    grants: []types.PermissionGrant,
+    skill_bindings: []SkillBinding = &.{},
+    skill_display_spans: []SkillDisplaySpan = &.{},
+    context_snapshot: context_contract.GatheredContextSnapshot = .{},
+    agent_settings: AgentTurnSettings = .{},
+    snapshot_file_ownerships: []types.SnapshotFileOwnership = &.{},
+    recovery_checkpoint: ?session_codec.RecoveryCheckpoint = null,
+    recovery_source_already_presented: bool = false,
+    user_prompt_already_presented: bool = false,
 };
 
 pub const QueuedPrompt = struct {
