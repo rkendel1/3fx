@@ -2,8 +2,9 @@ const neutral_queue = @import("queued_turn.zig");
 pub const NeutralQueuedTurn = neutral_queue.QueuedTurn;
 pub const ExecutionSnapshotId = neutral_queue.ExecutionSnapshotId;
 const std = @import("std");
+const credentials = @import("../auth/credentials.zig");
+const secret = @import("../auth/secret.zig");
 const io_mod = @import("../shared/io.zig");
-const execution_compatibility = @import("../app/execution_compatibility.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const diff_mod = @import("../output/diff.zig");
 const file_mutation_contract = @import("../tooling/file_mutation_contract.zig");
@@ -22,11 +23,6 @@ const types = @import("../shared/types.zig");
 const model_provider = @import("../config/model_provider.zig");
 const assistant_presentation = @import("assistant_presentation.zig");
 const compaction_activity = @import("../output/compaction_activity.zig");
-const neutral = @import("neutral_execution_boundary.zig");
-
-pub const TurnExecutionInput = neutral.TurnExecutionInput;
-pub const NeutralModelRequest = neutral.NeutralModelRequest;
-pub const NeutralModelCompletion = neutral.NeutralModelCompletion;
 
 pub const AgentTurnSettings = struct {
     max_tool_result_bytes: usize = tool_result_limits.default_max_tool_result_bytes,
@@ -150,17 +146,6 @@ pub const CompatibilityExecutionJob = struct {
 /// Enqueue-time execution authority/configuration, owned by this host worker.
 /// Explicit queue-sync operations continue updating only the fields they did
 /// before extraction. Dequeue never reads current model or auth configuration.
-/// Host-owned credential refresh event payload.
-/// Mirrors credentials.Credential fields without requiring the auth module import.
-pub const RefreshedCredential = struct {
-    token: []u8,
-    source: types.CredentialSource,
-    account_id: ?[]u8 = null,
-    team_id: ?[]u8 = null,
-    team_slug: ?[]u8 = null,
-    refresh_after_ms: ?i64 = null,
-};
-
 pub const ExecutionSnapshot = struct {
     steering_receipt: ?*SteeringReceipt = null,
     images: []types.ImageAttachment,
@@ -563,7 +548,7 @@ pub const WorkerEvent = union(enum) {
     /// last value wins). Owned by the event; the consumer frees it.
     provider_resolved: []u8,
     api_status_text: []u8,
-    credential_refreshed: RefreshedCredential,
+    credential_refreshed: credentials.Credential,
     command_output: CommandOutputChunk,
     command_output_complete: ?types.ToolLifecycleId,
     tool_lifecycle: types.ToolLifecycleEvent,
@@ -3006,7 +2991,7 @@ fn freeExecutionResources(alloc: std.mem.Allocator, prompt: anytype) void {
     types.freeImageAttachmentSlice(alloc, prompt.images);
     types.freeImageAttachmentSlice(alloc, prompt.authorized_image_catalog);
     alloc.free(prompt.model);
-    execution_compatibility.disposeApiKey(alloc, prompt);
+    secret.zeroAndFree(alloc, prompt.api_key);
     if (prompt.gateway_team) |team| alloc.free(team);
     if (prompt.account_id) |account_id| alloc.free(account_id);
     types.freeHistoryTurnSlice(alloc, prompt.history);
@@ -3031,7 +3016,7 @@ pub fn freeContextCompactionTask(
     task: ContextCompactionTask,
 ) void {
     alloc.free(task.model);
-    execution_compatibility.disposeApiKey(alloc, task);
+    secret.zeroAndFree(alloc, task.api_key);
     if (task.gateway_team) |team| alloc.free(team);
     if (task.account_id) |account_id| alloc.free(account_id);
     types.freeHistoryTurnSlice(alloc, task.history);
@@ -4198,14 +4183,7 @@ pub fn dupeWorkerEvent(alloc: std.mem.Allocator, event: WorkerEvent) !WorkerEven
         .provider_resolved => |slug| .{ .provider_resolved = try alloc.dupe(u8, slug) },
         .api_status_text => |text| .{ .api_status_text = try alloc.dupe(u8, text) },
         .credential_refreshed => |credential| .{
-            .credential_refreshed = .{
-                .token = try alloc.dupe(u8, credential.token),
-                .source = credential.source,
-                .account_id = if (credential.account_id) |value| try alloc.dupe(u8, value) else null,
-                .team_id = if (credential.team_id) |value| try alloc.dupe(u8, value) else null,
-                .team_slug = if (credential.team_slug) |value| try alloc.dupe(u8, value) else null,
-                .refresh_after_ms = credential.refresh_after_ms,
-            },
+            .credential_refreshed = try credential.clone(alloc),
         },
         .command_output => |chunk| .{ .command_output = .{
             .lifecycle_id = if (chunk.lifecycle_id) |id| .{
@@ -4309,7 +4287,8 @@ pub fn freeWorkerEvent(alloc: std.mem.Allocator, event: WorkerEvent) void {
         .provider_resolved => |slug| alloc.free(slug),
         .api_status_text => |text| alloc.free(text),
         .credential_refreshed => |credential| {
-            execution_compatibility.disposeRefreshedCredential(alloc, credential);
+            var owned = credential;
+            owned.deinit(alloc);
         },
         .command_output => |chunk| {
             if (chunk.lifecycle_id) |id| alloc.free(@constCast(id.call_id));

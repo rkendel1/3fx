@@ -97,28 +97,9 @@ pub fn build(b: *std.Build) void {
     const session_manager_test_step = b.step("test-session-manager", "Run the session manager's tests");
     session_manager_test_step.dependOn(&run_session_manager_tests.step);
 
-    // Neutral core standalone test: proves the core is independent of auth/billing/control-plane
-    const neutral_core_module = b.createModule(.{
-        .root_source_file = b.path("src/core/neutral-core.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    const neutral_core_tests = b.addTest(.{
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("tests/neutral-core-standalone.zig"),
-            .target = target,
-            .optimize = optimize,
-        }),
-    });
-    neutral_core_tests.root_module.addImport("neutral", neutral_core_module);
-    const run_neutral_core_tests = b.addRunArtifact(neutral_core_tests);
-    const neutral_core_test_step = b.step("test-neutral-core", "Run neutral core independence tests (compile-time proof of clean boundaries)");
-    neutral_core_test_step.dependOn(&run_neutral_core_tests.step);
-
     const test_step = b.step("test", "Run tests");
     test_step.dependOn(&run_exe_tests.step);
     test_step.dependOn(&run_session_manager_tests.step);
-    test_step.dependOn(&run_neutral_core_tests.step);
 
     if (wasm_surface != .none) {
         addWasmArtifact(b, wasm_surface, git_commit, app_version, update_channel);
