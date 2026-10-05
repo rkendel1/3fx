@@ -8680,7 +8680,7 @@ fn processQueuedPromptLoop(
                     stop_state.retained_candidate,
                     stop_state.latest_partial,
                 );
-                try finishCommonAssistantTerminal(
+                try runtime_finalization.finishCommonAssistantTerminal(
                     deps,
                     finalization,
                     arena,
@@ -8698,7 +8698,7 @@ fn processQueuedPromptLoop(
             }
             if (std.mem.trim(u8, partial_assistant, " \t\r\n").len > 0) {
                 stop_state.terminal_materializing = true;
-                try finishCommonAssistantTerminal(
+                try runtime_finalization.finishCommonAssistantTerminal(
                     deps,
                     finalization,
                     arena,
@@ -8971,7 +8971,7 @@ fn processQueuedPromptLoop(
                     assistant_text,
                 );
                 stop_state.terminal_materializing = true;
-                try finishCommonAssistantTerminal(
+                try runtime_finalization.finishCommonAssistantTerminal(
                     deps,
                     finalization,
                     arena,
@@ -9070,7 +9070,7 @@ fn processQueuedPromptLoop(
                 );
                 stop_state.terminal_materializing =
                     stop_state.retained_candidate != null;
-                try finishCommonAssistantTerminal(
+                try runtime_finalization.finishCommonAssistantTerminal(
                     deps,
                     finalization,
                     arena,
@@ -9150,7 +9150,7 @@ fn processQueuedPromptLoop(
             switch (stop_outcome) {
                 .allow => {
                     stop_state.terminal_materializing = true;
-                    try finishCommonAssistantTerminal(
+                    try runtime_finalization.finishCommonAssistantTerminal(
                         deps,
                         finalization,
                         arena,
@@ -11632,7 +11632,7 @@ fn processQueuedPromptLoop(
                 else
                     null };
                 stop_state.terminal_materializing = true;
-                try finishCommonAssistantTerminal(
+                try runtime_finalization.finishCommonAssistantTerminal(
                     deps,
                     finalization,
                     arena,
@@ -11787,7 +11787,7 @@ fn processQueuedPromptLoop(
             else
                 null };
             stop_state.terminal_materializing = true;
-            try finishCommonAssistantTerminal(
+            try runtime_finalization.finishCommonAssistantTerminal(
                 deps,
                 finalization,
                 arena,
@@ -11875,7 +11875,7 @@ fn processQueuedPromptLoop(
                 );
                 stop_state.terminal_materializing =
                     stop_state.retained_candidate != null;
-                try finishCommonAssistantTerminal(
+                try runtime_finalization.finishCommonAssistantTerminal(
                     deps,
                     finalization,
                     arena,
@@ -11939,7 +11939,7 @@ fn processQueuedPromptLoop(
             switch (stop_outcome) {
                 .allow => {
                     stop_state.terminal_materializing = true;
-                    try finishCommonAssistantTerminal(
+                    try runtime_finalization.finishCommonAssistantTerminal(
                         deps,
                         finalization,
                         arena,
@@ -12014,7 +12014,7 @@ fn finishFailedTurnWithNotice(
             notice,
         );
         stop_state.terminal_materializing = true;
-        try finishCommonAssistantTerminal(
+        try runtime_finalization.finishCommonAssistantTerminal(
             deps,
             finalization,
             arena,
@@ -12047,83 +12047,6 @@ fn finishFailedTurnWithNotice(
         .summary = completed_summary,
     });
     finish_trace.finish(trace_outcome);
-}
-
-pub fn finishCommonAssistantTerminal(
-    deps: *const AgentRuntimeDeps,
-    finalization: *TurnFinalizationGuard,
-    arena: Allocator,
-    job: CompatibilityExecutionJob,
-    current_turn_messages: []const ChatMessage,
-    summary_accumulator: *runtime_telemetry.TurnSummaryAccumulator,
-    assistant_text: runtime_finalization.TerminalText,
-    outcome: types.TurnPresentationOutcome,
-    disposition: ?types.ProviderCompletionDisposition,
-    finish_trace: *PromptFinishTrace,
-    trace_outcome: []const u8,
-    assistant_response: ?ChatMessage,
-) !void {
-    const execution_memory = try runtime_execution_memory.buildExecutionMemory(
-        arena,
-        current_turn_messages,
-    );
-    const history_text = assistant_text.history;
-    const presentation_text = if (assistant_text.presentation) |text|
-        if (std.mem.eql(u8, history_text, text)) null else text
-    else
-        null;
-    const replay = if (assistant_response) |response| try @import("../execution_memory.zig").dupeUnchangedProviderReplay(
-        arena,
-        response.provider_replay,
-        response.content,
-        history_text,
-        response.tool_calls,
-        &.{},
-    ) else null;
-    try finishCommonAssistantTerminalWithExecution(
-        deps,
-        finalization,
-        job,
-        execution_memory,
-        summary_accumulator,
-        history_text,
-        outcome,
-        disposition,
-        finish_trace,
-        trace_outcome,
-        replay,
-        presentation_text,
-    );
-}
-
-fn finishCommonAssistantTerminalWithExecution(
-    deps: *const AgentRuntimeDeps,
-    finalization: *TurnFinalizationGuard,
-    job: CompatibilityExecutionJob,
-    execution_memory: types.ExecutionMemory,
-    summary_accumulator: *runtime_telemetry.TurnSummaryAccumulator,
-    assistant_text: []const u8,
-    outcome: types.TurnPresentationOutcome,
-    disposition: ?types.ProviderCompletionDisposition,
-    finish_trace: *PromptFinishTrace,
-    trace_outcome: []const u8,
-    replay: ?types.ProviderReplay,
-    presentation_text: ?[]const u8,
-) !void {
-    try runtime_finalization.finishAssistantTerminalWithExecution(
-        deps,
-        finalization,
-        job,
-        execution_memory,
-        summary_accumulator,
-        assistant_text,
-        outcome,
-        disposition,
-        finish_trace,
-        trace_outcome,
-        replay,
-        presentation_text,
-    );
 }
 
 pub fn copyLatestStopPartial(
