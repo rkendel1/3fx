@@ -1,3 +1,4 @@
+const ToolArgumentIntegrity = @import("../core/agent/tool_argument_integrity.zig").ToolArgumentIntegrity;
 const std = @import("std");
 const stream_provider = @import("../core/agent/stream_provider.zig");
 const model_provider = @import("../core/config/model_provider.zig");
@@ -397,7 +398,7 @@ fn validateReplayMessage(alloc: std.mem.Allocator, message: types.ChatMessage, l
             return error.ToolArgumentsTooLarge;
         }
         if (call.provenance != .provider_executed and
-            try types.ToolArgumentIntegrity.classifyFunctionInput(alloc, call.arguments_json) != .valid)
+            try ToolArgumentIntegrity.classifyFunctionInput(alloc, call.arguments_json) != .valid)
         {
             return error.InvalidToolArguments;
         }
@@ -2330,7 +2331,7 @@ test "Responses final argument evidence does not manufacture an empty object" {
         const completion = try stream.finish();
         defer stream.freeCompletion(completion);
         try std.testing.expectEqualStrings(case.arguments, completion.tool_calls[0].arguments_json);
-        try std.testing.expect(try types.ToolArgumentIntegrity.classifyFunctionInput(std.testing.allocator, completion.tool_calls[0].arguments_json) != .valid);
+        try std.testing.expect(try ToolArgumentIntegrity.classifyFunctionInput(std.testing.allocator, completion.tool_calls[0].arguments_json) != .valid);
     }
 }
 

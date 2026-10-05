@@ -43,6 +43,48 @@ const InvocationAdmission = struct {
     }
 };
 
+/// Compatibility boundary adapter. Injects credential into neutral model request
+/// and delegates to streamModelCompletion. The orchestrator constructs only
+/// neutral requests; credential information remains outside the neutral path
+/// and is injected here at the gateway boundary.
+pub fn streamNeutralModelCompletion(
+    provider: agent_stream_provider.Provider,
+    alloc: Allocator,
+    neutral_request: agent_stream_provider.NeutralModelRequest,
+    credential: types.CredentialLease,
+    usage: ?*session_usage.Usage,
+    usage_allocator: Allocator,
+) !StreamResult {
+    var model_request = agent_stream_provider.ModelRequest{
+        .credential = credential,
+        .session_id = neutral_request.session_id,
+        .model = neutral_request.model,
+        .retry_count = 1, // Note: retry_count is set at compatibility boundary
+        .instructions = neutral_request.instructions,
+        .messages = neutral_request.messages,
+        .tools = neutral_request.tools,
+        .tool_choice = neutral_request.tool_choice,
+        .vision_mode = neutral_request.vision_mode,
+        .provider_options = neutral_request.provider_options,
+        .max_output_tokens = neutral_request.max_output_tokens,
+        .budget = neutral_request.budget,
+        .verified_images = neutral_request.verified_images,
+        .response_format = neutral_request.response_format,
+        .prepared_request_body = neutral_request.prepared_request_body,
+        .trace_ctx = neutral_request.trace_ctx,
+        .content_capture_limit = neutral_request.content_capture_limit,
+        .deadline = neutral_request.deadline,
+        .cooperative_pulse = neutral_request.cooperative_pulse,
+        .delivery = neutral_request.delivery,
+        .attempt_evidence = neutral_request.attempt_evidence,
+        .events = neutral_request.events,
+        .admission = neutral_request.admission,
+        .cancel_flag = neutral_request.cancel_flag,
+        .provider_attempt_owner = neutral_request.provider_attempt_owner,
+    };
+    return streamModelCompletion(provider, alloc, model_request, usage, usage_allocator);
+}
+
 pub fn streamModelCompletion(
     provider: agent_stream_provider.Provider,
     alloc: Allocator,
@@ -158,6 +200,67 @@ fn recordProviderResultMetric(
             .request_shape = if (failure) |value| value.diagnostics.request_shape orelse "" else "",
         },
     );
+}
+
+test "neutral model request adapter correctly injects credential at boundary" {
+    const Fake = struct {
+        received_credential: ?[]const u8 = null,
+
+        fn stream(raw: ?*anyopaque, alloc: Allocator, request: agent_stream_provider.ModelRequest) !StreamResult {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.received_credential = request.credential.secret();
+            try request.admission.admit();
+            const content = try alloc.dupe(u8, "test response");
+            return .{ .completed = .{ .completion = .{ .content = content }, .ownership = .owned } };
+        }
+
+        fn emit(_: *anyopaque, _: agent_stream_provider.Event) void {}
+    };
+
+    var turn = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer turn.deinit();
+
+    var fake: Fake = .{};
+    var cancel = std.atomic.Value(bool).init(false);
+    var delivery = DeliveryCertainty.init();
+    var evidence: AttemptEvidence = .{};
+
+    const neutral_request = agent_stream_provider.NeutralModelRequest{
+        .model = "test-model",
+        .messages = &.{.{ .role = .user, .content = "hello" }},
+        .tool_choice = .auto,
+        .provider_options = .{},
+        .delivery = &delivery,
+        .attempt_evidence = &evidence,
+        .events = .{ .context = &fake, .emit_fn = Fake.emit },
+        .cancel_flag = &cancel,
+    };
+
+    const test_credential = "test-api-key";
+    const credential_lease: types.CredentialLease = .{ .direct = .{
+        .secret_bytes = test_credential,
+        .source = .ai_gateway_api_key,
+    } };
+
+    const provider = agent_stream_provider.Provider{
+        .context = &fake,
+        .stream_fn = Fake.stream,
+    };
+
+    const result = try streamNeutralModelCompletion(
+        provider,
+        turn.allocator(),
+        neutral_request,
+        credential_lease,
+        null,
+        std.testing.allocator,
+    );
+
+    try std.testing.expect(fake.received_credential != null);
+    try std.testing.expectEqualStrings(test_credential, fake.received_credential.?);
+
+    var owned_result = result;
+    defer owned_result.deinit(turn.allocator());
 }
 
 test "gateway request scratch is released across success failure cancellation and retries" {

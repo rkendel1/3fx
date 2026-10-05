@@ -66,7 +66,12 @@ const Feedback = struct {
         const child = try alloc.dupe(u8, child_id);
         errdefer alloc.free(child);
         const operation = try alloc.dupe(u8, operation_id);
-        item.* = .{ .child_id = child, .operation_id = operation, .fingerprint = fingerprint, .receipt = .{ .operation_id = operation } };
+        item.* = .{
+            .child_id = child,
+            .operation_id = operation,
+            .fingerprint = fingerprint,
+            .receipt = .{ .operation_id = operation },
+        };
         return item;
     }
 
@@ -149,21 +154,15 @@ pub const Owner = struct {
         const item = try Feedback.create(self.alloc, child_id, operation_id, fingerprint);
         var accepted = false;
         defer if (!accepted) item.deinit(self.alloc);
-        const prompt = worker_runtime.QueuedPrompt{
-            .prompt = try self.alloc.dupe(u8, text),
-            .images = &.{},
-            .model = &.{},
-            .api_key = &.{},
-            .permission_mode = .ask,
-            .history = &.{},
-            .grants = &.{},
-            .steering_receipt = &item.receipt,
+        const prompt = worker_runtime.CapturedSubmission{
+            .work = .{ .prompt = try self.alloc.dupe(u8, text) },
+            .snapshot = .{ .images = &.{}, .model = &.{}, .api_key = &.{}, .permission_mode = .ask, .history = &.{}, .grants = &.{}, .steering_receipt = &item.receipt },
         };
         defer if (!accepted) {
             item.receipt.state.store(.not_applied, .seq_cst);
-            worker_runtime.freeQueuedPrompt(self.alloc, prompt);
+            worker_runtime.freeCapturedSubmission(self.alloc, prompt);
         };
-        accepted = try worker.admitActiveSteering(self.alloc, prompt);
+        accepted = try worker.admitActiveSteering(self.alloc, prompt.work, prompt.snapshot);
         if (!accepted) return .waiting;
         self.feedback.appendAssumeCapacity(item);
         debug_trace.eventf("subagent", "feedback_queued", .{}, "child_id={s} work_id={s} operation={s}", .{ child_id, work_id, operation_id });
@@ -681,7 +680,9 @@ const OpenChild = union(enum) {
             },
         );
         errdefer session.close();
-        return .{ .v2 = .{ .session = session, .preferences = try session.currentPreferences(owner.alloc) } };
+        return .{
+            .v2 = .{ .session = session, .preferences = try session.currentPreferences(owner.alloc) },
+        };
     }
 
     fn close(self: *OpenChild, alloc: Allocator) void {
@@ -1316,7 +1317,11 @@ test "subagent wait returns its completed observation after the registry advance
     var owner = Owner{ .alloc = alloc, .backend = .{ .v1 = &sessions }, .state_store = store, .services = undefined, .authority_resolver = undefined, .approvals = undefined };
     defer owner.deinit();
     const slot = try alloc.create(Slot);
-    slot.* = .{ .owner = &owner, .child_id = try alloc.dupe(u8, "child"), .completion = .{ .published = .{ .phase = .idle, .outcome = .completed } } };
+    slot.* = .{
+        .owner = &owner,
+        .child_id = try alloc.dupe(u8, "child"),
+        .completion = .{ .published = .{ .phase = .idle, .outcome = .completed } },
+    };
     try owner.slots.append(alloc, slot);
     slot.done.set(io_mod.getIo());
     const observed = try owner.wait("child", .{ .clock = .awake, .raw = .fromMilliseconds(1) });

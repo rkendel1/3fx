@@ -33,7 +33,7 @@ const Allocator = std.mem.Allocator;
 const HistoryTurn = types.HistoryTurn;
 const PermissionGrant = types.PermissionGrant;
 const ToolCall = types.ToolCall;
-const QueuedPrompt = worker_runtime.QueuedPrompt;
+const CompatibilityExecutionJob = worker_runtime.CompatibilityExecutionJob;
 
 const FakeCompletion = test_support.FakeCompletion;
 const FakeGateway = test_support.FakeGateway;
@@ -298,7 +298,7 @@ test "promoted steering remains model marked across the worker handoff" {
     );
 }
 
-fn makeOwnedProviderPrompt(alloc: Allocator, text: []const u8, model: []const u8) !QueuedPrompt {
+fn makeOwnedProviderPrompt(alloc: Allocator, text: []const u8, model: []const u8) !worker_runtime.CapturedSubmission {
     const prompt = try alloc.dupe(u8, text);
     errdefer alloc.free(prompt);
     const model_copy = try alloc.dupe(u8, model);
@@ -310,15 +310,7 @@ fn makeOwnedProviderPrompt(alloc: Allocator, text: []const u8, model: []const u8
     const grants = try alloc.alloc(PermissionGrant, 0);
     errdefer alloc.free(grants);
 
-    return .{
-        .prompt = prompt,
-        .images = &.{},
-        .model = model_copy,
-        .api_key = api_key,
-        .permission_mode = .ask,
-        .history = history,
-        .grants = grants,
-    };
+    return .{ .work = .{ .prompt = prompt }, .snapshot = .{ .images = &.{}, .model = model_copy, .api_key = api_key, .permission_mode = .ask, .history = history, .grants = grants } };
 }
 
 fn expectPromptEntryRole(entry: std.json.Value, expected_role: types.ChatRole) !void {
@@ -4537,10 +4529,13 @@ test "processQueuedPrompt provider payload follows queued model sync boundaries"
         .effort = types.ReasoningEffort.literal("high"),
     };
 
-    try worker.enqueuePrompt(alloc, try makeOwnedProviderPrompt(alloc, "unsupported", "anthropic/claude-opus-4.6"));
+    try (submission: {
+        const captured: worker_runtime.CapturedSubmission = try makeOwnedProviderPrompt(alloc, "unsupported", "anthropic/claude-opus-4.6");
+        break :submission worker.enqueuePrompt(alloc, captured.work, captured.snapshot);
+    });
     try worker.syncQueuedPromptModel(alloc, "openai/gpt-4o");
     const unsupported_job = (try worker.waitAndTakeNextPrompt(alloc)).?;
-    defer worker_runtime.freeQueuedPrompt(alloc, unsupported_job);
+    defer worker_runtime.freeCompatibilityExecutionJob(alloc, unsupported_job);
     try std.testing.expect(unsupported_job.agent_settings.fast_mode);
 
     {
@@ -4561,10 +4556,13 @@ test "processQueuedPrompt provider payload follows queued model sync boundaries"
     }
     worker.finishProcessing();
 
-    try worker.enqueuePrompt(alloc, try makeOwnedProviderPrompt(alloc, "supported", "openai/gpt-4o"));
+    try (submission: {
+        const captured: worker_runtime.CapturedSubmission = try makeOwnedProviderPrompt(alloc, "supported", "openai/gpt-4o");
+        break :submission worker.enqueuePrompt(alloc, captured.work, captured.snapshot);
+    });
     try worker.syncQueuedPromptModel(alloc, "anthropic/claude-opus-4.6");
     const supported_job = (try worker.waitAndTakeNextPrompt(alloc)).?;
-    defer worker_runtime.freeQueuedPrompt(alloc, supported_job);
+    defer worker_runtime.freeCompatibilityExecutionJob(alloc, supported_job);
     try std.testing.expect(supported_job.agent_settings.fast_mode);
 
     {

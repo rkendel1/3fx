@@ -333,22 +333,14 @@ const TestWorkerApp = struct {
     }
 };
 
-fn makeQueuedPrompt(alloc: std.mem.Allocator, text: []const u8) !worker_runtime.QueuedPrompt {
-    return .{
-        .prompt = try alloc.dupe(u8, text),
-        .images = &.{},
-        .model = try alloc.dupe(u8, "test-model"),
-        .api_key = try alloc.dupe(u8, "test-key"),
-        .permission_mode = .ask,
-        .history = try alloc.alloc(types.HistoryTurn, 0),
-        .grants = try alloc.alloc(types.PermissionGrant, 0),
-    };
+fn makeQueuedPrompt(alloc: std.mem.Allocator, text: []const u8) !worker_runtime.CapturedSubmission {
+    return .{ .work = .{ .prompt = try alloc.dupe(u8, text) }, .snapshot = .{ .images = &.{}, .model = try alloc.dupe(u8, "test-model"), .api_key = try alloc.dupe(u8, "test-key"), .permission_mode = .ask, .history = try alloc.alloc(types.HistoryTurn, 0), .grants = try alloc.alloc(types.PermissionGrant, 0) } };
 }
 
 fn queuePrompt(app: *TestWorkerApp, text: []const u8) !void {
     const prompt = try makeQueuedPrompt(std.heap.c_allocator, text);
-    errdefer worker_runtime.freeQueuedPrompt(std.heap.c_allocator, prompt);
-    try app.worker.enqueuePrompt(std.heap.c_allocator, prompt);
+    errdefer worker_runtime.freeCapturedSubmission(std.heap.c_allocator, prompt);
+    try app.worker.enqueuePrompt(std.heap.c_allocator, prompt.work, prompt.snapshot);
 }
 
 test "startWorkerThread processes queued prompt and exits on shutdown" {

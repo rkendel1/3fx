@@ -1,3 +1,4 @@
+const ToolArgumentIntegrity = @import("../agent/tool_argument_integrity.zig").ToolArgumentIntegrity;
 const std = @import("std");
 const image_attachments = @import("../images/image_attachments.zig");
 const image_data = @import("../images/image_data.zig");
@@ -2347,7 +2348,7 @@ fn parseToolCall(alloc: Allocator, value: std.json.Value) !session.ToolCall {
     errdefer mem_utils.free(alloc, name);
     var arguments_json = try parseRequiredDurableBytes(alloc, object, "arguments_json");
     errdefer mem_utils.free(alloc, arguments_json);
-    const argument_integrity = try types.ToolArgumentIntegrity.classifyFunctionInput(alloc, arguments_json);
+    const argument_integrity = try ToolArgumentIntegrity.classifyFunctionInput(alloc, arguments_json);
     if (argument_integrity == .malformed_json) {
         const safe_arguments = try alloc.dupe(u8, "{}");
         mem_utils.free(alloc, arguments_json);
@@ -3675,14 +3676,14 @@ test "durable state repairs duplicate-key execution and interrupted tool argumen
 
     const decoded_step = decoded.history[0].assistant.execution.tool_steps[0];
     try std.testing.expectEqualStrings("{}", decoded_step.tool_calls[0].arguments_json);
-    try std.testing.expectEqual(types.ToolArgumentIntegrity.valid, decoded_step.tool_calls[0].argument_integrity);
+    try std.testing.expectEqual(ToolArgumentIntegrity.valid, decoded_step.tool_calls[0].argument_integrity);
     try std.testing.expectEqual(session.PersistedToolStatus.failure, decoded_step.tool_results[0].status);
     try std.testing.expect(std.mem.find(u8, decoded_step.tool_results[0].output, "tool_execution_failed") != null);
     try std.testing.expect(std.mem.find(u8, decoded_step.tool_results[0].output, duplicate_arguments) == null);
 
     const interrupted = decoded.history[1].interrupted.tool_call.?;
     try std.testing.expectEqualStrings("{}", interrupted.arguments_json);
-    try std.testing.expectEqual(types.ToolArgumentIntegrity.valid, interrupted.argument_integrity);
+    try std.testing.expectEqual(ToolArgumentIntegrity.valid, interrupted.argument_integrity);
 }
 
 test "non-object saved function inputs are repaired without changing recorded outcomes" {
@@ -3713,7 +3714,7 @@ test "non-object saved function inputs are repaired without changing recorded ou
                 const step = decoded.assistant.execution.tool_steps[0];
                 try std.testing.expectEqualStrings(if (native_kind == 0) "{}" else arguments, step.tool_calls[0].arguments_json);
                 try std.testing.expectEqual(if (native_kind == 0) types.ToolExecutionProvenance.fx_local else .provider_executed, step.tool_calls[0].provenance);
-                try std.testing.expectEqual(types.ToolArgumentIntegrity.valid, step.tool_calls[0].argument_integrity);
+                try std.testing.expectEqual(ToolArgumentIntegrity.valid, step.tool_calls[0].argument_integrity);
                 try std.testing.expectEqual(status, step.tool_results[0].status);
                 try std.testing.expectEqualStrings("stale", step.tool_results[0].output);
                 try std.testing.expectEqualStrings("retained-handle", step.tool_results[0].output_handle.?);

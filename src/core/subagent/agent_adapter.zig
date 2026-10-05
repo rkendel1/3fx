@@ -228,43 +228,25 @@ pub fn run(
         return error.ProviderFailed;
     };
     const history = turn.sessionRuntime().snapshotHistory(arena) catch return error.OutOfMemory;
-    const prompt = worker_runtime.QueuedPrompt{
-        .turn_id = trace_context.turn_id,
-        .prompt = arena.dupe(u8, message.content) catch return error.OutOfMemory,
-        .images = &.{},
-        .model = arena.dupe(u8, admission.model) catch return error.OutOfMemory,
-        .provider = admission.provider,
-        .api_key = arena.dupe(u8, routed_config.tool_context.api_key) catch return error.OutOfMemory,
-        .gateway_team = if (routed_config.tool_context.gateway_team) |team|
-            arena.dupe(u8, team) catch return error.OutOfMemory
-        else
-            null,
-        .credential_source = routed_config.tool_context.credential_source,
-        .account_id = if (routed_config.tool_context.account_id) |account_id|
-            arena.dupe(u8, account_id) catch return error.OutOfMemory
-        else
-            null,
-        .permission_mode = admission.permission_mode,
-        .history = history,
-        .unversioned_history_count = turn.sessionRuntime().unversionedHistoryEnd(),
-        .root_user_intent_context = if (message.root_user_intent_context.len > 0)
-            arena.dupe(u8, message.root_user_intent_context) catch return error.OutOfMemory
-        else
-            &.{},
-        .grants = types.dupePermissionGrantSlice(arena, admission.grants) catch return error.OutOfMemory,
-        .agent_settings = .{
-            .max_tool_result_bytes = config.tool_context.max_tool_result_bytes,
-            .auto_compact_percent = config.tool_context.auto_compact_percent,
-            .first_call_tool_choice = config.tool_context.first_call_tool_choice,
-            .fast_mode = config.tool_context.fast_mode,
-            .ultrafast_mode = ultrafast_mode,
-            .effort = admission.effort,
-            .provider_order = if (admission.provider == .gateway) config.tool_context.provider_order else &.{},
-            .provider_strict = admission.provider == .gateway and config.tool_context.provider_strict,
-        },
-        .recovery_checkpoint = recovery_checkpoint,
-        .recovery_source_already_presented = recovery_checkpoint != null,
-    };
+    const prompt = try worker_runtime.admitSynchronousSubmission(arena, .{ .turn_id = trace_context.turn_id, .prompt = arena.dupe(u8, message.content) catch return error.OutOfMemory }, .{ .images = &.{}, .model = arena.dupe(u8, admission.model) catch return error.OutOfMemory, .provider = admission.provider, .api_key = arena.dupe(u8, routed_config.tool_context.api_key) catch return error.OutOfMemory, .gateway_team = if (routed_config.tool_context.gateway_team) |team|
+        arena.dupe(u8, team) catch return error.OutOfMemory
+    else
+        null, .credential_source = routed_config.tool_context.credential_source, .account_id = if (routed_config.tool_context.account_id) |account_id|
+        arena.dupe(u8, account_id) catch return error.OutOfMemory
+    else
+        null, .permission_mode = admission.permission_mode, .history = history, .unversioned_history_count = turn.sessionRuntime().unversionedHistoryEnd(), .root_user_intent_context = if (message.root_user_intent_context.len > 0)
+        arena.dupe(u8, message.root_user_intent_context) catch return error.OutOfMemory
+    else
+        &.{}, .grants = types.dupePermissionGrantSlice(arena, admission.grants) catch return error.OutOfMemory, .agent_settings = .{
+        .max_tool_result_bytes = config.tool_context.max_tool_result_bytes,
+        .auto_compact_percent = config.tool_context.auto_compact_percent,
+        .first_call_tool_choice = config.tool_context.first_call_tool_choice,
+        .fast_mode = config.tool_context.fast_mode,
+        .ultrafast_mode = ultrafast_mode,
+        .effort = admission.effort,
+        .provider_order = if (admission.provider == .gateway) config.tool_context.provider_order else &.{},
+        .provider_strict = admission.provider == .gateway and config.tool_context.provider_strict,
+    }, .recovery_checkpoint = recovery_checkpoint, .recovery_source_already_presented = recovery_checkpoint != null });
     const child_tool_names = try withoutSubagentNames(
         arena,
         config.advertised_tool_names,
@@ -315,7 +297,7 @@ pub fn run(
             .gateway_chat_url = config.tool_context.gateway_chat_url,
             .advertised_tool_names = child_tool_names,
             .advertised_functions = child_functions,
-            .provider_capabilities = config.provider_set.select(admission.provider).capabilities,
+            .provider_capabilities = config.provider_set.select(admission.provider).agentFeatures(),
             .custom_tool_guidance = config.custom_tool_guidance,
             .agent_step_limit = config.tool_context.agent_step_limit,
             .max_tool_result_bytes = config.tool_context.max_tool_result_bytes,

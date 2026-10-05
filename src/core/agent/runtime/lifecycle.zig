@@ -1,3 +1,5 @@
+const ToolArgumentDiagnostic = @import("../tool_argument_diagnostic.zig").ToolArgumentDiagnostic;
+const ToolArgumentIntegrity = @import("../tool_argument_integrity.zig").ToolArgumentIntegrity;
 const std = @import("std");
 const hooks = @import("../../hooks/hooks.zig");
 const types = @import("../../shared/types.zig");
@@ -221,11 +223,11 @@ test "malformed function arguments report the diagnosed input they replaced" {
     defer from_raw.deinit(alloc);
     try std.testing.expect(from_raw == .blocked);
     try std.testing.expectEqualStrings("{}", from_raw.call().arguments_json);
-    try std.testing.expectEqual(types.ToolArgumentIntegrity.malformed_json, from_raw.call().argument_integrity);
+    try std.testing.expectEqual(ToolArgumentIntegrity.malformed_json, from_raw.call().argument_integrity);
     try expectMalformedFeedback(from_raw.blocked.model_output.?, "truncated", raw);
 
     const provider_raw = "{\"path\":\"a\",}";
-    const provider_diagnostic = try types.ToolArgumentDiagnostic.diagnose(alloc, provider_raw);
+    const provider_diagnostic = try ToolArgumentDiagnostic.diagnose(alloc, provider_raw);
     var from_provider = try prepareToolCallForLifecycle(alloc, context, null, 1, 0, .{
         .id = "provider",
         .name = "read_file",
@@ -284,7 +286,7 @@ fn prepareToolCallFromCheckpoint(
         return .{ .provider_executed = try types.dupeToolCall(result_allocator, call) };
     }
     const integrity = if (call.argument_integrity == .valid)
-        try types.ToolArgumentIntegrity.classifyFunctionInput(result_allocator, call.arguments_json)
+        try ToolArgumentIntegrity.classifyFunctionInput(result_allocator, call.arguments_json)
     else
         call.argument_integrity;
     if (integrity != .valid) {
@@ -292,7 +294,7 @@ fn prepareToolCallFromCheckpoint(
         rejected.argument_integrity = integrity;
         // Raw arguments reach this point only when the provider did not classify them.
         if (integrity == .malformed_json and call.argument_integrity == .valid) {
-            rejected.argument_diagnostic = try types.ToolArgumentDiagnostic.diagnose(result_allocator, call.arguments_json);
+            rejected.argument_diagnostic = try ToolArgumentDiagnostic.diagnose(result_allocator, call.arguments_json);
         }
         return makePreparedBlocked(
             result_allocator,
@@ -438,7 +440,7 @@ pub fn dupeBlockedToolCall(alloc: Allocator, call: ToolCall) !ToolCall {
     var replay = call;
     if (call.provenance != .provider_executed) {
         replay.argument_integrity = if (call.argument_integrity == .valid)
-            try types.ToolArgumentIntegrity.classifyFunctionInput(alloc, call.arguments_json)
+            try ToolArgumentIntegrity.classifyFunctionInput(alloc, call.arguments_json)
         else
             call.argument_integrity;
         if (replay.argument_integrity != .valid) replay.arguments_json = "{}";

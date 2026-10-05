@@ -1,3 +1,4 @@
+const ToolArgumentIntegrity = @import("../tool_argument_integrity.zig").ToolArgumentIntegrity;
 const std = @import("std");
 const skill_runtime = @import("../../skills/skill_runtime.zig");
 const skill_contract = @import("../../skills/skill_contract.zig");
@@ -21,10 +22,7 @@ const text_utils = @import("../../shared/text_utils.zig");
 const file_mutation_contract = @import("../../tooling/file_mutation_contract.zig");
 const io_mod = @import("../../shared/io.zig");
 const host_target = @import("../../hosts/target.zig");
-const secret = @import("../../auth/secret.zig");
-const auth_transition = @import("../../auth/auth_transition.zig");
-const credentials = @import("../../auth/credentials.zig");
-const credential_authority = @import("../../auth/credential_authority.zig");
+const execution_compatibility = @import("../../app/execution_compatibility.zig");
 const tool_dispatch = @import("../../tooling/tool_dispatch.zig");
 const model_tool_schema = @import("../../tooling/model_tool_schema.zig");
 const command_result_mapping = @import("../../tooling/command_result_mapping.zig");
@@ -73,10 +71,9 @@ const ChatMessage = types.ChatMessage;
 const HistoryTurn = types.HistoryTurn;
 const PermissionGrant = types.PermissionGrant;
 const ToolCall = types.ToolCall;
-const QueuedPrompt = worker_runtime.QueuedPrompt;
+const CompatibilityExecutionJob = worker_runtime.CompatibilityExecutionJob;
 const TraceContext = debug_trace.TraceContext;
 const AgentRuntimeDeps = runtime_deps.AgentRuntimeDeps;
-const CredentialRefreshMode = runtime_deps.CredentialRefreshMode;
 
 const http_error_detail_max_bytes: usize = 4096;
 const assistant_prefill_recovery_prompt =
@@ -118,7 +115,7 @@ fn take_steering_boundary(
 fn finish_steering_handoff(
     deps: *const AgentRuntimeDeps,
     finalization: *TurnFinalizationGuard,
-    job: QueuedPrompt,
+    job: CompatibilityExecutionJob,
     completed_tool_names: [][]u8,
     interrupted_persisted: *bool,
     step_ctx: TraceContext,
@@ -167,9 +164,9 @@ fn observe_steering_boundary(
     kind: worker_runtime.SteeringBoundaryKind,
 ) !SteeringBoundaryAction {
     const boundary = try take_steering_boundary(deps, result_alloc, turn_id, kind);
-    switch (boundary) {
-        .continue_turn => |guidance| {
-            try append_steering_guidance(arena, within_turn_suffix, guidance, origin);
+    switch (boundary.decision()) {
+        .continue_turn => {
+            try append_steering_guidance(arena, within_turn_suffix, boundary.continue_turn, origin);
             return .continued;
         },
         .handoff => return .handoff,
@@ -223,8 +220,8 @@ fn append_pending_steering_after_assistant(
     boundary_kind: worker_runtime.SteeringBoundaryKind,
 ) !bool {
     const boundary = try take_steering_boundary(deps, arena, turn_id, boundary_kind);
-    const guidance = switch (boundary) {
-        .continue_turn => |messages| messages,
+    const guidance = switch (boundary.decision()) {
+        .continue_turn => boundary.continue_turn,
         .none, .handoff, .interrupt => return false,
     };
 
@@ -245,8 +242,8 @@ fn append_immediate_steering_after_cancel(
     assistant_text: []const u8,
 ) !bool {
     const boundary = try take_steering_boundary(deps, arena, turn_id, .cancelled);
-    const guidance = switch (boundary) {
-        .continue_turn => |messages| messages,
+    const guidance = switch (boundary.decision()) {
+        .continue_turn => boundary.continue_turn,
         .none, .handoff, .interrupt => return false,
     };
 
@@ -1140,7 +1137,7 @@ test "rejected subagent arguments keep their call and result during projection" 
     };
     // Rewriting a malformed call into an assistant-role summary would leave
     // the next request ending in assistant prefill.
-    for ([_]types.ToolArgumentIntegrity{ .non_object_json, .malformed_json, .valid }) |integrity| {
+    for ([_]ToolArgumentIntegrity{ .non_object_json, .malformed_json, .valid }) |integrity| {
         calls[0].argument_integrity = integrity;
         const projected = try project_subagent_request_messages(
             alloc,
@@ -3447,7 +3444,7 @@ fn finishPendingCancelledCalls(
 pub const CommonStopState = struct {
     retained_candidate: ?[]const u8 = null,
     latest_partial: ?[]const u8 = null,
-    dispatched: bool = false,
+    control: @import("../stop_control.zig").StopControl = .{},
     terminal_materializing: bool = false,
 };
 
@@ -3566,7 +3563,7 @@ fn build_provider_prompt_with_response_language_control(
         };
         break :blk projected;
     } else ephemeral_overlay;
-    var prompt = try buildProviderPromptForCompactionWindow(
+    var prompt = try runtime_prompt_context.buildProviderPromptForCompactionWindow(
         alloc,
         stable_prefix,
         effective_overlay,
@@ -3744,106 +3741,6 @@ fn recoverySelectionChanged(
         checkpoint.requested_ultrafast_mode != selected_ultrafast_mode;
 }
 
-fn recoveryCredentialAuthorityMatches(
-    checkpoint: session_codec.RecoveryCheckpoint,
-    source: ?types.CredentialSource,
-    account_id: ?[]const u8,
-) bool {
-    const expected_source = checkpoint.authority.credential_source orelse return false;
-    const expected_identity = checkpoint.authority.credential_identity orelse return false;
-    const current_source = source orelse return false;
-    if (current_source != expected_source) return false;
-    const current_identity = credential_authority.derive(
-        current_source,
-        account_id,
-    ) orelse return false;
-    return expected_identity.eql(current_identity);
-}
-
-fn shouldRejectRecoveryAuthority(
-    checkpoint: session_codec.RecoveryCheckpoint,
-    source: ?types.CredentialSource,
-    account_id: ?[]const u8,
-) bool {
-    if (checkpoint.disposition == .history_only) return true;
-    const provider_may_have_received_request = checkpoint.outstanding_reservation or
-        checkpoint.consumed_provider_attempts > 0;
-    return provider_may_have_received_request and !recoveryCredentialAuthorityMatches(
-        checkpoint,
-        source,
-        account_id,
-    );
-}
-
-test "potentially sent recovery rejects missing or changed credential authority" {
-    const identity = credential_authority.derive(
-        .chatgpt_subscription,
-        "acct_1",
-    ).?;
-    const checkpoint = session_codec.RecoveryCheckpoint{
-        .turn_id = 1,
-        .user = .{ .text = @constCast("continue") },
-        .assistant_source = @constCast("partial"),
-        .cause = .response_interrupted,
-        .action = .continuing_response,
-        .authority = .{
-            .provider = .codex,
-            .model = @constCast("gpt-5.4"),
-            .credential_source = .chatgpt_subscription,
-            .credential_identity = identity,
-        },
-        .requested_fast_mode = false,
-        .fast_mode = false,
-        .max_provider_attempts = 3,
-        .consumed_provider_attempts = 1,
-    };
-    try std.testing.expect(!shouldRejectRecoveryAuthority(
-        checkpoint,
-        .chatgpt_subscription,
-        "acct_1",
-    ));
-    try std.testing.expect(shouldRejectRecoveryAuthority(
-        checkpoint,
-        .chatgpt_subscription,
-        "acct_2",
-    ));
-
-    var legacy = checkpoint;
-    legacy.authority.credential_source = null;
-    legacy.authority.credential_identity = null;
-    try std.testing.expect(shouldRejectRecoveryAuthority(
-        legacy,
-        .chatgpt_subscription,
-        "acct_1",
-    ));
-    legacy.authority.credential_source = .ai_gateway_api_key;
-    legacy.authority.credential_identity = credential_authority.derive(
-        .ai_gateway_api_key,
-        null,
-    );
-    try std.testing.expect(!shouldRejectRecoveryAuthority(
-        legacy,
-        .ai_gateway_api_key,
-        null,
-    ));
-    try std.testing.expect(shouldRejectRecoveryAuthority(
-        legacy,
-        .stored_key,
-        null,
-    ));
-    legacy.authority.credential_source = null;
-    legacy.authority.credential_identity = null;
-    legacy.consumed_provider_attempts = 0;
-    try std.testing.expect(!shouldRejectRecoveryAuthority(
-        legacy,
-        .chatgpt_subscription,
-        "acct_1",
-    ));
-    legacy.disposition = .history_only;
-    try std.testing.expect(shouldRejectRecoveryAuthority(legacy, .chatgpt_subscription, "acct_1"));
-    try std.testing.expect(shouldRejectRecoveryAuthority(legacy, null, null));
-}
-
 fn checkpointCause(
     cause: model_response_recovery.FailureCause,
 ) types.ModelRecoveryCause {
@@ -3916,7 +3813,7 @@ noinline fn pausedRequiredAction(
 fn appendRunningToolCalls(
     deps: *const AgentRuntimeDeps,
     finalization: *const TurnFinalizationGuard,
-    job: QueuedPrompt,
+    job: CompatibilityExecutionJob,
     current_turn_messages: []const ChatMessage,
     calls: []const types.ToolCall,
 ) !void {
@@ -3941,7 +3838,7 @@ fn appendRunningToolCalls(
 fn persistRecoveryCheckpoint(
     deps: *const AgentRuntimeDeps,
     finalization: *const TurnFinalizationGuard,
-    job: QueuedPrompt,
+    job: CompatibilityExecutionJob,
     current_turn_messages: []const ChatMessage,
     assistant_source: []const u8,
     route_model: []const u8,
@@ -3978,18 +3875,7 @@ fn persistRecoveryCheckpoint(
         .cause = checkpointCause(cause),
         .action = checkpointAction(strategy),
         .tool_state = checkpointToolState(tool_evidence),
-        .authority = .{
-            .provider = job.provider,
-            .model = @constCast(route_model),
-            .credential_source = job.credential_source,
-            .credential_identity = if (job.credential_source) |source|
-                credential_authority.derive(
-                    source,
-                    job.account_id,
-                )
-            else
-                null,
-        },
+        .authority = execution_compatibility.recoveryAuthority(job, route_model),
         .requested_fast_mode = requested_fast_mode,
         .fast_mode = fast_mode,
         .requested_ultrafast_mode = job.agent_settings.ultrafast_mode,
@@ -4019,7 +3905,7 @@ const CompactionSource = struct {
     deps: *const AgentRuntimeDeps,
     finalization: *const TurnFinalizationGuard,
     arena: Allocator,
-    job: QueuedPrompt,
+    job: CompatibilityExecutionJob,
     current_turn_messages: []const ChatMessage,
     route_model: []const u8,
     requested_fast_mode: bool,
@@ -4047,12 +3933,7 @@ const CompactionSource = struct {
             .cause = .compaction_prepared,
             .action = if (self.tool_evidence == .confirmed) .continuing_after_tool else .retrying_request,
             .tool_state = checkpointToolState(self.tool_evidence),
-            .authority = .{
-                .provider = job.provider,
-                .model = @constCast(self.route_model),
-                .credential_source = job.credential_source,
-                .credential_identity = if (job.credential_source) |source| credential_authority.derive(source, job.account_id) else null,
-            },
+            .authority = execution_compatibility.recoveryAuthority(job, self.route_model),
             .requested_fast_mode = self.requested_fast_mode,
             .fast_mode = self.fast_mode,
             .max_provider_attempts = self.attempt_limit,
@@ -4897,57 +4778,6 @@ fn unsafeNoRetryReason(
         .assistant_output;
 }
 
-fn refreshGatewayCredentialForJob(
-    deps: *const AgentRuntimeDeps,
-    alloc: Allocator,
-    job: QueuedPrompt,
-    mode: CredentialRefreshMode,
-    active_api_key: *[]const u8,
-    owned_api_key: *?[]u8,
-    trace_ctx: TraceContext,
-) !bool {
-    const source = job.credential_source orelse return false;
-    if (!credentials.sourceRefreshable(source)) return false;
-    const refresh = deps.refresh_gateway_credential orelse return false;
-
-    const refreshed = refresh(deps.ctx, alloc, source, mode, job.account_id) catch |err| {
-        if (err == error.OutOfMemory) return err;
-        debug_trace.eventf(
-            "gateway",
-            "credential_refresh_failed",
-            trace_ctx,
-            "source={s} mode={s} err={s}",
-            .{ @tagName(source), @tagName(mode), @errorName(err) },
-        );
-        return false;
-    } orelse return false;
-    const previous_api_key = active_api_key.*;
-    if (comptime !host_target.is_wasm) {
-        if (deps.usage) |usage| {
-            if (source == .chatgpt_subscription or source == .grok_subscription) {
-                usage.clearReconciliationCredential();
-            } else {
-                usage.refreshReconciliationCredential(
-                    deps.usage_allocator,
-                    previous_api_key,
-                    refreshed,
-                );
-            }
-        }
-    }
-    if (owned_api_key.*) |old| secret.zeroAndFree(alloc, old);
-    owned_api_key.* = refreshed;
-    active_api_key.* = refreshed;
-    debug_trace.eventf(
-        "gateway",
-        "credential_refreshed",
-        trace_ctx,
-        "source={s} mode={s}",
-        .{ @tagName(source), @tagName(mode) },
-    );
-    return true;
-}
-
 fn auto_retry_status(
     failed_attempt: usize,
     attempt_limit: usize,
@@ -5182,7 +5012,7 @@ test "recoveryElapsedNs clamps backward wall-clock steps" {
 /// jobs and subagent turns keep their own state.
 fn restorePromptAfterTerminalFailure(
     deps: *const AgentRuntimeDeps,
-    job: QueuedPrompt,
+    job: CompatibilityExecutionJob,
     config: Config,
 ) void {
     if (config.origin != .root) return;
@@ -5199,13 +5029,6 @@ fn restorePromptAfterTerminalFailure(
 // resume would auto-continue a turn the user explicitly stopped. Covers the
 // model-response cancel paths, including a cancel during an episode's first
 // retry wait; no-ops when no checkpoint exists.
-fn clearRecoveryCheckpointOnUserCancel(deps: *const AgentRuntimeDeps) void {
-    const effect = deps.recovery_checkpoint orelse return;
-    effect.clear(deps.ctx) catch |err| {
-        debug_trace.logf("agent", "recovery checkpoint clear on cancel failed err={s}", .{@errorName(err)});
-    };
-}
-
 fn defaultRecoveryDiagnostic(cause: model_response_recovery.FailureCause) types.ModelFailureDiagnostic {
     if (cause == .content_filter) return types.ModelFailureDiagnostic.init("content_filter");
     return types.ModelFailureDiagnostic.forCause(checkpointCause(cause));
@@ -5317,7 +5140,7 @@ pub fn processAgentPrompt(
     semantic_presentation: ?runtime_assistant_stream.SemanticPresentationSink,
     lifecycle: LifecycleContext,
     config: Config,
-    job: QueuedPrompt,
+    job: CompatibilityExecutionJob,
 ) !void {
     if (deps.compaction_failure) |out| out.* = null;
     var effective_job = job;
@@ -5343,6 +5166,8 @@ pub fn processAgentPrompt(
     );
     defer finalization.deinit();
 
+    // The compatibility job retains all auth/credential/account state;
+    // processQueuedPromptInner constructs its own projected state as needed.
     processQueuedPromptInner(deps, semantic_presentation, effective_lifecycle, effective_config, effective_job, &finalization, agent) catch |err| {
         if (finalization.state == .open) {
             finalization.finish(.failed, null, null) catch |finalization_err| {
@@ -5462,28 +5287,21 @@ fn processQueuedPromptInner(
     semantic_presentation: ?runtime_assistant_stream.SemanticPresentationSink,
     lifecycle: LifecycleContext,
     config: Config,
-    borrowed_job: QueuedPrompt,
+    borrowed_job: CompatibilityExecutionJob,
     finalization: *TurnFinalizationGuard,
     agent: *runtime_agent.Agent,
 ) !void {
     var arena_state = std.heap.ArenaAllocator.init(std.heap.c_allocator);
     defer mem_utils.deinit_arena(arena_state);
     const arena = arena_state.allocator();
-    var job = borrowed_job;
-    job.account_id = if (borrowed_job.account_id) |account_id|
-        try arena.dupe(u8, account_id)
-    else
-        null;
-    job.gateway_team = if (borrowed_job.gateway_team) |gateway_team|
-        try arena.dupe(u8, gateway_team)
-    else
-        null;
+    const job = try execution_compatibility.copyAuthorityForTurn(arena, borrowed_job);
 
     var summary_accumulator = runtime_telemetry.TurnSummaryAccumulator.init(
         io_mod.milliTimestamp(),
         if (config.origin == .root) job.prompt else "",
     );
-    const turn_id = job.turn_id;
+    var coordinator = execution_compatibility.coordinator(job, &agent.turn, config.cancel_flag, config.agent_step_limit);
+    const turn_id = coordinator.turn_id;
     var finish_trace = PromptFinishTrace{ .ctx = .{ .turn_id = turn_id, .subagent_id = config.subagent_id } };
     errdefer {
         if (config.cancel_flag.load(.seq_cst)) {
@@ -5695,7 +5513,7 @@ fn processQueuedPromptInner(
         "history_turns={d} gateway_messages_before={d} interrupted_turns={d} history_turn_kinds={s}",
         .{ active_history.len, history_messages_before, interrupted_turns, history_turn_kinds },
     );
-    if (job.delivery.isContinuation()) {
+    if (coordinator.delivery.isContinuation()) {
         try session_runtime.appendSteeringActiveContextHistoryChatMessages(
             arena,
             &history_messages,
@@ -5725,7 +5543,7 @@ fn processQueuedPromptInner(
 
     const current_user_message: ChatMessage = .{
         .role = .user,
-        .content = if (job.delivery.isContinuation())
+        .content = if (coordinator.delivery.isContinuation())
             try runtime_execution_memory.steeringMessage(arena, job.prompt)
         else
             job.prompt,
@@ -5733,6 +5551,7 @@ fn processQueuedPromptInner(
     };
 
     var stop_state = CommonStopState{};
+    var control = execution_compatibility.loopControl(&coordinator);
     processQueuedPromptLoop(
         deps,
         semantic_presentation,
@@ -5746,7 +5565,7 @@ fn processQueuedPromptInner(
         base_nested_read_tool_result_advertised,
         finalization,
         arena,
-        turn_id,
+        &control,
         &stable_prefix,
         &history_messages,
         &within_turn_suffix,
@@ -5853,34 +5672,6 @@ fn containsImageId(image_ids: []const usize, candidate: usize) bool {
     return false;
 }
 
-fn buildReviewTurnContext(
-    config: Config,
-    model: []const u8,
-    root_user_intent_context: []const u8,
-    current_turn_messages: []const ChatMessage,
-    pending_assistant: ChatMessage,
-    credential: types.CredentialLease,
-    target_call_id: []const u8,
-    review_attempt_available: bool,
-) permission_auto_classifier.ReviewTurnContext {
-    const trusted_root_context = auto_classifier_context.rootUserRequestContext(
-        root_user_intent_context,
-    ) orelse "";
-    return .{
-        .model = model,
-        .pending_assistant = pending_assistant,
-        .credential = credential,
-        .target_call_id = target_call_id,
-        .review_attempt_available = review_attempt_available,
-        .origin = switch (config.origin) {
-            .root => .root,
-            .subagent => .subagent,
-        },
-        .trusted_root_context = trusted_root_context,
-        .current_turn_untrusted_messages = current_turn_messages,
-    };
-}
-
 fn permissionDeniedModelOutput(
     alloc: Allocator,
     tool_name: []const u8,
@@ -5901,19 +5692,6 @@ fn permissionDeniedModelOutput(
             reason,
         ),
     };
-}
-
-fn activeCredentialLease(
-    secret_value: []const u8,
-    job: QueuedPrompt,
-) types.CredentialLease {
-    if (job.credential_source == .host_managed) return .host_managed;
-    return .{ .direct = .{
-        .secret_bytes = secret_value,
-        .source = job.credential_source,
-        .account_id = job.account_id,
-        .tenant_context = job.gateway_team,
-    } };
 }
 
 fn reviewFeedbackMemory(reason: types.ToolPermissionDenialReason, output: []const u8) ?types.ToolResultMemory {
@@ -6050,42 +5828,6 @@ test "vision policy keeps image route and tool visibility coherent" {
     }
 }
 
-fn buildProviderPromptForCompactionWindow(
-    alloc: Allocator,
-    stable_prefix: []const ChatMessage,
-    ephemeral_overlay: []const ChatMessage,
-    durable_history: []const ChatMessage,
-    current_user_message: ChatMessage,
-    within_turn_suffix: []const ChatMessage,
-    handoff: ?[]const u8,
-    retained_history_tail: []const ChatMessage,
-    compacted_suffix_len: usize,
-) !runtime_prompt_context.ProviderPrompt {
-    if (handoff == null) return runtime_prompt_context.buildProviderPrompt(
-        alloc,
-        stable_prefix,
-        ephemeral_overlay,
-        durable_history,
-        current_user_message,
-        within_turn_suffix,
-    );
-    var compacted_history: std.ArrayList(ChatMessage) = .empty;
-    defer compacted_history.deinit(alloc);
-    try compacted_history.append(alloc, .{
-        .role = .user,
-        .content = handoff.?,
-    });
-    try compacted_history.appendSlice(alloc, retained_history_tail);
-    return runtime_prompt_context.buildProviderPrompt(
-        alloc,
-        stable_prefix,
-        ephemeral_overlay,
-        compacted_history.items,
-        current_user_message,
-        within_turn_suffix[@min(compacted_suffix_len, within_turn_suffix.len)..],
-    );
-}
-
 fn commitContextCompaction(
     deps: *const AgentRuntimeDeps,
     summary: types.CompactedSummaryHistoryTurn,
@@ -6103,7 +5845,7 @@ fn reconstructProjectContext(
     alloc: Allocator,
     deps: *const AgentRuntimeDeps,
     config: Config,
-    job: QueuedPrompt,
+    job: CompatibilityExecutionJob,
 ) !?context_contract.GatheredContextSnapshot {
     if (!deps.context_enabled) return null;
     var retained = try tool_preparation.retainedContextTargets(
@@ -6680,7 +6422,7 @@ fn processQueuedPromptLoop(
     semantic_presentation: ?runtime_assistant_stream.SemanticPresentationSink,
     lifecycle: LifecycleContext,
     config: Config,
-    job: QueuedPrompt,
+    job: CompatibilityExecutionJob,
     skills: PreparedSkills,
     initial_request_capabilities: model_capabilities.Capabilities,
     base_nested_terminal_advertised: bool,
@@ -6688,7 +6430,7 @@ fn processQueuedPromptLoop(
     base_nested_read_tool_result_advertised: bool,
     finalization: *TurnFinalizationGuard,
     arena: Allocator,
-    turn_id: u64,
+    control: *@import("../loop_control.zig").LoopControl,
     stable_prefix_ptr: *std.ArrayList(ChatMessage),
     history_messages_ptr: *std.ArrayList(ChatMessage),
     within_turn_suffix_ptr: *std.ArrayList(ChatMessage),
@@ -6766,9 +6508,9 @@ fn processQueuedPromptLoop(
                 job.history,
             ),
     };
-    var active_api_key: []const u8 = job.api_key;
+    var active_api_key: []const u8 = execution_compatibility.initialSecret(job);
     var owned_refreshed_api_key: ?[]u8 = null;
-    defer if (owned_refreshed_api_key) |key| secret.zeroAndFree(std.heap.c_allocator, key);
+    defer if (owned_refreshed_api_key) |key| execution_compatibility.releaseSecret(std.heap.c_allocator, key);
     var summary_accumulator = summary_accumulator_ptr.*;
     defer summary_accumulator_ptr.* = summary_accumulator;
     var finish_trace = finish_trace_ptr.*;
@@ -6778,7 +6520,7 @@ fn processQueuedPromptLoop(
     var silent_tool_steps: usize = 0;
     var continuation_injected = false;
     var last_step_ctx = finish_trace.ctx;
-    var current_step_index: usize = 0;
+
     var last_tool_call_name: []const u8 = "none";
     var last_tool_call_id: []const u8 = "none";
     var last_gateway_message_count: usize = stable_prefix.items.len + history_messages.items.len + 1;
@@ -6813,19 +6555,13 @@ fn processQueuedPromptLoop(
     else
         false;
     if (job.recovery_checkpoint) |checkpoint| {
-        if (shouldRejectRecoveryAuthority(
-            checkpoint,
-            job.credential_source,
-            job.account_id,
-        )) {
-            return error.RecoveryCredentialAuthorityChanged;
-        }
+        try execution_compatibility.validateRecovery(job, checkpoint);
     }
     const restored_budget_exhausted = if (job.recovery_checkpoint) |checkpoint|
         !selection_changed and restored_attempts >= checkpoint.max_provider_attempts
     else
         false;
-    const semantic_limit = if (selection_changed or restored_budget_exhausted)
+    control.coordinator.attempt_limit = if (selection_changed or restored_budget_exhausted)
         semanticAttemptLimit(config.max_provider_attempts)
     else if (job.recovery_checkpoint) |checkpoint|
         checkpoint.max_provider_attempts
@@ -6843,7 +6579,7 @@ fn processQueuedPromptLoop(
     // Attachment pixel sizes probed during this turn, so each step does not
     // reread every attachment snapshot. Entries live in the turn arena.
     var attachment_dimensions: image_attachments.AttachmentDimensionCache = .empty;
-    var semantic_attempt: usize = if (selection_changed or restored_budget_exhausted)
+    control.coordinator.attempt = if (selection_changed or restored_budget_exhausted)
         0
     else
         restored_attempts;
@@ -6877,26 +6613,26 @@ fn processQueuedPromptLoop(
     else
         .none;
     var restore_recovery_source = job.recovery_checkpoint != null;
-    var step: usize = 0;
-    agent_steps_loop: while (agent_steps.allowsStep(config.agent_step_limit, step)) : (step += 1) {
-        current_step_index = step + 1;
-        const step_ctx: TraceContext = .{ .turn_id = turn_id, .step_id = debug_trace.nextStepId(), .subagent_id = config.subagent_id };
+
+    agent_steps_loop: while (agent_steps.allowsStep(control.coordinator.step_limit, control.coordinator.step)) : (control.coordinator.step += 1) {
+        control.current_step_index = control.coordinator.step + 1;
+        const step_ctx: TraceContext = .{ .turn_id = control.coordinator.turn_id, .step_id = debug_trace.nextStepId(), .subagent_id = config.subagent_id };
         const presentation_group_id = runtime_tool_presentation.presentationGroupForStep(
             active_presentation_group_id,
-            turn_id,
+            control.coordinator.turn_id,
             step_ctx.step_id,
         );
         last_step_ctx = step_ctx;
-        if (config.cancel_flag.load(.seq_cst)) {
+        if (control.coordinator.cancel_flag.load(.seq_cst)) {
             if (try append_immediate_steering_after_cancel(
                 deps,
                 arena,
                 &within_turn_suffix,
-                turn_id,
+                control.coordinator.turn_id,
                 "",
             )) continue :agent_steps_loop;
             runtime_telemetry.traceCancelObserved(step_ctx, false);
-            clearRecoveryCheckpointOnUserCancel(deps);
+            runtime_interruption.clearRecoveryCheckpointOnUserCancel(deps);
             try runtime_interruption.persistInterruptedTurnOnce(deps, finalization, job, null, null, completed_tool_names.items, &interrupted_persisted, step_ctx, within_turn_suffix.items, stop_state.retained_candidate, &stop_state.terminal_materializing);
             finish_trace.finish("interrupted");
             return;
@@ -6908,7 +6644,7 @@ fn processQueuedPromptLoop(
             arena,
             overlay_arena,
             &within_turn_suffix,
-            turn_id,
+            control.coordinator.turn_id,
             config.origin,
             .model,
         );
@@ -6962,15 +6698,15 @@ fn processQueuedPromptLoop(
             response_language_context_conflicts(response_language_expectation, history_messages.items) or
             response_language_context_conflicts(response_language_expectation, within_turn_suffix.items);
 
-        debug_trace.logf("agent", "step start step={d} limit={d} messages={d}", .{ current_step_index, config.agent_step_limit, gateway_instructions.items.len + gateway_messages.items.len });
-        debug_trace.eventf("agent", "step_begin", step_ctx, "step_index={d} step_limit={d} gateway_messages={d}", .{ current_step_index, config.agent_step_limit, gateway_instructions.items.len + gateway_messages.items.len });
+        debug_trace.logf("agent", "step start step={d} limit={d} messages={d}", .{ control.current_step_index, control.coordinator.step_limit, gateway_instructions.items.len + gateway_messages.items.len });
+        debug_trace.eventf("agent", "step_begin", step_ctx, "step_index={d} step_limit={d} gateway_messages={d}", .{ control.current_step_index, control.coordinator.step_limit, gateway_instructions.items.len + gateway_messages.items.len });
 
         var stream_ctx = runtime_assistant_stream.StreamChunkContext{
             .hooks = deps,
             .flush_assistant_stream_per_content_chunk = deps.flush_assistant_stream_per_content_chunk,
             .semantic_presentation = semantic_presentation,
             .token_progress = &summary_accumulator,
-            .turn_id = turn_id,
+            .turn_id = control.coordinator.turn_id,
             .step_id = step_ctx.step_id,
             .response_language_expected = response_language_expectation,
             .response_language_hold_until_completion = response_language_hold_until_completion,
@@ -7009,7 +6745,7 @@ fn processQueuedPromptLoop(
         var successful_recovery_strategy: ?model_response_recovery.Strategy = null;
         defer {
             if (recovery_has_unexecuted_tool_start and finalization.outcome != .paused) {
-                settle_deferred_tool_starts(deps, &stream_ctx, arena, turn_id, config.cancel_flag);
+                settle_deferred_tool_starts(deps, &stream_ctx, arena, control.coordinator.turn_id, control.coordinator.cancel_flag);
             }
         }
 
@@ -7031,8 +6767,8 @@ fn processQueuedPromptLoop(
                     gateway_model,
                     selected_fast_mode,
                     route_fast_mode,
-                    semantic_limit,
-                    semantic_attempt,
+                    control.coordinator.attempt_limit,
+                    control.coordinator.attempt,
                     false,
                     recovery_cause,
                     recovery_strategy,
@@ -7046,8 +6782,8 @@ fn processQueuedPromptLoop(
                     arena,
                     &finish_trace,
                     recovery_cause,
-                    semantic_attempt,
-                    semantic_limit,
+                    control.coordinator.attempt,
+                    control.coordinator.attempt_limit,
                     pausedRequiredAction(preserved_tool_evidence),
                     latest_recovery_diagnostic,
                 );
@@ -7063,7 +6799,7 @@ fn processQueuedPromptLoop(
             if (skip_next_preflight_refresh) {
                 skip_next_preflight_refresh = false;
             } else {
-                _ = try refreshGatewayCredentialForJob(
+                _ = try execution_compatibility.refreshCredential(
                     deps,
                     std.heap.c_allocator,
                     job,
@@ -7245,7 +6981,7 @@ fn processQueuedPromptLoop(
             }
             last_gateway_message_count = gateway_instructions.items.len + request_messages.len;
             var provider_opts = try model_capabilities.resolveUltrafastProviderOptions(request_capabilities, job.provider, gateway_model, config.effort, route_fast_mode, config.ultrafast_mode);
-            provider_opts.prompt_caching = config.provider_capabilities.gateway_prompt_caching;
+            provider_opts.prompt_caching = config.provider_capabilities.prompt_caching;
             provider_opts.provider_order = config.provider_order;
             provider_opts.provider_strict = config.provider_strict;
             runtime_telemetry.traceGatewayProviderOptions(step_ctx, gateway_model, route_fast_mode, config.effort, provider_opts);
@@ -7280,7 +7016,7 @@ fn processQueuedPromptLoop(
                 .vision_mode = vision_mode,
                 .provider_options = provider_opts,
                 .max_output_tokens = model_capabilities.requestOutputTokens(request_capabilities),
-                .budget = .{ .cancel_flag = config.cancel_flag },
+                .budget = .{ .cancel_flag = control.coordinator.cancel_flag },
             };
             var prepared_request_body: ?[]const u8 = null;
             var request_cost_for_attempt: ?runtime_prompt_context.RequestCost = null;
@@ -7365,8 +7101,8 @@ fn processQueuedPromptLoop(
                         .route_model = gateway_model,
                         .requested_fast_mode = selected_fast_mode,
                         .fast_mode = route_fast_mode,
-                        .attempt_limit = semantic_limit,
-                        .consumed_attempts = semantic_attempt,
+                        .attempt_limit = control.coordinator.attempt_limit,
+                        .consumed_attempts = control.coordinator.attempt,
                         .tool_evidence = preserved_tool_evidence,
                         .trace_ctx = step_ctx,
                     };
@@ -7376,9 +7112,6 @@ fn processQueuedPromptLoop(
                         .provider = job.provider,
                         .model = gateway_model,
                         .api_key = active_api_key,
-                        .credential_source = job.credential_source,
-                        .account_id = job.account_id,
-                        .gateway_team = job.gateway_team,
                         .session_id = lifecycle.scope.session_id,
                         .retry_count = config.gateway_retry_count,
                         .provider_options = request_data.provider_options,
@@ -7392,6 +7125,7 @@ fn processQueuedPromptLoop(
                         // After an overflow it no longer fits.
                         .conversation = if (overflow_pending) null else request_data,
                     };
+                    execution_compatibility.configureSideCall(&summary_model, job);
                     var compaction_failure: ?compaction_activity.ErrorProvenance = null;
                     const compacted = compactContext(arena, deps, .{
                         .activity_origin = if (overflow_pending) .provider_overflow else .automatic,
@@ -7404,11 +7138,11 @@ fn processQueuedPromptLoop(
                             .size = size,
                             .caller = summary_model.caller(),
                             .records = if (config.session_child_capability) |capability| result_store.compactorStore(capability) else null,
-                            .cancel_flag = config.cancel_flag,
+                            .cancel_flag = control.coordinator.cancel_flag,
                             .trace_ctx = step_ctx,
                         },
                     }) catch |err| {
-                        if (compaction_activity.failure(err, .summary, config.cancel_flag.load(.seq_cst)).outcome == .cancelled) {
+                        if (compaction_activity.failure(err, .summary, control.coordinator.cancel_flag.load(.seq_cst)).outcome == .cancelled) {
                             runtime_telemetry.traceCancelObserved(step_ctx, false);
                             try runtime_interruption.persistCompactionInterruptedTurnOnce(
                                 deps,
@@ -7464,7 +7198,7 @@ fn processQueuedPromptLoop(
                             arena,
                             overlay_arena,
                             &within_turn_suffix,
-                            turn_id,
+                            control.coordinator.turn_id,
                             config.origin,
                             .model,
                         );
@@ -7504,8 +7238,8 @@ fn processQueuedPromptLoop(
                     gateway_model,
                     selected_fast_mode,
                     route_fast_mode,
-                    semantic_limit,
-                    semantic_attempt,
+                    control.coordinator.attempt_limit,
+                    control.coordinator.attempt,
                     true,
                     recovery_cause,
                     recovery_strategy,
@@ -7530,19 +7264,9 @@ fn processQueuedPromptLoop(
                 .stream = &stream_ctx,
                 .pending_status = &pending_auto_retry_status,
             };
-            var model_request = agent_stream_provider.ModelRequest{
-                .credential = if (job.credential_source == .host_managed)
-                    .host_managed
-                else
-                    .{ .direct = .{
-                        .secret_bytes = active_api_key,
-                        .source = job.credential_source orelse .ai_gateway_api_key,
-                        .account_id = job.account_id,
-                        .tenant_context = job.gateway_team,
-                    } },
+            var neutral_request = agent_stream_provider.NeutralModelRequest{
                 .session_id = lifecycle.scope.session_id,
                 .model = gateway_model,
-                .retry_count = config.gateway_retry_count,
                 .instructions = request_data.instructions,
                 .messages = request_data.messages,
                 .tools = request_data.tools,
@@ -7559,13 +7283,15 @@ fn processQueuedPromptLoop(
                 .attempt_evidence = &gateway_attempt_evidence,
                 .events = .{ .context = &provider_events, .emit_fn = onProviderEvent },
                 .admission = .{ .context = &provider_admission, .admit_fn = ProviderAdmission.admit },
-                .cancel_flag = config.cancel_flag,
+                .cancel_flag = control.coordinator.cancel_flag,
                 .provider_attempt_owner = .agent,
             };
-            stream_result = runtime_gateway_step.streamModelCompletion(
+            const credential_lease = execution_compatibility.modelRequestLease(active_api_key, job);
+            stream_result = runtime_gateway_step.streamNeutralModelCompletion(
                 deps.agent_stream_provider,
                 arena,
-                model_request,
+                neutral_request,
+                credential_lease,
                 deps.usage,
                 deps.usage_allocator,
             ) catch |err| {
@@ -7577,8 +7303,8 @@ fn processQueuedPromptLoop(
                 runtime_assistant_stream.pushTokenProgressUpdate(&stream_ctx, summary_accumulator.finishTokenRequestWithoutUsage(gateway_delivery.load() == .possibly_sent)) catch |progress_err| {
                     debug_trace.logf("agent", "token progress publication failed source=gateway_error err={s}", .{@errorName(progress_err)});
                 };
-                const cancel_requested = config.cancel_flag.load(.seq_cst);
-                const consumed_attempts = semantic_attempt +
+                const cancel_requested = control.coordinator.cancel_flag.load(.seq_cst);
+                const consumed_attempts = control.coordinator.attempt +
                     @as(usize, @intFromBool(gateway_attempt_evidence.provider_admitted));
                 const network_failure = gateway_attempt_evidence.network_failure;
                 const failure_cause: model_response_recovery.FailureCause = if (network_failure) |evidence|
@@ -7602,7 +7328,7 @@ fn processQueuedPromptLoop(
                         gateway_model,
                         selected_fast_mode,
                         route_fast_mode,
-                        semantic_limit,
+                        control.coordinator.attempt_limit,
                         consumed_attempts,
                         false,
                         failure_cause,
@@ -7623,7 +7349,7 @@ fn processQueuedPromptLoop(
                         &finish_trace,
                         failure_cause,
                         consumed_attempts,
-                        semantic_limit,
+                        control.coordinator.attempt_limit,
                         pausedRequiredAction(effectiveRecoveryToolEvidence(
                             preserved_tool_evidence,
                             null,
@@ -7657,7 +7383,7 @@ fn processQueuedPromptLoop(
                             .definitely_unsent => .definitely_unsent,
                             .possibly_sent => .possibly_sent,
                         },
-                        .attempts = .{ .consumed = consumed_attempts, .limit = semantic_limit },
+                        .attempts = .{ .consumed = consumed_attempts, .limit = control.coordinator.attempt_limit },
                         .pacing = retry_pacing,
                         .output = if (stream_ctx.interruption_source_or("").len > 0) .partial else .none,
                         .tool = effectiveRecoveryToolEvidence(
@@ -7690,7 +7416,7 @@ fn processQueuedPromptLoop(
                         @errorName(err),
                         if (cancel_requested) "true" else "false",
                         consumed_attempts,
-                        semantic_limit,
+                        control.coordinator.attempt_limit,
                         if (stream_ctx.saw_visible_text) "true" else "false",
                         if (stream_ctx.saw_tool_start) "true" else "false",
                         if (stream_ctx.saw_provider_tool_start) "true" else "false",
@@ -7715,7 +7441,7 @@ fn processQueuedPromptLoop(
                     gateway_model,
                     selected_fast_mode,
                     route_fast_mode,
-                    semantic_limit,
+                    control.coordinator.attempt_limit,
                     consumed_attempts,
                     false,
                     failure_cause,
@@ -7733,14 +7459,14 @@ fn processQueuedPromptLoop(
                     retry_deadline = try pushAutoRetryStatus(
                         deps,
                         consumed_attempts,
-                        semantic_limit,
+                        control.coordinator.attempt_limit,
                         failure_cause,
                         recovery_decision,
                         failure_diagnostic,
                     );
                 }
                 const delay_completed = !will_auto_retry or wait_for_recovery_deadline(
-                    config.cancel_flag,
+                    control.coordinator.cancel_flag,
                     retry_deadline.?,
                 );
                 if (recoveryPauseRequested(config)) {
@@ -7753,7 +7479,7 @@ fn processQueuedPromptLoop(
                         gateway_model,
                         selected_fast_mode,
                         route_fast_mode,
-                        semantic_limit,
+                        control.coordinator.attempt_limit,
                         consumed_attempts,
                         false,
                         failure_cause,
@@ -7774,7 +7500,7 @@ fn processQueuedPromptLoop(
                         &finish_trace,
                         failure_cause,
                         consumed_attempts,
-                        semantic_limit,
+                        control.coordinator.attempt_limit,
                         pausedRequiredAction(effectiveRecoveryToolEvidence(
                             preserved_tool_evidence,
                             null,
@@ -7795,7 +7521,7 @@ fn processQueuedPromptLoop(
                         deps,
                         stream_ctx.alloc,
                         arena,
-                        turn_id,
+                        control.coordinator.turn_id,
                     );
                     const interruption_source = stream_ctx.interruption_source_or("");
                     try runtime_assistant_stream.flushAssistantStream(&stream_ctx);
@@ -7803,7 +7529,7 @@ fn processQueuedPromptLoop(
                         deps,
                         arena,
                         &within_turn_suffix,
-                        turn_id,
+                        control.coordinator.turn_id,
                         interruption_source,
                     )) {
                         reset_recovery_after_immediate_steering(
@@ -7818,7 +7544,7 @@ fn processQueuedPromptLoop(
                         }
                         continue :agent_steps_loop;
                     }
-                    clearRecoveryCheckpointOnUserCancel(deps);
+                    runtime_interruption.clearRecoveryCheckpointOnUserCancel(deps);
                     try runtime_interruption.persistInterruptedTurnOnce(deps, finalization, job, interruption_source, null, completed_tool_names.items, &interrupted_persisted, step_ctx, within_turn_suffix.items, stop_state.retained_candidate, &stop_state.terminal_materializing);
                     finish_trace.finish("interrupted");
                     return;
@@ -7827,7 +7553,7 @@ fn processQueuedPromptLoop(
                     std.debug.assert(pending_auto_retry_status == null);
                     pending_auto_retry_status = auto_retry_status(
                         consumed_attempts + 1,
-                        semantic_limit,
+                        control.coordinator.attempt_limit,
                         failure_cause,
                         recovery_decision.strategy,
                         inFlightDelaySeconds(recovery_decision.delay_ns),
@@ -7845,7 +7571,7 @@ fn processQueuedPromptLoop(
                     if (recovery_strategy == .regenerate_tool) {
                         recovery_has_unexecuted_tool_start = true;
                     }
-                    semantic_attempt = consumed_attempts;
+                    control.coordinator.attempt = consumed_attempts;
                     reset_stream_for_next_attempt = true;
                     continue;
                 }
@@ -7859,7 +7585,7 @@ fn processQueuedPromptLoop(
                         &finish_trace,
                         failure_cause,
                         consumed_attempts,
-                        semantic_limit,
+                        control.coordinator.attempt_limit,
                         recoveryRequiredAction(recovery_decision.required_action),
                         failure_diagnostic,
                     );
@@ -7875,7 +7601,7 @@ fn processQueuedPromptLoop(
                         &finish_trace,
                         failure_cause,
                         consumed_attempts,
-                        semantic_limit,
+                        control.coordinator.attempt_limit,
                         failure_diagnostic,
                     );
                     restorePromptAfterTerminalFailure(deps, job, config);
@@ -7885,12 +7611,12 @@ fn processQueuedPromptLoop(
                     const exhausted_retryable =
                         stream_ctx.interruption_source_or("").len == 0 and
                         !stream_ctx.saw_provider_tool_start and
-                        consumed_attempts >= semantic_limit;
+                        consumed_attempts >= control.coordinator.attempt_limit;
                     if (replay_safe or exhausted_retryable) {
                         try pushRouteRecoveryStatus(deps, .{
                             .kind = .terminal_provider_error,
                             .failed_attempt = consumed_attempts,
-                            .attempt_limit = semantic_limit,
+                            .attempt_limit = control.coordinator.attempt_limit,
                             .cause = checkpointCause(failure_cause),
                             .required_action = recoveryRequiredAction(recovery_decision.required_action),
                             .diagnostic = failure_diagnostic,
@@ -7908,11 +7634,11 @@ fn processQueuedPromptLoop(
                         );
                         restorePromptAfterTerminalFailure(deps, job, config);
                     }
-                } else if (semantic_attempt > 0) {
+                } else if (control.coordinator.attempt > 0) {
                     try pushRouteRecoveryStatus(deps, .{
                         .kind = .terminal_provider_error,
                         .failed_attempt = consumed_attempts,
-                        .attempt_limit = semantic_limit,
+                        .attempt_limit = control.coordinator.attempt_limit,
                         .cause = checkpointCause(failure_cause),
                         .required_action = recoveryRequiredAction(recovery_decision.required_action),
                         .diagnostic = failure_diagnostic,
@@ -7937,7 +7663,7 @@ fn processQueuedPromptLoop(
                         deps,
                         stream_ctx.alloc,
                         arena,
-                        turn_id,
+                        control.coordinator.turn_id,
                         &.{},
                     );
                 }
@@ -7965,16 +7691,15 @@ fn processQueuedPromptLoop(
             stream_result_set = true;
             pushNetworkRecord(deps, job.provider, gateway_model, gateway_wait_started_ms, &stream_result);
             const first_failure = streamFailure(stream_result);
-            const auth_replay = auth_transition.decideAuthReplay(.{
+            const auth_replay = execution_compatibility.replayDecision(job, .{
                 .authentication_rejected = first_failure != null and first_failure.?.kind == .unauthorized,
-                .refreshable = if (job.credential_source) |source| credentials.sourceRefreshable(source) else false,
                 .delivery_safe = stream_ctx.interruption_source_or("").len == 0 and
                     !stream_ctx.saw_tool_start and
                     streamCompletion(stream_result).tool_calls.len == 0,
                 .already_replayed = auth_retry_used,
             });
             if (auth_replay == .refresh_and_replay) {
-                if (try refreshGatewayCredentialForJob(
+                if (try execution_compatibility.refreshCredential(
                     deps,
                     std.heap.c_allocator,
                     job,
@@ -7986,14 +7711,16 @@ fn processQueuedPromptLoop(
                     auth_retry_used = true;
                     var replay_delivery = runtime_gateway_step.DeliveryCertainty.init();
                     var replay_evidence: runtime_gateway_step.AttemptEvidence = .{};
-                    model_request.credential.direct.secret_bytes = active_api_key;
-                    model_request.delivery = &replay_delivery;
-                    model_request.attempt_evidence = &replay_evidence;
+                    const replay_credential_lease = execution_compatibility.modelRequestLease(active_api_key, job);
+                    var replay_neutral_request = neutral_request;
+                    replay_neutral_request.delivery = &replay_delivery;
+                    replay_neutral_request.attempt_evidence = &replay_evidence;
                     const replay_wait_started_ms = io_mod.milliTimestamp();
-                    stream_result = try runtime_gateway_step.streamModelCompletion(
+                    stream_result = try runtime_gateway_step.streamNeutralModelCompletion(
                         deps.agent_stream_provider,
                         arena,
-                        model_request,
+                        replay_neutral_request,
+                        replay_credential_lease,
                         deps.usage,
                         deps.usage_allocator,
                     );
@@ -8008,7 +7735,7 @@ fn processQueuedPromptLoop(
                         "authenticated_request_replayed",
                         step_ctx,
                         "semantic_attempt={d}",
-                        .{semantic_attempt + 1},
+                        .{control.coordinator.attempt + 1},
                     );
                 }
             }
@@ -8069,8 +7796,8 @@ fn processQueuedPromptLoop(
                     gateway_model,
                     selected_fast_mode,
                     route_fast_mode,
-                    semantic_limit,
-                    semantic_attempt + 1,
+                    control.coordinator.attempt_limit,
+                    control.coordinator.attempt + 1,
                     false,
                     recovery_cause,
                     .pause,
@@ -8085,8 +7812,8 @@ fn processQueuedPromptLoop(
                     arena,
                     &finish_trace,
                     recovery_cause,
-                    semantic_attempt + 1,
-                    semantic_limit,
+                    control.coordinator.attempt + 1,
+                    control.coordinator.attempt_limit,
                     .inspect_uncertain_tool,
                     types.ModelFailureDiagnostic.init("UnexpectedToolCallDuringReconciliation"),
                 );
@@ -8104,7 +7831,7 @@ fn processQueuedPromptLoop(
                     has_compactable_context,
                     streamReplaySafe(&stream_ctx),
                     context_overflow_recovery == .ready,
-                    config.cancel_flag.load(.seq_cst),
+                    control.coordinator.cancel_flag.load(.seq_cst),
                 )) {
                     compactor.traceEvent(
                         step_ctx,
@@ -8138,7 +7865,7 @@ fn processQueuedPromptLoop(
                     &stream_ctx,
                     arena,
                     config,
-                    turn_id,
+                    control.coordinator.turn_id,
                     response_completion,
                     .{ .provider = job.provider, .model = gateway_model },
                     advertised_dynamic_tool_names,
@@ -8147,7 +7874,7 @@ fn processQueuedPromptLoop(
                     &completed_tool_names,
                 );
             }
-            const settled_attempts = semantic_attempt + 1;
+            const settled_attempts = control.coordinator.attempt + 1;
             if (job.provider == .gateway or
                 response_failure == null or response_failure.?.kind != .unauthorized)
             {
@@ -8160,7 +7887,7 @@ fn processQueuedPromptLoop(
                     gateway_model,
                     selected_fast_mode,
                     route_fast_mode,
-                    semantic_limit,
+                    control.coordinator.attempt_limit,
                     settled_attempts,
                     false,
                     recovery_cause,
@@ -8180,7 +7907,7 @@ fn processQueuedPromptLoop(
             summary_accumulator.addThinkingWait(gateway_wait_started_ms, stream_ctx.first_model_output_at_ms orelse gateway_wait_finished_ms);
 
             const prefill_tool_name: ?[]const u8 = if (!assistant_prefill_recovery_used and
-                semantic_attempt + 1 < semantic_limit and
+                control.coordinator.attempt + 1 < control.coordinator.attempt_limit and
                 streamReplaySafe(&stream_ctx))
                 postToolAssistantPrefillRejection(
                     if (response_failure) |failure| failureHttpStatus(failure.kind) else .ok,
@@ -8195,7 +7922,7 @@ fn processQueuedPromptLoop(
                     "assistant_prefill_recovery",
                     step_ctx,
                     "tool_name={s} provider_attempt={d}/{d}",
-                    .{ tool_name, semantic_attempt + 1, semantic_limit },
+                    .{ tool_name, control.coordinator.attempt + 1, control.coordinator.attempt_limit },
                 );
                 try within_turn_suffix.append(arena, .{
                     .role = .user,
@@ -8204,7 +7931,7 @@ fn processQueuedPromptLoop(
                 stream_result.deinit(arena);
                 stream_result_set = false;
                 assistant_prefill_recovery_used = true;
-                semantic_attempt += 1;
+                control.coordinator.attempt += 1;
                 retry_pacing = .idle;
                 reset_stream_for_next_attempt = true;
                 continue;
@@ -8238,7 +7965,7 @@ fn processQueuedPromptLoop(
                 const decision = model_response_recovery.decide(.{
                     .cause = cause,
                     .delivery = .possibly_sent,
-                    .attempts = .{ .consumed = semantic_attempt + 1, .limit = semantic_limit },
+                    .attempts = .{ .consumed = control.coordinator.attempt + 1, .limit = control.coordinator.attempt_limit },
                     .pacing = retry_pacing,
                     .output = if (stream_ctx.interruption_source_or("").len > 0) .partial else .none,
                     .tool = effectiveRecoveryToolEvidence(
@@ -8247,7 +7974,7 @@ fn processQueuedPromptLoop(
                         &stream_ctx,
                     ),
                     .retry_after_seconds = failure.retry_after_seconds,
-                    .cancelled = config.cancel_flag.load(.seq_cst),
+                    .cancelled = control.coordinator.cancel_flag.load(.seq_cst),
                     .recovery_elapsed_ns = recovery_elapsed_ns,
                 });
                 if (decision.strategy == .pause) {
@@ -8260,8 +7987,8 @@ fn processQueuedPromptLoop(
                         gateway_model,
                         selected_fast_mode,
                         route_fast_mode,
-                        semantic_limit,
-                        semantic_attempt + 1,
+                        control.coordinator.attempt_limit,
+                        control.coordinator.attempt + 1,
                         false,
                         cause,
                         .pause,
@@ -8280,8 +8007,8 @@ fn processQueuedPromptLoop(
                         arena,
                         &finish_trace,
                         cause,
-                        semantic_attempt + 1,
-                        semantic_limit,
+                        control.coordinator.attempt + 1,
+                        control.coordinator.attempt_limit,
                         recoveryRequiredAction(decision.required_action),
                         diagnostic,
                     );
@@ -8296,8 +8023,8 @@ fn processQueuedPromptLoop(
                         arena,
                         &finish_trace,
                         cause,
-                        semantic_attempt + 1,
-                        semantic_limit,
+                        control.coordinator.attempt + 1,
+                        control.coordinator.attempt_limit,
                         diagnostic,
                     );
                     restorePromptAfterTerminalFailure(deps, job, config);
@@ -8314,8 +8041,8 @@ fn processQueuedPromptLoop(
                             gateway_model,
                             selected_fast_mode,
                             route_fast_mode,
-                            semantic_limit,
-                            semantic_attempt + 1,
+                            control.coordinator.attempt_limit,
+                            control.coordinator.attempt + 1,
                             false,
                             cause,
                             decision.strategy,
@@ -8329,17 +8056,17 @@ fn processQueuedPromptLoop(
                     }
                     const retry_deadline = try pushAutoRetryStatus(
                         deps,
-                        semantic_attempt + 1,
-                        semantic_limit,
+                        control.coordinator.attempt + 1,
+                        control.coordinator.attempt_limit,
                         cause,
                         decision,
                         diagnostic,
                     );
-                    if (wait_for_recovery_deadline(config.cancel_flag, retry_deadline)) {
+                    if (wait_for_recovery_deadline(control.coordinator.cancel_flag, retry_deadline)) {
                         std.debug.assert(pending_auto_retry_status == null);
                         pending_auto_retry_status = auto_retry_status(
-                            semantic_attempt + 2,
-                            semantic_limit,
+                            control.coordinator.attempt + 2,
+                            control.coordinator.attempt_limit,
                             cause,
                             decision.strategy,
                             inFlightDelaySeconds(decision.delay_ns),
@@ -8353,14 +8080,14 @@ fn processQueuedPromptLoop(
                         );
                         stream_result.deinit(arena);
                         stream_result_set = false;
-                        semantic_attempt += 1;
+                        control.coordinator.attempt += 1;
                         recovery_strategy = decision.strategy;
                         recovery_cause = cause;
                         retry_pacing = decision.next_pacing;
                         reset_stream_for_next_attempt = true;
                         continue;
                     }
-                    if (config.cancel_flag.load(.seq_cst)) {
+                    if (control.coordinator.cancel_flag.load(.seq_cst)) {
                         runtime_telemetry.traceCancelObserved(step_ctx, false);
                         try clearAutoRetryStatusIfNeeded(deps, true);
                         try finishPendingCancelledCalls(
@@ -8369,7 +8096,7 @@ fn processQueuedPromptLoop(
                             stream_ctx.alloc,
                             arena,
                             config,
-                            turn_id,
+                            control.coordinator.turn_id,
                             response_completion.tool_calls,
                             advertised_dynamic_tool_names,
                         );
@@ -8378,7 +8105,7 @@ fn processQueuedPromptLoop(
                             deps,
                             arena,
                             &within_turn_suffix,
-                            turn_id,
+                            control.coordinator.turn_id,
                             interruption_source,
                         )) {
                             reset_recovery_after_immediate_steering(
@@ -8393,7 +8120,7 @@ fn processQueuedPromptLoop(
                             }
                             continue :agent_steps_loop;
                         }
-                        clearRecoveryCheckpointOnUserCancel(deps);
+                        runtime_interruption.clearRecoveryCheckpointOnUserCancel(deps);
                         try runtime_interruption.persistInterruptedTurnOnce(deps, finalization, job, interruption_source, null, completed_tool_names.items, &interrupted_persisted, step_ctx, within_turn_suffix.items, stop_state.retained_candidate, &stop_state.terminal_materializing);
                         finish_trace.finish("interrupted");
                         return;
@@ -8412,7 +8139,7 @@ fn processQueuedPromptLoop(
                 attempt_completion.content orelse "",
             );
 
-            if (config.cancel_flag.load(.seq_cst)) {
+            if (control.coordinator.cancel_flag.load(.seq_cst)) {
                 runtime_telemetry.traceCancelObserved(step_ctx, false);
                 try clearAutoRetryStatusIfNeeded(deps, recovery_strategy != null);
                 try finishPendingCancelledCalls(
@@ -8421,7 +8148,7 @@ fn processQueuedPromptLoop(
                     stream_ctx.alloc,
                     arena,
                     config,
-                    turn_id,
+                    control.coordinator.turn_id,
                     attempt_completion.tool_calls,
                     advertised_dynamic_tool_names,
                 );
@@ -8432,7 +8159,7 @@ fn processQueuedPromptLoop(
                     deps,
                     arena,
                     &within_turn_suffix,
-                    turn_id,
+                    control.coordinator.turn_id,
                     interruption_source,
                 )) {
                     reset_recovery_after_immediate_steering(
@@ -8447,7 +8174,7 @@ fn processQueuedPromptLoop(
                     }
                     continue :agent_steps_loop;
                 }
-                clearRecoveryCheckpointOnUserCancel(deps);
+                runtime_interruption.clearRecoveryCheckpointOnUserCancel(deps);
                 try runtime_interruption.persistInterruptedTurnOnce(deps, finalization, job, interruption_source, null, completed_tool_names.items, &interrupted_persisted, step_ctx, within_turn_suffix.items, stop_state.retained_candidate, &stop_state.terminal_materializing);
                 finish_trace.finish("interrupted");
                 return;
@@ -8482,8 +8209,8 @@ fn processQueuedPromptLoop(
                                 @tagName(response_language_expectation.?),
                                 @tagName(candidate_language.script.?),
                                 gateway_model,
-                                semantic_attempt + 1,
-                                semantic_limit,
+                                control.coordinator.attempt + 1,
+                                control.coordinator.attempt_limit,
                             },
                         );
                         stream_ctx.drop_staged_response_language_candidate();
@@ -8491,7 +8218,7 @@ fn processQueuedPromptLoop(
                     .retry_once, .fail_without_commit => {
                         const observed = candidate_language.script.?;
                         const can_retry = language_decision == .retry_once and
-                            semantic_attempt + 1 < semantic_limit;
+                            control.coordinator.attempt + 1 < control.coordinator.attempt_limit;
                         debug_trace.eventf(
                             "agent",
                             "response_language_mismatch",
@@ -8501,8 +8228,8 @@ fn processQueuedPromptLoop(
                                 @tagName(response_language_expectation.?),
                                 @tagName(observed),
                                 gateway_model,
-                                semantic_attempt + 1,
-                                semantic_limit,
+                                control.coordinator.attempt + 1,
+                                control.coordinator.attempt_limit,
                                 if (can_retry) "true" else "false",
                             },
                         );
@@ -8517,7 +8244,7 @@ fn processQueuedPromptLoop(
                             stream_ctx.drop_staged_response_language_candidate();
                             stream_result.deinit(arena);
                             stream_result_set = false;
-                            semantic_attempt += 1;
+                            control.coordinator.attempt += 1;
                             response_language_correction_attempted = true;
                             reset_stream_for_next_attempt = true;
                             continue;
@@ -8585,7 +8312,7 @@ fn processQueuedPromptLoop(
                     model_response_recovery.decide(.{
                         .cause = cause,
                         .delivery = .possibly_sent,
-                        .attempts = .{ .consumed = semantic_attempt + 1, .limit = semantic_limit },
+                        .attempts = .{ .consumed = control.coordinator.attempt + 1, .limit = control.coordinator.attempt_limit },
                         .pacing = retry_pacing,
                         .output = if (partial_assistant.len > 0) .partial else .none,
                         .tool = effectiveRecoveryToolEvidence(
@@ -8593,7 +8320,7 @@ fn processQueuedPromptLoop(
                             attempt_completion,
                             &stream_ctx,
                         ),
-                        .cancelled = config.cancel_flag.load(.seq_cst),
+                        .cancelled = control.coordinator.cancel_flag.load(.seq_cst),
                         .progress = if (track_progress and recovery_no_progress_streak >= 2)
                             .stalled
                         else
@@ -8608,8 +8335,8 @@ fn processQueuedPromptLoop(
                         job.model,
                         gateway_model,
                         route_fast_mode,
-                        semantic_attempt + 1,
-                        semantic_limit,
+                        control.coordinator.attempt + 1,
+                        control.coordinator.attempt_limit,
                         attempt_completion,
                         &stream_ctx,
                         decision.reserve_provider_attempt,
@@ -8633,8 +8360,8 @@ fn processQueuedPromptLoop(
                         gateway_model,
                         selected_fast_mode,
                         route_fast_mode,
-                        semantic_limit,
-                        semantic_attempt + 1,
+                        control.coordinator.attempt_limit,
+                        control.coordinator.attempt + 1,
                         false,
                         cause,
                         .pause,
@@ -8652,8 +8379,8 @@ fn processQueuedPromptLoop(
                         arena,
                         &finish_trace,
                         cause,
-                        semantic_attempt + 1,
-                        semantic_limit,
+                        control.coordinator.attempt + 1,
+                        control.coordinator.attempt_limit,
                         recoveryRequiredAction(decision.required_action),
                         diagnostic,
                     );
@@ -8668,8 +8395,8 @@ fn processQueuedPromptLoop(
                         arena,
                         &finish_trace,
                         cause,
-                        semantic_attempt + 1,
-                        semantic_limit,
+                        control.coordinator.attempt + 1,
+                        control.coordinator.attempt_limit,
                         diagnostic,
                     );
                     restorePromptAfterTerminalFailure(deps, job, config);
@@ -8687,8 +8414,8 @@ fn processQueuedPromptLoop(
                             gateway_model,
                             selected_fast_mode,
                             route_fast_mode,
-                            semantic_limit,
-                            semantic_attempt + 1,
+                            control.coordinator.attempt_limit,
+                            control.coordinator.attempt + 1,
                             false,
                             cause,
                             decision.strategy,
@@ -8702,17 +8429,17 @@ fn processQueuedPromptLoop(
                     }
                     const retry_deadline = try pushAutoRetryStatus(
                         deps,
-                        semantic_attempt + 1,
-                        semantic_limit,
+                        control.coordinator.attempt + 1,
+                        control.coordinator.attempt_limit,
                         cause,
                         decision,
                         diagnostic,
                     );
-                    if (wait_for_recovery_deadline(config.cancel_flag, retry_deadline)) {
+                    if (wait_for_recovery_deadline(control.coordinator.cancel_flag, retry_deadline)) {
                         std.debug.assert(pending_auto_retry_status == null);
                         pending_auto_retry_status = auto_retry_status(
-                            semantic_attempt + 2,
-                            semantic_limit,
+                            control.coordinator.attempt + 2,
+                            control.coordinator.attempt_limit,
                             cause,
                             decision.strategy,
                             inFlightDelaySeconds(decision.delay_ns),
@@ -8726,7 +8453,7 @@ fn processQueuedPromptLoop(
                         );
                         // Probes and connectivity waits are not provider
                         // attempts: nothing billable was sent.
-                        if (decision.reserve_provider_attempt) semantic_attempt += 1;
+                        if (decision.reserve_provider_attempt) control.coordinator.attempt += 1;
                         recovery_strategy = decision.strategy;
                         recovery_cause = cause;
                         retry_pacing = decision.next_pacing;
@@ -8736,7 +8463,7 @@ fn processQueuedPromptLoop(
                         reset_stream_for_next_attempt = true;
                         continue;
                     }
-                    if (config.cancel_flag.load(.seq_cst)) {
+                    if (control.coordinator.cancel_flag.load(.seq_cst)) {
                         runtime_telemetry.traceCancelObserved(step_ctx, false);
                         try clearAutoRetryStatusIfNeeded(deps, true);
                         try finishPendingCancelledCalls(
@@ -8745,7 +8472,7 @@ fn processQueuedPromptLoop(
                             stream_ctx.alloc,
                             arena,
                             config,
-                            turn_id,
+                            control.coordinator.turn_id,
                             attempt_completion.tool_calls,
                             advertised_dynamic_tool_names,
                         );
@@ -8753,7 +8480,7 @@ fn processQueuedPromptLoop(
                             deps,
                             arena,
                             &within_turn_suffix,
-                            turn_id,
+                            control.coordinator.turn_id,
                             partial_assistant,
                         )) {
                             reset_recovery_after_immediate_steering(
@@ -8768,7 +8495,7 @@ fn processQueuedPromptLoop(
                             }
                             continue :agent_steps_loop;
                         }
-                        clearRecoveryCheckpointOnUserCancel(deps);
+                        runtime_interruption.clearRecoveryCheckpointOnUserCancel(deps);
                         try runtime_interruption.persistInterruptedTurnOnce(deps, finalization, job, partial_assistant, null, completed_tool_names.items, &interrupted_persisted, step_ctx, within_turn_suffix.items, stop_state.retained_candidate, &stop_state.terminal_materializing);
                         finish_trace.finish("interrupted");
                         return;
@@ -8807,8 +8534,8 @@ fn processQueuedPromptLoop(
                     if (replay_safe) {
                         try pushTerminalProviderFailureStatus(
                             deps,
-                            semantic_attempt + 1,
-                            semantic_limit,
+                            control.coordinator.attempt + 1,
+                            control.coordinator.attempt_limit,
                             attempt_completion,
                             diagnostic,
                         );
@@ -8825,8 +8552,8 @@ fn processQueuedPromptLoop(
                 if (finish_reason == .content_filter) {
                     try pushTerminalProviderFailureStatus(
                         deps,
-                        semantic_attempt + 1,
-                        semantic_limit,
+                        control.coordinator.attempt + 1,
+                        control.coordinator.attempt_limit,
                         attempt_completion,
                         diagnostic,
                     );
@@ -8837,7 +8564,7 @@ fn processQueuedPromptLoop(
                             .fast_mode = route_fast_mode,
                             .replay_safe = false,
                             .finish_reason = finish_reason,
-                            .semantic_attempts = semantic_attempt + 1,
+                            .semantic_attempts = control.coordinator.attempt + 1,
                             .provider_failure_detail = attempt_completion.provider_failure_detail,
                         });
                         debug_trace.eventf("agent", "route_recovery_decision", step_ctx, "decision={s} replay_safe=false", .{@tagName(decision)});
@@ -8910,7 +8637,7 @@ fn processQueuedPromptLoop(
                 if (!has_novel_content) {
                     try stream_ctx.start_response();
                     if (successful_recovery_strategy != null) {
-                        try pushAutoRecoveredStatus(deps, semantic_attempt, semantic_limit);
+                        try pushAutoRecoveredStatus(deps, control.coordinator.attempt, control.coordinator.attempt_limit);
                     }
                     latest_recovery_diagnostic = null;
                     recovery_strategy = null;
@@ -8942,7 +8669,7 @@ fn processQueuedPromptLoop(
                 job.model,
                 request_capabilities,
             );
-            try deps.push_http_error(deps.ctx, failureHttpStatus(failure.kind), http_detail, job.credential_source);
+            try execution_compatibility.publishHttpError(deps, job, failureHttpStatus(failure.kind), http_detail);
             if (stop_state.retained_candidate != null) {
                 stop_state.terminal_materializing = true;
                 const assistant_text = try runtime_finalization.stopTerminalText(
@@ -8950,7 +8677,7 @@ fn processQueuedPromptLoop(
                     stop_state.retained_candidate,
                     stop_state.latest_partial,
                 );
-                try finishCommonAssistantTerminal(
+                try runtime_finalization.finishCommonAssistantTerminal(
                     deps,
                     finalization,
                     arena,
@@ -8968,7 +8695,7 @@ fn processQueuedPromptLoop(
             }
             if (std.mem.trim(u8, partial_assistant, " \t\r\n").len > 0) {
                 stop_state.terminal_materializing = true;
-                try finishCommonAssistantTerminal(
+                try runtime_finalization.finishCommonAssistantTerminal(
                     deps,
                     finalization,
                     arena,
@@ -9007,8 +8734,8 @@ fn processQueuedPromptLoop(
                 try pushTerminalAutoRetryStatusIfNeeded(
                     deps,
                     successful_recovery_strategy != null,
-                    semantic_attempt,
-                    semantic_limit,
+                    control.coordinator.attempt,
+                    control.coordinator.attempt_limit,
                     types.ModelFailureDiagnostic.init("StreamInterrupted"),
                 );
                 debug_trace.eventf("agent", "provider_finish_missing", step_ctx, "content_bytes={d} tool_call_count={d}", .{
@@ -9032,8 +8759,8 @@ fn processQueuedPromptLoop(
                 try pushTerminalAutoRetryStatusIfNeeded(
                     deps,
                     successful_recovery_strategy != null,
-                    semantic_attempt,
-                    semantic_limit,
+                    control.coordinator.attempt,
+                    control.coordinator.attempt_limit,
                     types.ModelFailureDiagnostic.init("InvalidProviderCompletion"),
                 );
                 const finish_reason = completion.finish_reason.?;
@@ -9053,8 +8780,8 @@ fn processQueuedPromptLoop(
             try pushTerminalAutoRetryStatusIfNeeded(
                 deps,
                 successful_recovery_strategy != null,
-                semantic_attempt,
-                semantic_limit,
+                control.coordinator.attempt,
+                control.coordinator.attempt_limit,
                 types.ModelFailureDiagnostic.init("RequiredVisionToolCallMissing"),
             );
             debug_trace.eventf(
@@ -9072,14 +8799,14 @@ fn processQueuedPromptLoop(
                 deps,
                 stream_ctx.alloc,
                 arena,
-                turn_id,
+                control.coordinator.turn_id,
                 completion.tool_calls,
             );
             recovery_has_unexecuted_tool_start = false;
         }
         const finish_reason = completion.finish_reason.?;
         if (successful_recovery_strategy != null) {
-            try pushAutoRecoveredStatus(deps, semantic_attempt, semantic_limit);
+            try pushAutoRecoveredStatus(deps, control.coordinator.attempt, control.coordinator.attempt_limit);
         }
         latest_recovery_diagnostic = null;
         recovery_strategy = null;
@@ -9100,25 +8827,25 @@ fn processQueuedPromptLoop(
             switch (tool_admission) {
                 .admitted => reportProviderExecutedUsage(deps, completion.tool_calls),
                 .reject_duplicate_identity => {
-                    try stream_ctx.provisional_statuses.finishRejectedCompletions(deps, arena, turn_id, completion.tool_calls, advertised_dynamic_tool_names);
+                    try stream_ctx.provisional_statuses.finishRejectedCompletions(deps, arena, control.coordinator.turn_id, completion.tool_calls, advertised_dynamic_tool_names);
                     debug_trace.eventf("agent", "authoritative_tool_admission_rejected", step_ctx, "failure=duplicate", .{});
                     finish_trace.finish("duplicate_tool_identity");
                     return error.MalformedAuthoritativeToolIdentity;
                 },
                 .reject_malformed_identity => |failure| {
-                    try stream_ctx.provisional_statuses.finishRejectedCompletions(deps, arena, turn_id, completion.tool_calls, advertised_dynamic_tool_names);
+                    try stream_ctx.provisional_statuses.finishRejectedCompletions(deps, arena, control.coordinator.turn_id, completion.tool_calls, advertised_dynamic_tool_names);
                     debug_trace.eventf("agent", "authoritative_tool_admission_rejected", step_ctx, "failure={s} provenance=fx_local", .{@tagName(failure)});
                     finish_trace.finish("malformed_tool_identity");
                     return error.MalformedAuthoritativeToolIdentity;
                 },
                 .reject_unstorable_identity => |failure| {
-                    try stream_ctx.provisional_statuses.finishRejectedCompletions(deps, arena, turn_id, completion.tool_calls, advertised_dynamic_tool_names);
+                    try stream_ctx.provisional_statuses.finishRejectedCompletions(deps, arena, control.coordinator.turn_id, completion.tool_calls, advertised_dynamic_tool_names);
                     debug_trace.eventf("agent", "authoritative_tool_admission_rejected", step_ctx, "field={s} failure={s}", .{ @tagName(failure.field), @tagName(failure.reason) });
                     finish_trace.finish("unstorable_tool_identity");
                     return error.MalformedAuthoritativeToolIdentity;
                 },
                 .reject_malformed_provider_result => |failure| {
-                    try stream_ctx.provisional_statuses.finishRejectedCompletions(deps, arena, turn_id, completion.tool_calls, advertised_dynamic_tool_names);
+                    try stream_ctx.provisional_statuses.finishRejectedCompletions(deps, arena, control.coordinator.turn_id, completion.tool_calls, advertised_dynamic_tool_names);
                     debug_trace.eventf("agent", "authoritative_tool_admission_rejected", step_ctx, "failure={s} provenance=provider_executed", .{@tagName(failure)});
                     finish_trace.finish("malformed_provider_result");
                     return error.MalformedProviderResultIdentity;
@@ -9127,7 +8854,7 @@ fn processQueuedPromptLoop(
                     try stream_ctx.provisional_statuses.finishMalformedProviderToolArguments(
                         deps,
                         arena,
-                        turn_id,
+                        control.coordinator.turn_id,
                         completion.tool_calls,
                     );
                     debug_trace.eventf(
@@ -9157,7 +8884,7 @@ fn processQueuedPromptLoop(
             runtime_tool_presentation.transitionPresentationGroup(
                 active_presentation_group_id,
                 stream_ctx.provisional_statuses.presentation_group_id,
-                turn_id,
+                control.coordinator.turn_id,
                 step_ctx.step_id,
                 .{
                     .has_visible_tool_calls = step_has_visible_tool_calls,
@@ -9188,7 +8915,7 @@ fn processQueuedPromptLoop(
             "agent",
             "step completion step={d} content_bytes={d} tool_calls={d} finish_reason={s}",
             .{
-                step + 1,
+                control.coordinator.step + 1,
                 if (completion.content) |content| content.len else 0,
                 completion.tool_calls.len,
                 finish_reason.label(),
@@ -9219,12 +8946,12 @@ fn processQueuedPromptLoop(
                 finish_reason.label(),
                 completion.tool_calls.len,
             });
-            if (agent_steps.allowsStep(config.agent_step_limit, step + 1) and
+            if (agent_steps.allowsStep(control.coordinator.step_limit, control.coordinator.step + 1) and
                 try append_pending_steering_after_assistant(
                     deps,
                     arena,
                     &within_turn_suffix,
-                    turn_id,
+                    control.coordinator.turn_id,
                     assistant_text,
                     provider_replay,
                     config.origin,
@@ -9241,7 +8968,7 @@ fn processQueuedPromptLoop(
                     assistant_text,
                 );
                 stop_state.terminal_materializing = true;
-                try finishCommonAssistantTerminal(
+                try runtime_finalization.finishCommonAssistantTerminal(
                     deps,
                     finalization,
                     arena,
@@ -9308,26 +9035,26 @@ fn processQueuedPromptLoop(
             const history_text = try arena.dupe(u8, raw_final);
             const history_replay = if (has_content) final_provider_replay else try deps.agent_stream_provider.projectReplay(arena, final_provider_replay, &.{}, false, true);
 
-            if (agent_steps.allowsStep(config.agent_step_limit, step + 1) and
+            if (agent_steps.allowsStep(control.coordinator.step_limit, control.coordinator.step + 1) and
                 try append_pending_steering_after_assistant(
                     deps,
                     arena,
                     &within_turn_suffix,
-                    turn_id,
+                    control.coordinator.turn_id,
                     history_text,
                     history_replay,
                     config.origin,
-                    if (!lifecycle.view.hasStop() or stop_state.dispatched) .finalizing else .model,
+                    if (!lifecycle.view.hasStop() or !stop_state.control.needsDispatch()) .finalizing else .model,
                 ))
             {
                 try deps.push_text(deps.ctx, .{ .assistant_rendered = "\n" });
                 continue;
             }
 
-            if (disposition == .completed and agent_steps.allowsStep(config.agent_step_limit, step + 1) and
-                try continue_pending_subagent(deps, arena, &within_turn_suffix, turn_id, step_ctx.step_id, history_text, history_replay)) continue;
+            if (disposition == .completed and agent_steps.allowsStep(control.coordinator.step_limit, control.coordinator.step + 1) and
+                try continue_pending_subagent(deps, arena, &within_turn_suffix, control.coordinator.turn_id, step_ctx.step_id, history_text, history_replay)) continue;
 
-            if (!lifecycle.view.hasStop() or stop_state.dispatched) {
+            if (!lifecycle.view.hasStop() or !stop_state.control.needsDispatch()) {
                 if (!has_content) {
                     try deps.push_text(deps.ctx, .{ .operational = rendered });
                 }
@@ -9340,7 +9067,7 @@ fn processQueuedPromptLoop(
                 );
                 stop_state.terminal_materializing =
                     stop_state.retained_candidate != null;
-                try finishCommonAssistantTerminal(
+                try runtime_finalization.finishCommonAssistantTerminal(
                     deps,
                     finalization,
                     arena,
@@ -9375,13 +9102,13 @@ fn processQueuedPromptLoop(
 
             var stop_outcome = runtime_lifecycle.dispatchStopCheckpoint(
                 lifecycle,
-                config.cancel_flag,
+                control.coordinator.cancel_flag,
                 .{
-                    .turn_id = turn_id,
-                    .step_index = current_step_index,
+                    .turn_id = control.coordinator.turn_id,
+                    .step_index = control.current_step_index,
                     .assistant_text = rendered,
                     .provider_disposition = disposition,
-                    .can_continue = agent_steps.allowsStep(config.agent_step_limit, step + 1),
+                    .can_continue = agent_steps.allowsStep(control.coordinator.step_limit, control.coordinator.step + 1),
                 },
             ) catch |err| switch (err) {
                 error.Cancelled => {
@@ -9389,7 +9116,7 @@ fn processQueuedPromptLoop(
                         deps,
                         arena,
                         &within_turn_suffix,
-                        turn_id,
+                        control.coordinator.turn_id,
                         "",
                     )) {
                         stop_state.retained_candidate = null;
@@ -9416,11 +9143,11 @@ fn processQueuedPromptLoop(
             };
             defer stop_outcome.deinit(lifecycle.outcome_allocator);
 
-            stop_state.dispatched = true;
+            stop_state.control.markDispatched();
             switch (stop_outcome) {
                 .allow => {
                     stop_state.terminal_materializing = true;
-                    try finishCommonAssistantTerminal(
+                    try runtime_finalization.finishCommonAssistantTerminal(
                         deps,
                         finalization,
                         arena,
@@ -9511,12 +9238,12 @@ fn processQueuedPromptLoop(
             prepared_tool_calls[tool_call_index] = runtime_lifecycle.prepareToolCallForLifecycle(
                 arena,
                 lifecycle,
-                config.cancel_flag,
-                turn_id,
-                current_step_index,
+                control.coordinator.cancel_flag,
+                control.coordinator.turn_id,
+                control.current_step_index,
                 tool_call,
             ) catch |err| {
-                if (err == error.Cancelled and config.cancel_flag.load(.seq_cst)) {
+                if (err == error.Cancelled and control.coordinator.cancel_flag.load(.seq_cst)) {
                     runtime_telemetry.traceCancelObserved(step_ctx, true);
                     try finishPreparedCallsOnCancellation(
                         deps,
@@ -9524,7 +9251,7 @@ fn processQueuedPromptLoop(
                         stream_ctx.alloc,
                         arena,
                         config,
-                        turn_id,
+                        control.coordinator.turn_id,
                         prepared_tool_calls[0..tool_call_index],
                         &.{},
                         advertised_dynamic_tool_names,
@@ -9535,7 +9262,7 @@ fn processQueuedPromptLoop(
                         stream_ctx.alloc,
                         arena,
                         config,
-                        turn_id,
+                        control.coordinator.turn_id,
                         completion.tool_calls[tool_call_index..],
                         advertised_dynamic_tool_names,
                     );
@@ -9583,7 +9310,7 @@ fn processQueuedPromptLoop(
                 deps,
                 &stream_ctx.provisional_statuses,
                 stream_ctx.alloc,
-                turn_id,
+                control.coordinator.turn_id,
                 effective_tool_calls,
                 advertised_dynamic_tool_names,
                 err,
@@ -9605,7 +9332,7 @@ fn processQueuedPromptLoop(
                     .workspace_root = config.workspace_root,
                     .access_scope = config.access_scope,
                     .advertised_dynamic_tool_names = advertised_dynamic_tool_names,
-                    .cancel_flag = config.cancel_flag,
+                    .cancel_flag = control.coordinator.cancel_flag,
                     .classifiers = .{
                         .ctx = @ptrCast(&classifier_ctx),
                         .idempotent = prepareNoIdempotentTerminal,
@@ -9614,7 +9341,7 @@ fn processQueuedPromptLoop(
                         .deferred_dynamic = prepareDeferredDynamicCandidate,
                     },
                 }) catch |err| {
-                    if (err == error.Cancelled and config.cancel_flag.load(.seq_cst)) {
+                    if (err == error.Cancelled and control.coordinator.cancel_flag.load(.seq_cst)) {
                         runtime_telemetry.traceCancelObserved(step_ctx, true);
                         try finishPreparedCallsOnCancellation(
                             deps,
@@ -9622,7 +9349,7 @@ fn processQueuedPromptLoop(
                             stream_ctx.alloc,
                             arena,
                             config,
-                            turn_id,
+                            control.coordinator.turn_id,
                             prepared_tool_calls,
                             preparation_batch.preparations,
                             advertised_dynamic_tool_names,
@@ -9647,7 +9374,7 @@ fn processQueuedPromptLoop(
                         deps,
                         &stream_ctx.provisional_statuses,
                         stream_ctx.alloc,
-                        turn_id,
+                        control.coordinator.turn_id,
                         effective_tool_calls,
                         advertised_dynamic_tool_names,
                         err,
@@ -9661,7 +9388,7 @@ fn processQueuedPromptLoop(
                 deps,
                 &stream_ctx.provisional_statuses,
                 stream_ctx.alloc,
-                turn_id,
+                control.coordinator.turn_id,
                 effective_tool_calls,
                 advertised_dynamic_tool_names,
                 err,
@@ -9684,7 +9411,7 @@ fn processQueuedPromptLoop(
                     deps,
                     &stream_ctx.provisional_statuses,
                     stream_ctx.alloc,
-                    turn_id,
+                    control.coordinator.turn_id,
                     effective_tool_calls,
                     advertised_dynamic_tool_names,
                     err,
@@ -9704,7 +9431,7 @@ fn processQueuedPromptLoop(
                             context_deferred_calls[0] = preparation == .candidate;
                         }
                     }
-                } else if (!config.cancel_flag.load(.seq_cst)) context_probes: {
+                } else if (!control.coordinator.cancel_flag.load(.seq_cst)) context_probes: {
                     for (preparation_batch.preparations, effective_tool_calls, 0..) |maybe_preparation, tool_call, index| {
                         if (runtime_parallel_execution.isReadOnlyCall(
                             deps.tool_registry,
@@ -9722,23 +9449,23 @@ fn processQueuedPromptLoop(
                             &context_delivery_state,
                             candidate,
                         ) catch |err| {
-                            if (config.cancel_flag.load(.seq_cst)) break :context_probes;
+                            if (control.coordinator.cancel_flag.load(.seq_cst)) break :context_probes;
                             return settleFailedContextGate(
                                 deps,
                                 &stream_ctx.provisional_statuses,
                                 stream_ctx.alloc,
-                                turn_id,
+                                control.coordinator.turn_id,
                                 effective_tool_calls,
                                 advertised_dynamic_tool_names,
                                 err,
                             );
                         };
-                        if (config.cancel_flag.load(.seq_cst)) break :context_probes;
+                        if (control.coordinator.cancel_flag.load(.seq_cst)) break :context_probes;
                     }
                 }
             }
 
-            if (config.cancel_flag.load(.seq_cst)) {
+            if (control.coordinator.cancel_flag.load(.seq_cst)) {
                 var cancelled_call: ?ToolCall = null;
                 find_scoped_candidate: for (preparation_batch.preparations, effective_tool_calls) |maybe_preparation, tool_call| {
                     const preparation = maybe_preparation orelse continue;
@@ -9759,7 +9486,7 @@ fn processQueuedPromptLoop(
                     stream_ctx.alloc,
                     arena,
                     config,
-                    turn_id,
+                    control.coordinator.turn_id,
                     prepared_tool_calls,
                     preparation_batch.preparations,
                     advertised_dynamic_tool_names,
@@ -9791,7 +9518,7 @@ fn processQueuedPromptLoop(
                     deps,
                     &stream_ctx.provisional_statuses,
                     stream_ctx.alloc,
-                    turn_id,
+                    control.coordinator.turn_id,
                     effective_tool_calls,
                     advertised_dynamic_tool_names,
                     err,
@@ -9851,7 +9578,7 @@ fn processQueuedPromptLoop(
                 )
             else
                 runtime_parallel_execution.LeadingGroup{};
-            const parallel_permission_eligible = switch (parallel_group.kind) {
+            const parallel_permission_eligible = switch (parallel_group.decision()) {
                 .none => false,
                 .read_only => root_action_permission_mode == .auto or
                     root_action_permission_mode == .yolo,
@@ -9873,7 +9600,7 @@ fn processQueuedPromptLoop(
                         deps,
                         &stream_ctx.provisional_statuses,
                         stream_ctx.alloc,
-                        turn_id,
+                        control.coordinator.turn_id,
                         effective_tool_calls[tool_call_index..],
                         advertised_dynamic_tool_names,
                         err,
@@ -9915,7 +9642,7 @@ fn processQueuedPromptLoop(
                         .provider_executed => unreachable,
                         .ready => {},
                     }
-                    if (config.cancel_flag.load(.seq_cst)) {
+                    if (control.coordinator.cancel_flag.load(.seq_cst)) {
                         runtime_telemetry.traceCancelObserved(step_ctx, true);
                         try finishPendingParallelCancelled(
                             deps,
@@ -9923,7 +9650,7 @@ fn processQueuedPromptLoop(
                             stream_ctx.alloc,
                             arena,
                             config,
-                            turn_id,
+                            control.coordinator.turn_id,
                             parallel_calls,
                             precomputed_results,
                             parallel_status_started,
@@ -9976,7 +9703,7 @@ fn processQueuedPromptLoop(
                 for (parallel_calls, precomputed_results, 0..) |unbound_call, precomputed, group_index| {
                     if (precomputed != null) continue;
                     var parallel_call = unbound_call;
-                    if (config.cancel_flag.load(.seq_cst)) {
+                    if (control.coordinator.cancel_flag.load(.seq_cst)) {
                         runtime_telemetry.traceCancelObserved(step_ctx, true);
                         try finishPendingParallelCancelled(
                             deps,
@@ -9984,7 +9711,7 @@ fn processQueuedPromptLoop(
                             stream_ctx.alloc,
                             arena,
                             config,
-                            turn_id,
+                            control.coordinator.turn_id,
                             parallel_calls,
                             precomputed_results,
                             parallel_status_started,
@@ -9997,7 +9724,7 @@ fn processQueuedPromptLoop(
                         return;
                     }
                     parallel_skill_preparations[group_index] = prepareSkillCall(deps, arena, parallel_call, if (skills.catalog) |catalog| &catalog.locations else null) catch |err| {
-                        if (err != error.Cancelled or !config.cancel_flag.load(.seq_cst)) return err;
+                        if (err != error.Cancelled or !control.coordinator.cancel_flag.load(.seq_cst)) return err;
                         runtime_telemetry.traceCancelObserved(step_ctx, true);
                         try finishPendingParallelCancelled(
                             deps,
@@ -10005,7 +9732,7 @@ fn processQueuedPromptLoop(
                             stream_ctx.alloc,
                             arena,
                             config,
-                            turn_id,
+                            control.coordinator.turn_id,
                             parallel_calls,
                             precomputed_results,
                             parallel_status_started,
@@ -10028,7 +9755,7 @@ fn processQueuedPromptLoop(
                         },
                     };
                     if (!runtime_tool_admission.deferVisibleLifecycleUntilAfterPermission(parallel_call.name)) {
-                        parallel_status_started[group_index] = try runtime_tool_presentation.startToolVisibleLifecycle(deps, arena, turn_id, stream_ctx.provisional_statuses.presentation_group_id, parallel_call, null, advertised_dynamic_tool_names);
+                        parallel_status_started[group_index] = try runtime_tool_presentation.startToolVisibleLifecycle(deps, arena, control.coordinator.turn_id, stream_ctx.provisional_statuses.presentation_group_id, parallel_call, null, advertised_dynamic_tool_names);
                     }
 
                     const parallel_preserved_review_hold = if (root_action_permission_mode == .auto)
@@ -10037,13 +9764,13 @@ fn processQueuedPromptLoop(
                         null;
                     const parallel_review_attempt_available = root_action_permission_mode != .auto or
                         turn_review_cache.reviewAttemptAvailable(parallel_call);
-                    const parallel_review_context = buildReviewTurnContext(
+                    const parallel_review_context = execution_compatibility.buildReviewTurnContext(
                         config,
                         successful_gateway_model,
                         root_user_intent_context,
                         within_turn_suffix.items,
                         pending_assistant,
-                        activeCredentialLease(active_api_key, job),
+                        execution_compatibility.credentialLease(active_api_key, job),
                         parallel_call.id,
                         parallel_review_attempt_available,
                     );
@@ -10060,10 +9787,10 @@ fn processQueuedPromptLoop(
                         outcome
                     else
                         runtime_tool_admission.requestToolPermissionTraced(deps, arena, parallel_call, parallel_review_context, root_action_permission_mode, local_grants.items, null, null, advertised_dynamic_tool_names, advertised_dynamic_tools, config.workspace_root, step_ctx) catch |err| blk: {
-                            if (err != error.Cancelled or !config.cancel_flag.load(.seq_cst)) return err;
+                            if (err != error.Cancelled or !control.coordinator.cancel_flag.load(.seq_cst)) return err;
                             break :blk null;
                         };
-                    if (maybe_parallel_permission == null or config.cancel_flag.load(.seq_cst)) {
+                    if (maybe_parallel_permission == null or control.coordinator.cancel_flag.load(.seq_cst)) {
                         runtime_telemetry.traceCancelObserved(step_ctx, true);
                         try finishPendingParallelCancelled(
                             deps,
@@ -10071,7 +9798,7 @@ fn processQueuedPromptLoop(
                             stream_ctx.alloc,
                             arena,
                             config,
-                            turn_id,
+                            control.coordinator.turn_id,
                             parallel_calls,
                             precomputed_results,
                             parallel_status_started,
@@ -10113,7 +9840,7 @@ fn processQueuedPromptLoop(
                             deps,
                             stream_ctx.alloc,
                             arena,
-                            turn_id,
+                            control.coordinator.turn_id,
                             parallel_call,
                             parallel_status_started[group_index],
                             null,
@@ -10136,7 +9863,7 @@ fn processQueuedPromptLoop(
                     }
 
                     if (!parallel_status_started[group_index]) {
-                        parallel_status_started[group_index] = try runtime_tool_presentation.startToolVisibleLifecycle(deps, arena, turn_id, stream_ctx.provisional_statuses.presentation_group_id, parallel_call, null, advertised_dynamic_tool_names);
+                        parallel_status_started[group_index] = try runtime_tool_presentation.startToolVisibleLifecycle(deps, arena, control.coordinator.turn_id, stream_ctx.provisional_statuses.presentation_group_id, parallel_call, null, advertised_dynamic_tool_names);
                     }
                     const parallel_authority = permission_outcome.execution_authority orelse
                         return error.MissingToolExecutionAuthority;
@@ -10159,7 +9886,7 @@ fn processQueuedPromptLoop(
 
                 var parallel_run: ?runtime_parallel_execution.ParallelRunResult = null;
                 if (executable_calls.items.len > 0) {
-                    if (config.cancel_flag.load(.seq_cst)) {
+                    if (control.coordinator.cancel_flag.load(.seq_cst)) {
                         runtime_telemetry.traceCancelObserved(step_ctx, true);
                         try finishPendingParallelCancelled(
                             deps,
@@ -10167,7 +9894,7 @@ fn processQueuedPromptLoop(
                             stream_ctx.alloc,
                             arena,
                             config,
-                            turn_id,
+                            control.coordinator.turn_id,
                             parallel_calls,
                             precomputed_results,
                             parallel_status_started,
@@ -10219,7 +9946,7 @@ fn processQueuedPromptLoop(
                         "parallel_tool_group_start",
                         step_ctx,
                         "kind={s} count={d}",
-                        .{ @tagName(parallel_group.kind), executable_calls.items.len },
+                        .{ @tagName(parallel_group.decision()), executable_calls.items.len },
                     );
                     const parallel_execution_root_user_context = try buildToolExecutionRootUserContext(
                         arena,
@@ -10230,7 +9957,7 @@ fn processQueuedPromptLoop(
                     var parallel_exec_ctx = runtime_parallel_execution.ParallelHookExecContext{
                         .skill_locations = if (skills.catalog) |catalog| &catalog.locations else null,
                         .hooks = deps,
-                        .turn_id = turn_id,
+                        .turn_id = control.coordinator.turn_id,
                         .root_user_intent_context = parallel_execution_root_user_context,
                         .current_turn_messages = within_turn_suffix.items,
                         .session_grants = local_grants.items,
@@ -10241,11 +9968,11 @@ fn processQueuedPromptLoop(
                     };
                     var completion_publisher = ParallelSubagentCompletionPublisher{
                         .deps = deps,
-                        .turn_id = turn_id,
+                        .turn_id = control.coordinator.turn_id,
                         .advertised_dynamic_tool_names = advertised_dynamic_tool_names,
                         .step_ctx = step_ctx,
                     };
-                    const attempt_observer: ?runtime_parallel_execution.ParallelAttemptObserver = if (parallel_group.kind == .subagent)
+                    const attempt_observer: ?runtime_parallel_execution.ParallelAttemptObserver = if (parallel_group.decision() == .subagent)
                         .{ .ctx = &completion_publisher, .notify = ParallelSubagentCompletionPublisher.notify }
                     else
                         null;
@@ -10255,7 +9982,7 @@ fn processQueuedPromptLoop(
                             .execute = runtime_parallel_execution.parallelHookExecute,
                             .format_ctx = &parallel_exec_ctx,
                             .format_error = runtime_parallel_execution.parallelHookFormatError,
-                            .cancel_flag = config.cancel_flag,
+                            .cancel_flag = control.coordinator.cancel_flag,
                             .attempt_observer = attempt_observer,
                         });
                     } else {
@@ -10264,7 +9991,7 @@ fn processQueuedPromptLoop(
                             .execute = runtime_parallel_execution.parallelHookExecute,
                             .format_ctx = &parallel_exec_ctx,
                             .format_error = runtime_parallel_execution.parallelHookFormatError,
-                            .cancel_flag = config.cancel_flag,
+                            .cancel_flag = control.coordinator.cancel_flag,
                             .attempt_observer = attempt_observer,
                         });
                     }
@@ -10313,7 +10040,7 @@ fn processQueuedPromptLoop(
                     if (parallel_run) |run| run.attempts else &.{},
                     admitted_status_started,
                     parallel_status_terminalized,
-                    turn_id,
+                    control.coordinator.turn_id,
                     advertised_dynamic_tool_names,
                     step_ctx,
                 );
@@ -10323,11 +10050,11 @@ fn processQueuedPromptLoop(
                     step_ctx,
                     "kind={s} count={d}",
                     .{
-                        @tagName(parallel_group.kind),
+                        @tagName(parallel_group.decision()),
                         if (parallel_run) |run| run.attempts.len else 0,
                     },
                 );
-                if (config.cancel_flag.load(.seq_cst)) {
+                if (control.coordinator.cancel_flag.load(.seq_cst)) {
                     runtime_telemetry.traceCancelObserved(step_ctx, true);
                     try runtime_tool_batch.drainPendingUserSuffix(arena, &step_batch, &within_turn_suffix);
                     try runtime_interruption.persistInterruptedTurnOnce(deps, finalization, job, partial_assistant, cancelled_call, completed_tool_names.items, &interrupted_persisted, step_ctx, within_turn_suffix.items, stop_state.retained_candidate, &stop_state.terminal_materializing);
@@ -10393,7 +10120,7 @@ fn processQueuedPromptLoop(
                             deps,
                             stream_ctx.alloc,
                             arena,
-                            turn_id,
+                            control.coordinator.turn_id,
                             tool_call,
                             false,
                             tool_display_target,
@@ -10441,7 +10168,7 @@ fn processQueuedPromptLoop(
             if (tool_call.argument_integrity != .valid) {
                 unreachable;
             }
-            if (config.cancel_flag.load(.seq_cst)) {
+            if (control.coordinator.cancel_flag.load(.seq_cst)) {
                 runtime_telemetry.traceCancelObserved(step_ctx, true);
                 try finishPendingCancelledCalls(
                     deps,
@@ -10449,7 +10176,7 @@ fn processQueuedPromptLoop(
                     stream_ctx.alloc,
                     arena,
                     config,
-                    turn_id,
+                    control.coordinator.turn_id,
                     effective_tool_calls[tool_call_index..],
                     advertised_dynamic_tool_names,
                 );
@@ -10464,7 +10191,7 @@ fn processQueuedPromptLoop(
                     &stream_ctx,
                     arena,
                     config,
-                    turn_id,
+                    control.coordinator.turn_id,
                     tool_call,
                     advertised_dynamic_tool_names,
                     step_ctx,
@@ -10482,7 +10209,7 @@ fn processQueuedPromptLoop(
                             &stream_ctx.provisional_statuses,
                             stream_ctx.alloc,
                             arena,
-                            turn_id,
+                            control.coordinator.turn_id,
                             tool_call,
                             advertised_dynamic_tool_names,
                             step_ctx,
@@ -10520,7 +10247,7 @@ fn processQueuedPromptLoop(
                                     deps,
                                     stream_ctx.alloc,
                                     arena,
-                                    turn_id,
+                                    control.coordinator.turn_id,
                                     tool_call,
                                     false,
                                     tool_display_target,
@@ -10561,7 +10288,7 @@ fn processQueuedPromptLoop(
                                     deps,
                                     stream_ctx.alloc,
                                     arena,
-                                    turn_id,
+                                    control.coordinator.turn_id,
                                     tool_call,
                                     false,
                                     tool_display_target,
@@ -10593,7 +10320,7 @@ fn processQueuedPromptLoop(
                                 const status_started = try runtime_tool_presentation.startToolVisibleLifecycle(
                                     deps,
                                     arena,
-                                    turn_id,
+                                    control.coordinator.turn_id,
                                     stream_ctx.provisional_statuses.presentation_group_id,
                                     tool_call,
                                     tool_display_target,
@@ -10608,7 +10335,7 @@ fn processQueuedPromptLoop(
                                     deps,
                                     stream_ctx.alloc,
                                     arena,
-                                    turn_id,
+                                    control.coordinator.turn_id,
                                     tool_call,
                                     status_started,
                                     tool_display_target,
@@ -10645,7 +10372,7 @@ fn processQueuedPromptLoop(
                                     deps,
                                     stream_ctx.alloc,
                                     arena,
-                                    turn_id,
+                                    control.coordinator.turn_id,
                                     tool_call,
                                     false,
                                     tool_display_target,
@@ -10722,7 +10449,7 @@ fn processQueuedPromptLoop(
                         deps,
                         stream_ctx.alloc,
                         arena,
-                        turn_id,
+                        control.coordinator.turn_id,
                         tool_call,
                         false,
                         tool_display_target,
@@ -10759,7 +10486,7 @@ fn processQueuedPromptLoop(
                         deps,
                         stream_ctx.alloc,
                         arena,
-                        turn_id,
+                        control.coordinator.turn_id,
                         tool_call,
                         false,
                         tool_display_target,
@@ -10791,7 +10518,7 @@ fn processQueuedPromptLoop(
                 }
             }
             var skill_preparation = prepareSkillCall(deps, arena, tool_call, if (skills.catalog) |catalog| &catalog.locations else null) catch |err| {
-                if (err != error.Cancelled or !config.cancel_flag.load(.seq_cst)) return err;
+                if (err != error.Cancelled or !control.coordinator.cancel_flag.load(.seq_cst)) return err;
                 runtime_telemetry.traceCancelObserved(step_ctx, true);
                 try finishPendingCancelledCalls(
                     deps,
@@ -10799,7 +10526,7 @@ fn processQueuedPromptLoop(
                     stream_ctx.alloc,
                     arena,
                     config,
-                    turn_id,
+                    control.coordinator.turn_id,
                     effective_tool_calls[tool_call_index..],
                     advertised_dynamic_tool_names,
                 );
@@ -10819,7 +10546,7 @@ fn processQueuedPromptLoop(
                             deps,
                             stream_ctx.alloc,
                             arena,
-                            turn_id,
+                            control.coordinator.turn_id,
                             tool_call,
                             false,
                             tool_display_target,
@@ -10870,7 +10597,7 @@ fn processQueuedPromptLoop(
                         deps,
                         &stream_ctx.provisional_statuses,
                         stream_ctx.alloc,
-                        turn_id,
+                        control.coordinator.turn_id,
                         effective_tool_calls[tool_call_index..],
                         advertised_dynamic_tool_names,
                         err,
@@ -10904,7 +10631,7 @@ fn processQueuedPromptLoop(
                         deps,
                         &stream_ctx.provisional_statuses,
                         stream_ctx.alloc,
-                        turn_id,
+                        control.coordinator.turn_id,
                         effective_tool_calls[tool_call_index..],
                         advertised_dynamic_tool_names,
                         err,
@@ -10918,7 +10645,7 @@ fn processQueuedPromptLoop(
                     &stream_ctx.provisional_statuses,
                     stream_ctx.alloc,
                     arena,
-                    turn_id,
+                    control.coordinator.turn_id,
                     tool_call,
                     advertised_dynamic_tool_names,
                     step_ctx,
@@ -10981,7 +10708,7 @@ fn processQueuedPromptLoop(
                         &stream_ctx.provisional_statuses,
                         stream_ctx.alloc,
                         arena,
-                        turn_id,
+                        control.coordinator.turn_id,
                         tool_call,
                         advertised_dynamic_tool_names,
                         step_ctx,
@@ -11017,7 +10744,7 @@ fn processQueuedPromptLoop(
             if (!runtime_tool_admission.deferVisibleLifecycleUntilAfterPermission(tool_call.name) and
                 !defer_auto_command_lifecycle)
             {
-                status_started = try runtime_tool_presentation.startToolVisibleLifecycle(deps, arena, turn_id, stream_ctx.provisional_statuses.presentation_group_id, tool_call, tool_display_target, advertised_dynamic_tool_names);
+                status_started = try runtime_tool_presentation.startToolVisibleLifecycle(deps, arena, control.coordinator.turn_id, stream_ctx.provisional_statuses.presentation_group_id, tool_call, tool_display_target, advertised_dynamic_tool_names);
             }
 
             var file_call_arena_state: std.heap.ArenaAllocator = undefined;
@@ -11035,13 +10762,13 @@ fn processQueuedPromptLoop(
                 tool_call;
             const review_attempt_available = action_permission_mode != .auto or
                 turn_review_cache.reviewAttemptAvailable(execution_call);
-            const review_context = buildReviewTurnContext(
+            const review_context = execution_compatibility.buildReviewTurnContext(
                 config,
                 successful_gateway_model,
                 root_user_intent_context,
                 within_turn_suffix.items,
                 pending_assistant,
-                activeCredentialLease(active_api_key, job),
+                execution_compatibility.credentialLease(active_api_key, job),
                 execution_call.id,
                 review_attempt_available,
             );
@@ -11108,16 +10835,16 @@ fn processQueuedPromptLoop(
                         config.workspace_root,
                         step_ctx,
                     )) catch |err| blk: {
-                    if (err != error.Cancelled or !config.cancel_flag.load(.seq_cst)) return err;
+                    if (err != error.Cancelled or !control.coordinator.cancel_flag.load(.seq_cst)) return err;
                     break :blk null;
                 };
-            if (maybe_permission == null or config.cancel_flag.load(.seq_cst)) {
+            if (maybe_permission == null or control.coordinator.cancel_flag.load(.seq_cst)) {
                 runtime_telemetry.traceCancelObserved(step_ctx, true);
                 if (!status_started and (is_file_mutation or defer_auto_command_lifecycle)) {
                     status_started = try runtime_tool_presentation.startToolVisibleLifecycle(
                         deps,
                         call_allocator,
-                        turn_id,
+                        control.coordinator.turn_id,
                         stream_ctx.provisional_statuses.presentation_group_id,
                         execution_call,
                         tool_display_target,
@@ -11128,7 +10855,7 @@ fn processQueuedPromptLoop(
                     deps,
                     stream_ctx.alloc,
                     call_allocator,
-                    turn_id,
+                    control.coordinator.turn_id,
                     execution_call,
                     status_started,
                     tool_display_target,
@@ -11141,7 +10868,7 @@ fn processQueuedPromptLoop(
                     stream_ctx.alloc,
                     arena,
                     config,
-                    turn_id,
+                    control.coordinator.turn_id,
                     effective_tool_calls[tool_call_index + 1 ..],
                     advertised_dynamic_tool_names,
                 );
@@ -11206,16 +10933,16 @@ fn processQueuedPromptLoop(
                     config.workspace_root,
                     step_ctx,
                 ) catch |err| blk: {
-                    if (err != error.Cancelled or !config.cancel_flag.load(.seq_cst)) return err;
+                    if (err != error.Cancelled or !control.coordinator.cancel_flag.load(.seq_cst)) return err;
                     break :blk null;
                 };
-                if (maybe_revalidated == null or config.cancel_flag.load(.seq_cst)) {
+                if (maybe_revalidated == null or control.coordinator.cancel_flag.load(.seq_cst)) {
                     runtime_telemetry.traceCancelObserved(step_ctx, true);
                     if (!status_started and (is_file_mutation or defer_auto_command_lifecycle)) {
                         status_started = try runtime_tool_presentation.startToolVisibleLifecycle(
                             deps,
                             call_allocator,
-                            turn_id,
+                            control.coordinator.turn_id,
                             null,
                             execution_call,
                             tool_display_target,
@@ -11225,7 +10952,7 @@ fn processQueuedPromptLoop(
                     try runtime_tool_presentation.finishDeniedToolStatus(
                         deps,
                         call_allocator,
-                        turn_id,
+                        control.coordinator.turn_id,
                         execution_call,
                         status_started,
                         tool_display_target,
@@ -11254,7 +10981,7 @@ fn processQueuedPromptLoop(
                     status_started = try runtime_tool_presentation.startToolVisibleLifecycle(
                         deps,
                         call_allocator,
-                        turn_id,
+                        control.coordinator.turn_id,
                         stream_ctx.provisional_statuses.presentation_group_id,
                         execution_call,
                         tool_display_target,
@@ -11277,7 +11004,7 @@ fn processQueuedPromptLoop(
                     deps,
                     stream_ctx.alloc,
                     call_allocator,
-                    turn_id,
+                    control.coordinator.turn_id,
                     execution_call,
                     status_started,
                     tool_display_target,
@@ -11343,7 +11070,7 @@ fn processQueuedPromptLoop(
                     status_started = try runtime_tool_presentation.startToolVisibleLifecycle(
                         deps,
                         call_allocator,
-                        turn_id,
+                        control.coordinator.turn_id,
                         stream_ctx.provisional_statuses.presentation_group_id,
                         execution_call,
                         tool_display_target,
@@ -11354,7 +11081,7 @@ fn processQueuedPromptLoop(
                     deps,
                     stream_ctx.alloc,
                     call_allocator,
-                    turn_id,
+                    control.coordinator.turn_id,
                     execution_call,
                     status_started,
                     tool_display_target,
@@ -11446,7 +11173,7 @@ fn processQueuedPromptLoop(
                 status_started = try runtime_tool_presentation.startToolVisibleLifecycle(
                     deps,
                     call_allocator,
-                    turn_id,
+                    control.coordinator.turn_id,
                     stream_ctx.provisional_statuses.presentation_group_id,
                     execution_call,
                     tool_display_target,
@@ -11504,13 +11231,13 @@ fn processQueuedPromptLoop(
                 }
             }
 
-            if (config.cancel_flag.load(.seq_cst)) {
+            if (control.coordinator.cancel_flag.load(.seq_cst)) {
                 runtime_telemetry.traceCancelObserved(step_ctx, true);
                 _ = try stream_ctx.provisional_statuses.finishDeniedCall(
                     deps,
                     stream_ctx.alloc,
                     call_allocator,
-                    turn_id,
+                    control.coordinator.turn_id,
                     execution_call,
                     status_started,
                     tool_display_target,
@@ -11523,7 +11250,7 @@ fn processQueuedPromptLoop(
                     stream_ctx.alloc,
                     arena,
                     config,
-                    turn_id,
+                    control.coordinator.turn_id,
                     effective_tool_calls[tool_call_index + 1 ..],
                     advertised_dynamic_tool_names,
                 );
@@ -11560,7 +11287,7 @@ fn processQueuedPromptLoop(
                     );
                 };
             }
-            const execution_lifecycle_id = types.ToolLifecycleId{ .turn_id = turn_id, .call_id = execution_call.id };
+            const execution_lifecycle_id = types.ToolLifecycleId{ .turn_id = control.coordinator.turn_id, .call_id = execution_call.id };
             const execution_is_command = runtime_tool_presentation.activityKindForCall(arena, deps.tool_registry, tool_call) == .command;
             var execution_error: ?anyerror = null;
             var execution = deps.execute_tool_call(deps.ctx, .{
@@ -11569,7 +11296,7 @@ fn processQueuedPromptLoop(
                 .result_allocator = arena,
                 .call = execution_call,
                 .authority = execution_authority,
-                .credential = activeCredentialLease(active_api_key, job),
+                .credential = execution_compatibility.credentialLease(active_api_key, job),
                 .permission_mode = action_permission_mode,
                 .root_user_intent_context = tool_execution_root_user_context,
                 .root_user_messages = &.{},
@@ -11594,7 +11321,7 @@ fn processQueuedPromptLoop(
                 .lifecycle_id = execution_lifecycle_id,
             }) catch |err| blk: {
                 if (err == error.OutOfMemory) return error.OutOfMemory;
-                if (err == error.Cancelled and config.cancel_flag.load(.seq_cst)) {
+                if (err == error.Cancelled and control.coordinator.cancel_flag.load(.seq_cst)) {
                     break :blk ToolExecutionResult{
                         .status = .failure,
                         .cancelled = true,
@@ -11609,7 +11336,7 @@ fn processQueuedPromptLoop(
                 execution.result_commit.?.cancel();
             };
 
-            if (execution.cancelled and config.cancel_flag.load(.seq_cst)) {
+            if (execution.cancelled and control.coordinator.cancel_flag.load(.seq_cst)) {
                 runtime_telemetry.traceCancelObserved(step_ctx, true);
                 if (execution.result_commit) |commit| {
                     try commit.commit();
@@ -11633,7 +11360,7 @@ fn processQueuedPromptLoop(
                     deps,
                     stream_ctx.alloc,
                     call_allocator,
-                    turn_id,
+                    control.coordinator.turn_id,
                     execution_call,
                     status_started,
                     tool_display_target,
@@ -11646,7 +11373,7 @@ fn processQueuedPromptLoop(
                     stream_ctx.alloc,
                     arena,
                     config,
-                    turn_id,
+                    control.coordinator.turn_id,
                     effective_tool_calls[tool_call_index + 1 ..],
                     advertised_dynamic_tool_names,
                 );
@@ -11746,7 +11473,7 @@ fn processQueuedPromptLoop(
                     status_started,
                     file_display_path,
                     is_file_mutation,
-                    turn_id,
+                    control.coordinator.turn_id,
                     advertised_dynamic_tool_names,
                     step_ctx,
                 );
@@ -11825,7 +11552,7 @@ fn processQueuedPromptLoop(
             try runtime_tool_presentation.finishExecutedToolStatus(
                 deps,
                 call_allocator,
-                turn_id,
+                control.coordinator.turn_id,
                 execution_call,
                 status_started,
                 tool_display_target,
@@ -11902,7 +11629,7 @@ fn processQueuedPromptLoop(
                 else
                     null };
                 stop_state.terminal_materializing = true;
-                try finishCommonAssistantTerminal(
+                try runtime_finalization.finishCommonAssistantTerminal(
                     deps,
                     finalization,
                     arena,
@@ -11990,13 +11717,13 @@ fn processQueuedPromptLoop(
             &step_batch,
         );
         if (malformed_arguments_retry.finishBatch()) {
-            if (agent_steps.allowsStep(config.agent_step_limit, step + 1)) {
+            if (agent_steps.allowsStep(control.coordinator.step_limit, control.coordinator.step + 1)) {
                 const terminal_action = try observe_steering_boundary(
                     deps,
                     arena,
                     arena,
                     &within_turn_suffix,
-                    turn_id,
+                    control.coordinator.turn_id,
                     config.origin,
                     .finalizing,
                 );
@@ -12029,13 +11756,13 @@ fn processQueuedPromptLoop(
             return;
         }
         if (terminal_validation_retry.finishBatch()) {
-            if (agent_steps.allowsStep(config.agent_step_limit, step + 1)) {
+            if (agent_steps.allowsStep(control.coordinator.step_limit, control.coordinator.step + 1)) {
                 const terminal_action = try observe_steering_boundary(
                     deps,
                     arena,
                     arena,
                     &within_turn_suffix,
-                    turn_id,
+                    control.coordinator.turn_id,
                     config.origin,
                     .finalizing,
                 );
@@ -12057,7 +11784,7 @@ fn processQueuedPromptLoop(
             else
                 null };
             stop_state.terminal_materializing = true;
-            try finishCommonAssistantTerminal(
+            try runtime_finalization.finishCommonAssistantTerminal(
                 deps,
                 finalization,
                 arena,
@@ -12074,13 +11801,13 @@ fn processQueuedPromptLoop(
             return;
         }
         if (shell_execution_failure_retry.finishBatch()) {
-            if (agent_steps.allowsStep(config.agent_step_limit, step + 1)) {
+            if (agent_steps.allowsStep(control.coordinator.step_limit, control.coordinator.step + 1)) {
                 const terminal_action = try observe_steering_boundary(
                     deps,
                     arena,
                     arena,
                     &within_turn_suffix,
-                    turn_id,
+                    control.coordinator.turn_id,
                     config.origin,
                     .finalizing,
                 );
@@ -12115,26 +11842,26 @@ fn processQueuedPromptLoop(
             const final_text = try runtime_assistant_stream.normalizeAssistantTextForDisplay(arena, raw_final);
             const rendered = if (final_text.len > 0) final_text else "Done.";
 
-            if (agent_steps.allowsStep(config.agent_step_limit, step + 1) and
+            if (agent_steps.allowsStep(control.coordinator.step_limit, control.coordinator.step + 1) and
                 try append_pending_steering_after_assistant(
                     deps,
                     arena,
                     &within_turn_suffix,
-                    turn_id,
+                    control.coordinator.turn_id,
                     raw_final,
                     final_provider_replay,
                     config.origin,
-                    if (!lifecycle.view.hasStop() or stop_state.dispatched) .finalizing else .model,
+                    if (!lifecycle.view.hasStop() or !stop_state.control.needsDispatch()) .finalizing else .model,
                 ))
             {
                 try deps.push_text(deps.ctx, .{ .assistant_rendered = "\n" });
                 continue;
             }
 
-            if (agent_steps.allowsStep(config.agent_step_limit, step + 1) and
-                try continue_pending_subagent(deps, arena, &within_turn_suffix, turn_id, step_ctx.step_id, raw_final, final_provider_replay)) continue;
+            if (agent_steps.allowsStep(control.coordinator.step_limit, control.coordinator.step + 1) and
+                try continue_pending_subagent(deps, arena, &within_turn_suffix, control.coordinator.turn_id, step_ctx.step_id, raw_final, final_provider_replay)) continue;
 
-            if (!lifecycle.view.hasStop() or stop_state.dispatched) {
+            if (!lifecycle.view.hasStop() or !stop_state.control.needsDispatch()) {
                 try deps.push_text(deps.ctx, .{ .assistant_rendered = "\n" });
 
                 const history_text = try arena.dupe(u8, raw_final);
@@ -12145,7 +11872,7 @@ fn processQueuedPromptLoop(
                 );
                 stop_state.terminal_materializing =
                     stop_state.retained_candidate != null;
-                try finishCommonAssistantTerminal(
+                try runtime_finalization.finishCommonAssistantTerminal(
                     deps,
                     finalization,
                     arena,
@@ -12175,13 +11902,13 @@ fn processQueuedPromptLoop(
 
             var stop_outcome = runtime_lifecycle.dispatchStopCheckpoint(
                 lifecycle,
-                config.cancel_flag,
+                control.coordinator.cancel_flag,
                 .{
-                    .turn_id = turn_id,
-                    .step_index = current_step_index,
+                    .turn_id = control.coordinator.turn_id,
+                    .step_index = control.current_step_index,
                     .assistant_text = rendered,
                     .provider_disposition = disposition,
-                    .can_continue = agent_steps.allowsStep(config.agent_step_limit, step + 1),
+                    .can_continue = agent_steps.allowsStep(control.coordinator.step_limit, control.coordinator.step + 1),
                 },
             ) catch |err| switch (err) {
                 error.Cancelled => {
@@ -12205,11 +11932,11 @@ fn processQueuedPromptLoop(
             };
             defer stop_outcome.deinit(lifecycle.outcome_allocator);
 
-            stop_state.dispatched = true;
+            stop_state.control.markDispatched();
             switch (stop_outcome) {
                 .allow => {
                     stop_state.terminal_materializing = true;
-                    try finishCommonAssistantTerminal(
+                    try runtime_finalization.finishCommonAssistantTerminal(
                         deps,
                         finalization,
                         arena,
@@ -12242,8 +11969,8 @@ fn processQueuedPromptLoop(
 
     runtime_telemetry.traceStepLimitReached(.{
         .ctx = last_step_ctx,
-        .step_index = current_step_index,
-        .step_limit = config.agent_step_limit,
+        .step_index = control.current_step_index,
+        .step_limit = control.coordinator.step_limit,
         .gateway_message_count = last_gateway_message_count,
         .completed_tool_names = completed_tool_names.items,
         .last_tool_call_name = last_tool_call_name,
@@ -12267,7 +11994,7 @@ fn finishFailedTurnWithNotice(
     deps: *const AgentRuntimeDeps,
     finalization: *TurnFinalizationGuard,
     arena: Allocator,
-    job: QueuedPrompt,
+    job: CompatibilityExecutionJob,
     current_turn_messages: []const ChatMessage,
     summary_accumulator: *runtime_telemetry.TurnSummaryAccumulator,
     stop_state: *CommonStopState,
@@ -12284,7 +12011,7 @@ fn finishFailedTurnWithNotice(
             notice,
         );
         stop_state.terminal_materializing = true;
-        try finishCommonAssistantTerminal(
+        try runtime_finalization.finishCommonAssistantTerminal(
             deps,
             finalization,
             arena,
@@ -12317,83 +12044,6 @@ fn finishFailedTurnWithNotice(
         .summary = completed_summary,
     });
     finish_trace.finish(trace_outcome);
-}
-
-pub fn finishCommonAssistantTerminal(
-    deps: *const AgentRuntimeDeps,
-    finalization: *TurnFinalizationGuard,
-    arena: Allocator,
-    job: QueuedPrompt,
-    current_turn_messages: []const ChatMessage,
-    summary_accumulator: *runtime_telemetry.TurnSummaryAccumulator,
-    assistant_text: runtime_finalization.TerminalText,
-    outcome: types.TurnPresentationOutcome,
-    disposition: ?types.ProviderCompletionDisposition,
-    finish_trace: *PromptFinishTrace,
-    trace_outcome: []const u8,
-    assistant_response: ?ChatMessage,
-) !void {
-    const execution_memory = try runtime_execution_memory.buildExecutionMemory(
-        arena,
-        current_turn_messages,
-    );
-    const history_text = assistant_text.history;
-    const presentation_text = if (assistant_text.presentation) |text|
-        if (std.mem.eql(u8, history_text, text)) null else text
-    else
-        null;
-    const replay = if (assistant_response) |response| try @import("../execution_memory.zig").dupeUnchangedProviderReplay(
-        arena,
-        response.provider_replay,
-        response.content,
-        history_text,
-        response.tool_calls,
-        &.{},
-    ) else null;
-    try finishCommonAssistantTerminalWithExecution(
-        deps,
-        finalization,
-        job,
-        execution_memory,
-        summary_accumulator,
-        history_text,
-        outcome,
-        disposition,
-        finish_trace,
-        trace_outcome,
-        replay,
-        presentation_text,
-    );
-}
-
-fn finishCommonAssistantTerminalWithExecution(
-    deps: *const AgentRuntimeDeps,
-    finalization: *TurnFinalizationGuard,
-    job: QueuedPrompt,
-    execution_memory: types.ExecutionMemory,
-    summary_accumulator: *runtime_telemetry.TurnSummaryAccumulator,
-    assistant_text: []const u8,
-    outcome: types.TurnPresentationOutcome,
-    disposition: ?types.ProviderCompletionDisposition,
-    finish_trace: *PromptFinishTrace,
-    trace_outcome: []const u8,
-    replay: ?types.ProviderReplay,
-    presentation_text: ?[]const u8,
-) !void {
-    try runtime_finalization.finishAssistantTerminalWithExecution(
-        deps,
-        finalization,
-        job,
-        execution_memory,
-        summary_accumulator,
-        assistant_text,
-        outcome,
-        disposition,
-        finish_trace,
-        trace_outcome,
-        replay,
-        presentation_text,
-    );
 }
 
 pub fn copyLatestStopPartial(

@@ -13,7 +13,7 @@ const AgentRuntimeDeps = deps_mod.AgentRuntimeDeps;
 const ChatMessage = types.ChatMessage;
 const HistoryTurn = types.HistoryTurn;
 const LifecycleContext = lifecycle_runtime.LifecycleContext;
-const QueuedPrompt = worker_runtime.QueuedPrompt;
+const CompatibilityExecutionJob = worker_runtime.CompatibilityExecutionJob;
 const TraceContext = debug_trace.TraceContext;
 const TurnSummaryAccumulator = telemetry.TurnSummaryAccumulator;
 
@@ -167,10 +167,57 @@ pub fn stopTerminalText(
     };
 }
 
+pub fn finishCommonAssistantTerminal(
+    deps: *const AgentRuntimeDeps,
+    finalization: *TurnFinalizationGuard,
+    arena: Allocator,
+    job: CompatibilityExecutionJob,
+    current_turn_messages: []const ChatMessage,
+    summary_accumulator: *TurnSummaryAccumulator,
+    assistant_text: TerminalText,
+    outcome: types.TurnPresentationOutcome,
+    disposition: ?types.ProviderCompletionDisposition,
+    finish_trace: *PromptFinishTrace,
+    trace_outcome: []const u8,
+    assistant_response: ?ChatMessage,
+) !void {
+    const execution = try execution_memory.buildExecutionMemory(
+        arena,
+        current_turn_messages,
+    );
+    const history_text = assistant_text.history;
+    const presentation_text = if (assistant_text.presentation) |text|
+        if (std.mem.eql(u8, history_text, text)) null else text
+    else
+        null;
+    const replay = if (assistant_response) |response| try @import("../execution_memory.zig").dupeUnchangedProviderReplay(
+        arena,
+        response.provider_replay,
+        response.content,
+        history_text,
+        response.tool_calls,
+        &.{},
+    ) else null;
+    try finishAssistantTerminalWithExecution(
+        deps,
+        finalization,
+        job,
+        execution,
+        summary_accumulator,
+        history_text,
+        outcome,
+        disposition,
+        finish_trace,
+        trace_outcome,
+        replay,
+        presentation_text,
+    );
+}
+
 pub fn finishAssistantTerminalWithExecution(
     deps: *const AgentRuntimeDeps,
     finalization: *TurnFinalizationGuard,
-    job: QueuedPrompt,
+    job: CompatibilityExecutionJob,
     execution: types.ExecutionMemory,
     summary: *TurnSummaryAccumulator,
     assistant_text: []const u8,
@@ -214,7 +261,7 @@ pub fn finishExecutionOnlyFailureIfNeeded(
     deps: *const AgentRuntimeDeps,
     finalization: *TurnFinalizationGuard,
     arena: Allocator,
-    job: QueuedPrompt,
+    job: CompatibilityExecutionJob,
     current_turn_messages: []const ChatMessage,
     summary: *TurnSummaryAccumulator,
     finish_trace: *PromptFinishTrace,
@@ -249,7 +296,7 @@ pub fn finalizeRetainedCandidateFailure(
     deps: *const AgentRuntimeDeps,
     finalization: *TurnFinalizationGuard,
     arena: Allocator,
-    job: QueuedPrompt,
+    job: CompatibilityExecutionJob,
     current_turn_messages: []const ChatMessage,
     summary: *TurnSummaryAccumulator,
     finish_trace: *PromptFinishTrace,

@@ -815,12 +815,7 @@ pub const ChatRole = enum {
     tool,
 };
 
-pub const FinalToolIdentity = enum {
-    valid,
-    absent,
-    empty,
-    wrong_type,
-};
+const FinalToolIdentity = @import("../agent/final_tool_identity.zig").FinalToolIdentity;
 
 pub const ToolExecutionProvenance = enum {
     fx_local,
@@ -843,83 +838,9 @@ pub const ProviderResultIdentityFailure = enum {
     duplicate_result,
 };
 
-pub const ToolArgumentIntegrity = enum {
-    valid,
-    malformed_json,
-    non_object_json,
+const ToolArgumentIntegrity = @import("../agent/tool_argument_integrity.zig").ToolArgumentIntegrity;
 
-    pub fn classifySerialized(
-        alloc: std.mem.Allocator,
-        serialized: []const u8,
-    ) std.mem.Allocator.Error!ToolArgumentIntegrity {
-        var parsed = std.json.parseFromSlice(std.json.Value, alloc, serialized, .{}) catch |err| switch (err) {
-            error.OutOfMemory => return error.OutOfMemory,
-            else => return .malformed_json,
-        };
-        defer parsed.deinit();
-        return .valid;
-    }
-
-    pub fn classifyFunctionInput(
-        alloc: std.mem.Allocator,
-        serialized: []const u8,
-    ) std.mem.Allocator.Error!ToolArgumentIntegrity {
-        const integrity = try classifySerialized(alloc, serialized);
-        if (integrity != .valid) return integrity;
-        // A complete JSON root is nonempty; only an object can start with '{'.
-        return if (std.mem.trimStart(u8, serialized, " \t\r\n")[0] == '{') .valid else .non_object_json;
-    }
-};
-
-/// Explains why raw function arguments were `malformed_json`, captured before
-/// fx replaces them with `{}`. It carries positions only: rejected argument
-/// bytes never leave the parse step.
-pub const ToolArgumentDiagnostic = struct {
-    pub const Failure = enum {
-        /// The input ended before the JSON value was complete.
-        truncated,
-        /// The scanner rejected the input at `error_offset`.
-        syntax_error,
-        /// The syntax was complete, but the parsed value was refused, such as
-        /// an object that repeats a key.
-        rejected_value,
-    };
-
-    failure: Failure,
-    input_bytes: usize,
-    /// Byte offset where scanning stopped; null when no single byte is at fault.
-    error_offset: ?usize,
-
-    /// Diagnoses raw input that failed `ToolArgumentIntegrity` classification.
-    /// `scratch` backs only the scanner's nesting stack, released before return.
-    pub fn diagnose(scratch: std.mem.Allocator, raw: []const u8) std.mem.Allocator.Error!ToolArgumentDiagnostic {
-        var scanner = std.json.Scanner.initCompleteInput(scratch, raw);
-        defer scanner.deinit();
-        var position: std.json.Diagnostics = .{};
-        scanner.enableDiagnostics(&position);
-        while (true) {
-            const token = scanner.next() catch |err| return switch (err) {
-                error.OutOfMemory => error.OutOfMemory,
-                // Complete input cannot underrun; treat it as the same missing tail.
-                error.UnexpectedEndOfInput, error.BufferUnderrun => .{
-                    .failure = .truncated,
-                    .input_bytes = raw.len,
-                    .error_offset = raw.len,
-                },
-                error.SyntaxError => .{
-                    .failure = .syntax_error,
-                    .input_bytes = raw.len,
-                    .error_offset = @min(raw.len, std.math.cast(usize, position.getByteOffset()) orelse raw.len),
-                },
-            };
-            if (token == .end_of_document) return .{
-                .failure = .rejected_value,
-                .input_bytes = raw.len,
-                .error_offset = null,
-            };
-        }
-    }
-};
+const ToolArgumentDiagnostic = @import("../agent/tool_argument_diagnostic.zig").ToolArgumentDiagnostic;
 
 /// Identifies the server and catalog offered to one model step.
 pub const McpToolBinding = struct {
@@ -3236,104 +3157,8 @@ test "dupeToolCall drops action scoped skill bindings" {
     try std.testing.expectEqualStrings(source.arguments_json, copy.arguments_json);
 }
 
-test "function input classification distinguishes syntax from object shape" {
-    const cases = [_]struct { input: []const u8, expected: ToolArgumentIntegrity }{
-        .{ .input = "{}", .expected = .valid },
-        .{ .input = " \n{\"nested\":[1,null,{}]}\t", .expected = .valid },
-        .{ .input = "[]", .expected = .non_object_json },
-        .{ .input = "42", .expected = .non_object_json },
-        .{ .input = "null", .expected = .non_object_json },
-        .{ .input = "true", .expected = .non_object_json },
-        .{ .input = "\"text\"", .expected = .non_object_json },
-        .{ .input = "", .expected = .malformed_json },
-        .{ .input = "{} trailing", .expected = .malformed_json },
-        .{ .input = "{\"a\":1,\"a\":2}", .expected = .malformed_json },
-    };
-    for (cases) |case| {
-        try std.testing.expectEqual(case.expected, try ToolArgumentIntegrity.classifyFunctionInput(std.testing.allocator, case.input));
-        try std.testing.expectEqual(case.expected, try ToolArgumentIntegrity.classifyFunctionInput(std.testing.allocator, case.input));
-        if (case.expected == .non_object_json) {
-            try std.testing.expectEqual(ToolArgumentIntegrity.valid, try ToolArgumentIntegrity.classifySerialized(std.testing.allocator, case.input));
-        }
-    }
-    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
-    try std.testing.expectError(error.OutOfMemory, ToolArgumentIntegrity.classifyFunctionInput(failing.allocator(), "{\"path\":\"file\"}"));
-}
-
-test "ToolArgumentIntegrity accepts complete serialized JSON roots" {
-    const cases = [_][]const u8{
-        "  {\"first\":1,\"second\":1e+02} \n",
-        "[1,{\"nested\":true}]",
-        "null",
-        "true",
-        "42",
-        "\"text\"",
-    };
-
-    for (cases) |serialized| {
-        try std.testing.expectEqual(
-            ToolArgumentIntegrity.valid,
-            try ToolArgumentIntegrity.classifySerialized(std.testing.allocator, serialized),
-        );
-    }
-}
-
-test "ToolArgumentIntegrity rejects malformed trailing and duplicate-key JSON" {
-    const cases = [_][]const u8{
-        "{]",
-        "{} trailing",
-        "{\"depth\":1,\"depth\":2}",
-    };
-
-    for (cases) |serialized| {
-        try std.testing.expectEqual(
-            ToolArgumentIntegrity.malformed_json,
-            try ToolArgumentIntegrity.classifySerialized(std.testing.allocator, serialized),
-        );
-    }
-}
-
-test "ToolArgumentIntegrity preserves parser allocation failure" {
-    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
-    try std.testing.expectError(
-        error.OutOfMemory,
-        ToolArgumentIntegrity.classifySerialized(failing.allocator(), "{\"path\":\"src/main.zig\"}"),
-    );
-}
-
-test "tool argument diagnostic locates truncated, syntax, and rejected input" {
-    const alloc = std.testing.allocator;
-    const cut = "{\"request\":{\"action\":\"run\",\"task\":\"Investigate the \\\"slow exit\\\" path and report";
-    try std.testing.expectEqual(
-        ToolArgumentDiagnostic{ .failure = .truncated, .input_bytes = cut.len, .error_offset = cut.len },
-        try ToolArgumentDiagnostic.diagnose(alloc, cut),
-    );
-
-    const unescaped = "{\"task\":\"say \"hi\" now\"}";
-    try std.testing.expectEqual(
-        ToolArgumentDiagnostic{ .failure = .syntax_error, .input_bytes = unescaped.len, .error_offset = std.mem.find(u8, unescaped, "hi").? },
-        try ToolArgumentDiagnostic.diagnose(alloc, unescaped),
-    );
-
-    const trailing = "{\"path\":\"a\",}";
-    try std.testing.expectEqual(
-        ToolArgumentDiagnostic{ .failure = .syntax_error, .input_bytes = trailing.len, .error_offset = trailing.len - 1 },
-        try ToolArgumentDiagnostic.diagnose(alloc, trailing),
-    );
-
-    const repeated = "{\"path\":\"a\",\"path\":\"b\"}";
-    try std.testing.expectEqual(
-        ToolArgumentDiagnostic{ .failure = .rejected_value, .input_bytes = repeated.len, .error_offset = null },
-        try ToolArgumentDiagnostic.diagnose(alloc, repeated),
-    );
-
-    try std.testing.expectEqual(
-        ToolArgumentDiagnostic{ .failure = .truncated, .input_bytes = 0, .error_offset = 0 },
-        try ToolArgumentDiagnostic.diagnose(alloc, ""),
-    );
-
-    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
-    try std.testing.expectError(error.OutOfMemory, ToolArgumentDiagnostic.diagnose(failing.allocator(), "[" ** 4096));
+test "ToolCall uses the canonical argument diagnostic" {
+    try std.testing.expect(@FieldType(ToolCall, "argument_diagnostic") == ?@import("../agent/tool_argument_diagnostic.zig").ToolArgumentDiagnostic);
 }
 
 test "dupeToolCall keeps the argument diagnostic" {
@@ -3348,29 +3173,6 @@ test "dupeToolCall keeps the argument diagnostic" {
     const copy = try dupeToolCall(std.testing.allocator, source);
     defer freeToolCall(std.testing.allocator, copy);
     try std.testing.expectEqual(diagnostic, copy.argument_diagnostic.?);
-}
-
-fn fuzzToolArgumentDiagnostic(_: void, smith: *std.testing.Smith) anyerror!void {
-    var input_buffer: [1024]u8 = undefined;
-    const input_len: usize = @intCast(smith.slice(&input_buffer));
-    const input = input_buffer[0..input_len];
-    if (try ToolArgumentIntegrity.classifyFunctionInput(std.testing.allocator, input) != .malformed_json) return;
-    const diagnostic = try ToolArgumentDiagnostic.diagnose(std.testing.allocator, input);
-    try std.testing.expectEqual(input.len, diagnostic.input_bytes);
-    if (diagnostic.error_offset) |offset| try std.testing.expect(offset <= input.len);
-    try std.testing.expectEqual(diagnostic.failure == .rejected_value, diagnostic.error_offset == null);
-}
-
-test "fuzz tool argument diagnostic" {
-    try std.testing.fuzz({}, fuzzToolArgumentDiagnostic, .{
-        .corpus = &.{
-            "{\"request\":{\"task\":\"cut",
-            "{\"a\":1,}",
-            "{\"a\":1,\"a\":2}",
-            "{\"t\":\"\xc3\xa9\xe2\x82",
-            "\xff\x00{",
-        },
-    });
 }
 
 pub fn freeUserTurn(alloc: std.mem.Allocator, user: UserTurn) void {
@@ -3891,4 +3693,14 @@ test "public types remain constructible" {
     _ = decision;
     _ = action;
     _ = resolve_mode;
+}
+
+test "ToolCall integrity field uses the canonical neutral type" {
+    const call: ToolCall = .{ .id = "call", .name = "tool", .arguments_json = "{}" };
+    try std.testing.expect(@TypeOf(call.argument_integrity) == @import("../agent/tool_argument_integrity.zig").ToolArgumentIntegrity);
+    try std.testing.expect(call.argument_integrity == .valid);
+}
+
+test "ToolCall uses the canonical final tool identity" {
+    try std.testing.expect(@FieldType(ToolCall, "final_identity") == @import("../agent/final_tool_identity.zig").FinalToolIdentity);
 }

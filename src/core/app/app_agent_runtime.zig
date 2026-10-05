@@ -962,7 +962,7 @@ pub fn Runtime(comptime App: type) type {
 
         pub fn processQueuedPrompt(
             app: *App,
-            queued_job: worker_runtime.QueuedPrompt,
+            queued_job: worker_runtime.CompatibilityExecutionJob,
             gateway_retry_count: usize,
             gateway_chat_url: []const u8,
             failure_provenance: ?*?compaction_activity.ErrorProvenance,
@@ -1237,7 +1237,7 @@ pub fn Runtime(comptime App: type) type {
 
         fn buildQueuedPromptConfig(
             app: *App,
-            job: worker_runtime.QueuedPrompt,
+            job: worker_runtime.CompatibilityExecutionJob,
             catalog: skill_invocation.Catalog,
             bindings: []const skill_invocation.ExplicitBinding,
             gateway_retry_count: usize,
@@ -1260,9 +1260,9 @@ pub fn Runtime(comptime App: type) type {
                 .advertised_tool_names = tool_projection.advertised_names,
                 .advertised_functions = tool_projection.advertised_functions,
                 .provider_capabilities = if (comptime @hasDecl(App, "providerSet"))
-                    app.providerSet().select(job.provider).capabilities
+                    app.providerSet().select(job.provider).agentFeatures()
                 else if (job.provider == .gateway)
-                    .{ .fx_search = true, .vision_fallback = true }
+                    .{ .native_search = true, .vision_fallback = true }
                 else
                     .{},
                 .custom_tool_guidance = tool_projection.custom_guidance,
@@ -2631,7 +2631,7 @@ test "app agent runtime shows MCP availability changes to the model" {
     try std.testing.expect(std.mem.find(u8, messages.items[2].content.?, "linear: authentication_required -> ready (74 tools)") != null);
 }
 
-fn makeQueuedPrompt(alloc: Allocator) !worker_runtime.QueuedPrompt {
+fn makeQueuedPrompt(alloc: Allocator) !worker_runtime.CompatibilityExecutionJob {
     return .{
         .prompt = try alloc.dupe(u8, "draft an issue"),
         .images = &.{},
@@ -2641,6 +2641,10 @@ fn makeQueuedPrompt(alloc: Allocator) !worker_runtime.QueuedPrompt {
         .history = try alloc.alloc(types.HistoryTurn, 0),
         .grants = try alloc.alloc(types.PermissionGrant, 0),
     };
+}
+
+fn captureQueuedPrompt(alloc: Allocator) !worker_runtime.CapturedSubmission {
+    return .{ .work = .{ .prompt = try alloc.dupe(u8, "draft an issue") }, .snapshot = .{ .images = &.{}, .model = try alloc.dupe(u8, "test-model"), .api_key = try alloc.dupe(u8, "api-key"), .permission_mode = .auto, .history = try alloc.alloc(types.HistoryTurn, 0), .grants = try alloc.alloc(types.PermissionGrant, 0) } };
 }
 
 test "queued fresh prompt closes only a still-paused turn before provider execution" {
@@ -2653,7 +2657,7 @@ test "queued fresh prompt closes only a still-paused turn before provider execut
         failure: ?anyerror = null,
         cancel_after_prepare: bool = false,
 
-        fn run(self: *@This(), job: worker_runtime.QueuedPrompt) void {
+        fn run(self: *@This(), job: worker_runtime.CompatibilityExecutionJob) void {
             Runtime(FakeApp).processQueuedPrompt(self.app, job, 1, test_gateway_chat_url, null) catch |err| {
                 self.failure = err;
             };
@@ -2721,13 +2725,16 @@ test "queued fresh prompt closes only a still-paused turn before provider execut
         try app_session_runtime.Runtime(FakeApp).setRecoveryCheckpoint(&app, checkpoint);
         app.worker.worker_processing = true;
         app.worker.active_turn_id = 41;
-        var queued = try makeQueuedPrompt(queue_alloc);
-        queue_alloc.free(queued.prompt);
-        queued.prompt = try queue_alloc.dupe(u8, "same prompt");
-        types.freeHistoryTurnSlice(queue_alloc, queued.history);
-        queued.history = try app.session.snapshotHistory(queue_alloc);
-        try app.worker.admitInteractivePrompt(queue_alloc, queued);
-        try app.worker.enqueuePrompt(queue_alloc, try makeQueuedPrompt(queue_alloc));
+        var queued = try captureQueuedPrompt(queue_alloc);
+        queue_alloc.free(queued.work.prompt);
+        queued.work.prompt = try queue_alloc.dupe(u8, "same prompt");
+        types.freeHistoryTurnSlice(queue_alloc, queued.snapshot.history);
+        queued.snapshot.history = try app.session.snapshotHistory(queue_alloc);
+        try app.worker.admitInteractivePrompt(queue_alloc, queued.work, queued.snapshot);
+        try (submission: {
+            const captured: worker_runtime.CapturedSubmission = try captureQueuedPrompt(queue_alloc);
+            break :submission app.worker.enqueuePrompt(queue_alloc, captured.work, captured.snapshot);
+        });
         const previous_finished = types.FinishedPrompt{ .turn = .{ .assistant = .{
             .user = .{ .text = @constCast("same prompt") },
             .assistant = @constCast("old completed answer"),
@@ -2738,7 +2745,7 @@ test "queued fresh prompt closes only a still-paused turn before provider execut
         }
         app.worker.finishProcessing();
         const job = (try app.worker.tryTakeNextPrompt(queue_alloc)).?;
-        defer worker_runtime.freeQueuedPrompt(queue_alloc, job);
+        defer worker_runtime.freeCompatibilityExecutionJob(queue_alloc, job);
         try std.testing.expect(job.delivery.isContinuation());
         try std.testing.expect(job.recovery_checkpoint == null);
         var probe: Probe = .{ .app = &app, .cancel_after_prepare = outcome == .cancel_after_prepare };
@@ -2970,7 +2977,7 @@ test "app agent runtime processes a cancelled queued prompt" {
     app.worker.worker_cancel_requested.store(true, .seq_cst);
 
     const job = try makeQueuedPrompt(alloc);
-    defer worker_runtime.freeQueuedPrompt(alloc, job);
+    defer worker_runtime.freeCompatibilityExecutionJob(alloc, job);
 
     try Runtime(FakeApp).processQueuedPrompt(&app, job, 1, test_gateway_chat_url, null);
 
@@ -3017,7 +3024,7 @@ test "app direct ask delivers semantic presentation through the runtime sink" {
     var app = try FakeApp.init(alloc);
     defer app.deinit();
     const job = try makeQueuedPrompt(alloc);
-    defer worker_runtime.freeQueuedPrompt(alloc, job);
+    defer worker_runtime.freeCompatibilityExecutionJob(alloc, job);
 
     app.agent_stream_provider = testAgentStreamProvider(Gateway.stream);
 
@@ -3082,7 +3089,7 @@ test "app agent runtime clears active turn settings when queued prompt setup fai
     app.snapshot_tools_error = error.TestExpectedEqual;
 
     var job = try makeQueuedPrompt(alloc);
-    defer worker_runtime.freeQueuedPrompt(alloc, job);
+    defer worker_runtime.freeCompatibilityExecutionJob(alloc, job);
     job.agent_settings = .{
         .fast_mode = true,
         .effort = types.ReasoningEffort.literal("high"),
@@ -3293,7 +3300,7 @@ test "app agent runtime settles queued snapshot ownership when prompt admission 
         }
 
         var job = try makeQueuedPrompt(alloc);
-        defer worker_runtime.freeQueuedPrompt(alloc, job);
+        defer worker_runtime.freeCompatibilityExecutionJob(alloc, job);
         job.images = try types.dupeImageAttachmentSlice(alloc, &.{.{
             .id = 1,
             .path = @constCast("/tmp/source.png"),
@@ -3349,7 +3356,7 @@ test "app agent runtime discards every snapshot in a failed multi-image prefligh
     defer app.deinit();
     app.snapshot_tools_error = error.TestExpectedEqual;
     var job = try makeQueuedPrompt(alloc);
-    defer worker_runtime.freeQueuedPrompt(alloc, job);
+    defer worker_runtime.freeCompatibilityExecutionJob(alloc, job);
     job.images = try types.dupeImageAttachmentSlice(alloc, &.{
         .{
             .id = 1,
@@ -3396,7 +3403,7 @@ test "app agent runtime queued prompt config uses captured job settings over sta
     };
 
     var job = try makeQueuedPrompt(alloc);
-    defer worker_runtime.freeQueuedPrompt(alloc, job);
+    defer worker_runtime.freeCompatibilityExecutionJob(alloc, job);
     job.agent_settings = .{
         .max_tool_result_bytes = 8192,
         .first_call_tool_choice = .none,

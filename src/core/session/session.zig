@@ -1,3 +1,4 @@
+const ToolArgumentIntegrity = @import("../agent/tool_argument_integrity.zig").ToolArgumentIntegrity;
 const std = @import("std");
 const kernel_agent = @import("../agent/runtime/agent.zig");
 const core_types = @import("../shared/types.zig");
@@ -1553,7 +1554,7 @@ fn tracePersistedToolArgumentsRepair(
     call: ToolCall,
     source: PersistedToolArgumentsSource,
     paired_result: bool,
-    integrity: core_types.ToolArgumentIntegrity,
+    integrity: ToolArgumentIntegrity,
 ) void {
     debug_trace.eventf(
         "session",
@@ -2011,7 +2012,7 @@ pub const SessionRuntime = struct {
             self.unversioned_history_len = 0;
         }
         self.agent.history.appendAssumeCapacity(turn);
-        self.agent.fresh = false;
+        self.agent.turn.fresh = false;
         if (turn == .compacted_summary and isCurrentCompactionCheckpoint(turn)) {
             self.unversioned_history_len = 0;
         }
@@ -2023,7 +2024,7 @@ pub const SessionRuntime = struct {
         self.agent.clearHistory(alloc);
         self.agent.history.deinit(alloc);
         self.agent.history = std.ArrayList(HistoryTurn).fromOwnedSlice(history);
-        self.agent.fresh = false;
+        self.agent.turn.fresh = false;
         self.unversioned_history_len = if (uncertain) history.len else 0;
     }
 

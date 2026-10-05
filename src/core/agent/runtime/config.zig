@@ -8,7 +8,7 @@ const context_limits = @import("../../config/context_limits.zig");
 const compactor = @import("../../compactor/compactor.zig");
 const workspace_access = @import("../../workspace/workspace_access.zig");
 const model_response_recovery = @import("model_response_recovery.zig");
-const provider_set = @import("../../gateway/provider_set.zig");
+const model_provider = @import("../model_provider.zig");
 const model_tool_schema = @import("../../tooling/model_tool_schema.zig");
 const stream_provider = @import("../stream_provider.zig");
 
@@ -36,9 +36,9 @@ pub const Config = struct {
     advertised_tool_names: []const []const u8 = &.{},
     advertised_functions: []const model_tool_schema.FunctionSchema = &.{},
     initial_dynamic_tools: []const stream_provider.DynamicFunctionTool = &.{},
-    provider_capabilities: provider_set.Bundle.Capabilities = .{
-        .gateway_prompt_caching = true,
-        .fx_search = true,
+    provider_capabilities: model_provider.ModelFeatures = .{
+        .prompt_caching = true,
+        .native_search = true,
         .vision_fallback = true,
     },
     custom_tool_guidance: []const u8 = "",

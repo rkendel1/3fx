@@ -155,7 +155,7 @@ const ReasoningEffort = types.ReasoningEffort;
 const ToolPermissionDecision = types.ToolPermissionDecision;
 const PermissionGrant = types.PermissionGrant;
 const PermissionEngine = permissions.PermissionEngine;
-const QueuedPrompt = worker_runtime.QueuedPrompt;
+const CompatibilityExecutionJob = worker_runtime.CompatibilityExecutionJob;
 const WorkItem = worker_runtime.WorkItem;
 const WorkerRuntime = worker_runtime.WorkerRuntime;
 const SessionRuntime = session_runtime.SessionRuntime;
@@ -1417,8 +1417,8 @@ const App = struct {
             0,
             false,
         );
-        errdefer worker_runtime.freeQueuedPrompt(std.heap.c_allocator, queued);
-        try self.worker.admitInteractivePrompt(std.heap.c_allocator, queued);
+        errdefer worker_runtime.freeCapturedSubmission(std.heap.c_allocator, queued);
+        try self.worker.admitInteractivePrompt(std.heap.c_allocator, queued.work, queued.snapshot);
         HerdrAppRuntime.reportWorking(self);
         return true;
     }
@@ -1460,8 +1460,8 @@ const App = struct {
             turn_id,
             user_prompt_already_presented,
         );
-        errdefer worker_runtime.freeQueuedPrompt(std.heap.c_allocator, queued);
-        try self.worker.enqueuePrompt(std.heap.c_allocator, queued);
+        errdefer worker_runtime.freeCapturedSubmission(std.heap.c_allocator, queued);
+        try self.worker.enqueuePrompt(std.heap.c_allocator, queued.work, queued.snapshot);
         HerdrAppRuntime.reportWorking(self);
         return true;
     }
@@ -1475,7 +1475,7 @@ const App = struct {
         prompt_images: ?[]const types.ImageAttachment,
         turn_id: u64,
         user_prompt_already_presented: bool,
-    ) !worker_runtime.QueuedPrompt {
+    ) !worker_runtime.CapturedSubmission {
         if (recovery_checkpoint == null) {
             SessionAppRuntime.maybeStartSessionTitleGeneration(self, prompt);
         }
@@ -1558,29 +1558,7 @@ const App = struct {
         const skill_display_spans = try dupeSkillDisplaySpansFromTokens(std.heap.c_allocator, skill_tokens);
         errdefer worker_runtime.freeSkillDisplaySpans(std.heap.c_allocator, skill_display_spans);
 
-        return .{
-            .turn_id = if (recovery_checkpoint) |checkpoint| checkpoint.turn_id else turn_id,
-            .prompt = prompt_copy,
-            .images = images_copy,
-            .authorized_image_catalog = authorized_image_catalog,
-            .model = model_copy,
-            .provider = self.provider_selection.selection().provider,
-            .api_key = api_key_copy,
-            .gateway_team = gateway_team_copy,
-            .credential_source = gateway_credential.source,
-            .account_id = account_id_copy,
-            .permission_mode = self.permission_engine.mode,
-            .history = history_copy,
-            .unversioned_history_count = self.session.unversionedHistoryEnd(),
-            .root_user_intent_context = root_user_intent_context,
-            .grants = grants_copy,
-            .skill_bindings = skill_bindings,
-            .skill_display_spans = skill_display_spans,
-            .context_snapshot = context_snapshot_copy,
-            .recovery_checkpoint = recovery_checkpoint_copy,
-            .recovery_source_already_presented = recovery_checkpoint != null,
-            .user_prompt_already_presented = user_prompt_already_presented,
-        };
+        return .{ .work = .{ .turn_id = if (recovery_checkpoint) |checkpoint| checkpoint.turn_id else turn_id, .prompt = prompt_copy }, .snapshot = .{ .images = images_copy, .authorized_image_catalog = authorized_image_catalog, .model = model_copy, .provider = self.provider_selection.selection().provider, .api_key = api_key_copy, .gateway_team = gateway_team_copy, .credential_source = gateway_credential.source, .account_id = account_id_copy, .permission_mode = self.permission_engine.mode, .history = history_copy, .unversioned_history_count = self.session.unversionedHistoryEnd(), .root_user_intent_context = root_user_intent_context, .grants = grants_copy, .skill_bindings = skill_bindings, .skill_display_spans = skill_display_spans, .context_snapshot = context_snapshot_copy, .recovery_checkpoint = recovery_checkpoint_copy, .recovery_source_already_presented = recovery_checkpoint != null, .user_prompt_already_presented = user_prompt_already_presented } };
     }
 
     pub fn request_context_compaction(self: *App) !void {
@@ -4812,6 +4790,7 @@ test {
     _ = @import("core/output/diff.zig");
     _ = @import("core/shared/display_width.zig");
     _ = @import("core/cli/doctor_runtime.zig");
+    _ = @import("gateway/openai_compatible_model_provider.zig");
     _ = @import("core/auth/login_flow.zig");
     _ = @import("core/auth/chatgpt_oauth.zig");
     _ = @import("core/auth/provider_catalog.zig");

@@ -16,12 +16,19 @@ const ToolCall = types.ToolCall;
 const TraceContext = debug_trace.TraceContext;
 const AgentRuntimeDeps = runtime_deps.AgentRuntimeDeps;
 const TurnFinalizationGuard = runtime_finalization.TurnFinalizationGuard;
-const QueuedPrompt = worker_runtime.QueuedPrompt;
+const CompatibilityExecutionJob = worker_runtime.CompatibilityExecutionJob;
+
+pub fn clearRecoveryCheckpointOnUserCancel(deps: *const AgentRuntimeDeps) void {
+    const effect = deps.recovery_checkpoint orelse return;
+    effect.clear(deps.ctx) catch |err| {
+        debug_trace.logf("agent", "recovery checkpoint clear on cancel failed err={s}", .{@errorName(err)});
+    };
+}
 
 pub fn persistInterruptedTurnOnce(
     hooks: *const AgentRuntimeDeps,
     finalization: *TurnFinalizationGuard,
-    job: QueuedPrompt,
+    job: CompatibilityExecutionJob,
     partial_assistant: ?[]const u8,
     active_tool_call: ?ToolCall,
     completed_tool_names: [][]u8,
@@ -51,7 +58,7 @@ pub fn persistInterruptedTurnOnce(
 pub fn persistCompactionInterruptedTurnOnce(
     hooks: *const AgentRuntimeDeps,
     finalization: *TurnFinalizationGuard,
-    job: QueuedPrompt,
+    job: CompatibilityExecutionJob,
     completed_tool_names: [][]u8,
     persisted: *bool,
     trace_ctx: TraceContext,
@@ -79,7 +86,7 @@ pub fn persistCompactionInterruptedTurnOnce(
 pub fn persistInterruptedCommandTurnOnce(
     hooks: *const AgentRuntimeDeps,
     finalization: *TurnFinalizationGuard,
-    job: QueuedPrompt,
+    job: CompatibilityExecutionJob,
     partial_assistant: ?[]const u8,
     active_tool_call: ToolCall,
     completed_tool_names: [][]u8,
@@ -110,7 +117,7 @@ pub fn persistInterruptedCommandTurnOnce(
 fn persistInterruptedTurnWithPresentation(
     hooks: *const AgentRuntimeDeps,
     finalization: *TurnFinalizationGuard,
-    job: QueuedPrompt,
+    job: CompatibilityExecutionJob,
     partial_assistant: ?[]const u8,
     active_tool_call: ?ToolCall,
     completed_tool_names: [][]u8,
@@ -226,7 +233,7 @@ fn persistInterruptedTurnWithPresentation(
 pub fn persistFailedPartialTurnOnce(
     hooks: *const AgentRuntimeDeps,
     finalization: *TurnFinalizationGuard,
-    job: QueuedPrompt,
+    job: CompatibilityExecutionJob,
     partial_assistant: []const u8,
     persisted: *bool,
     trace_ctx: TraceContext,
@@ -285,7 +292,7 @@ pub fn persistFailedPartialTurnOnce(
 }
 
 fn traceInterruptedPersistence(
-    job: QueuedPrompt,
+    job: CompatibilityExecutionJob,
     partial_assistant: ?[]const u8,
     active_tool_call: ?ToolCall,
     completed_tool_names: [][]u8,
@@ -356,4 +363,36 @@ fn interruptPersistenceReason(partial_assistant: ?[]const u8, active_tool_call: 
         if (text.len > 0) return "partial_assistant_only";
     }
     return "no_assistant_output";
+}
+
+test "user cancellation checkpoint cleanup is optional and best effort" {
+    const support = @import("tests/support.zig");
+    const Probe = struct {
+        clears: usize = 0,
+        fail: bool = false,
+
+        fn set(_: *anyopaque, _: @import("../../session/session_codec.zig").RecoveryCheckpoint) !void {
+            return error.UnexpectedCheckpointSet;
+        }
+
+        fn clear(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.clears += 1;
+            if (self.fail) return error.CheckpointClearFailed;
+        }
+    };
+    var fake = support.FakeAgentRuntimeDeps.init(std.testing.allocator);
+    defer fake.deinit();
+    var deps = fake.deps();
+    var probe: Probe = .{};
+    deps.ctx = &probe;
+    deps.recovery_checkpoint = null;
+    clearRecoveryCheckpointOnUserCancel(&deps);
+    try std.testing.expectEqual(@as(usize, 0), probe.clears);
+    deps.recovery_checkpoint = .{ .set = Probe.set, .clear = Probe.clear };
+    clearRecoveryCheckpointOnUserCancel(&deps);
+    try std.testing.expectEqual(@as(usize, 1), probe.clears);
+    probe.fail = true;
+    clearRecoveryCheckpointOnUserCancel(&deps);
+    try std.testing.expectEqual(@as(usize, 2), probe.clears);
 }
