@@ -2643,6 +2643,10 @@ fn makeQueuedPrompt(alloc: Allocator) !worker_runtime.CompatibilityExecutionJob 
     };
 }
 
+fn captureQueuedPrompt(alloc: Allocator) !worker_runtime.CapturedSubmission {
+    return .{ .work = .{ .prompt = try alloc.dupe(u8, "draft an issue") }, .snapshot = .{ .images = &.{}, .model = try alloc.dupe(u8, "test-model"), .api_key = try alloc.dupe(u8, "api-key"), .permission_mode = .auto, .history = try alloc.alloc(types.HistoryTurn, 0), .grants = try alloc.alloc(types.PermissionGrant, 0) } };
+}
+
 test "queued fresh prompt closes only a still-paused turn before provider execution" {
     const session_codec = @import("../session/session_codec.zig");
     const session_store = @import("../session/session_store.zig");
@@ -2721,13 +2725,16 @@ test "queued fresh prompt closes only a still-paused turn before provider execut
         try app_session_runtime.Runtime(FakeApp).setRecoveryCheckpoint(&app, checkpoint);
         app.worker.worker_processing = true;
         app.worker.active_turn_id = 41;
-        var queued = try makeQueuedPrompt(queue_alloc);
-        queue_alloc.free(queued.prompt);
-        queued.prompt = try queue_alloc.dupe(u8, "same prompt");
-        types.freeHistoryTurnSlice(queue_alloc, queued.history);
-        queued.history = try app.session.snapshotHistory(queue_alloc);
-        try app.worker.admitInteractivePrompt(queue_alloc, queued);
-        try app.worker.enqueuePrompt(queue_alloc, try makeQueuedPrompt(queue_alloc));
+        var queued = try captureQueuedPrompt(queue_alloc);
+        queue_alloc.free(queued.work.prompt);
+        queued.work.prompt = try queue_alloc.dupe(u8, "same prompt");
+        types.freeHistoryTurnSlice(queue_alloc, queued.snapshot.history);
+        queued.snapshot.history = try app.session.snapshotHistory(queue_alloc);
+        try app.worker.admitInteractivePrompt(queue_alloc, queued.work, queued.snapshot);
+        try (submission: {
+            const captured: worker_runtime.CapturedSubmission = try captureQueuedPrompt(queue_alloc);
+            break :submission app.worker.enqueuePrompt(queue_alloc, captured.work, captured.snapshot);
+        });
         const previous_finished = types.FinishedPrompt{ .turn = .{ .assistant = .{
             .user = .{ .text = @constCast("same prompt") },
             .assistant = @constCast("old completed answer"),

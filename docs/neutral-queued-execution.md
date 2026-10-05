@@ -28,7 +28,7 @@ The worker runtime owns `execution_snapshots`, a typed map from `ExecutionSnapsh
 - `snapshot_file_ownerships`.
 - `recovery_checkpoint`, `recovery_source_already_presented`, `user_prompt_already_presented`.
 
-`CompatibilityExecutionJob` (formerly `QueuedPrompt`) remains a compatibility ingress/execution shape, not a queue item. Existing producers capture the same values as before. Enqueue separates that job into neutral work and a typed execution snapshot without copying or rereading current configuration.
+`CompatibilityExecutionJob` (formerly `QueuedPrompt`) is now exclusively a resolved execution shape, not ingress or a queue item. Existing producers capture neutral `Submission` and a typed `ExecutionSnapshot` separately; admission stores those without copying or rereading current configuration. See [Neutral submission](neutral-submission.md).
 
 The history policy is unchanged: the worker's existing shared `queued_history` holds canonical queued history, while stored snapshots have an empty history slice. Dequeue supplies the existing updated history snapshot to the compatibility job.
 
@@ -67,4 +67,4 @@ Discard paths use `releaseQueuedTurn` and resource cleanup directly, so no compa
 
 The guard reports three additional per-file concepts because the explicit conversion module references the existing account, credential-source, and team fields. It does not introduce new identity state. Neither the guard nor the neutral queue dependency closure changed.
 
-Legacy host submission APIs still accept the same flat shape, now called `CompatibilityExecutionJob`, before immediately splitting it into queued work and a snapshot. This keeps allocation/error ownership unchanged but does not satisfy the stricter requirement that the type itself appear exclusively after dequeue. Separating host submission from resolved execution remains future work; this PR does not claim that stricter acceptance gate is met.
+Legacy host submission APIs now accept neutral work plus a separate typed snapshot. `CapturedSubmission` is a host capture result, not an alias or replacement execution job. Synchronous CLI, ACP, and child-agent entry points also pass through admission/dequeue before the compatibility resolver. See [Neutral submission](neutral-submission.md) for ownership and the remaining whole-agent boundary.

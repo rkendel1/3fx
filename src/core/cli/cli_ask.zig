@@ -2060,9 +2060,7 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
     else
         debug_trace.nextTurnId();
 
-    const job: worker_runtime.CompatibilityExecutionJob = .{
-        .turn_id = ctx.active_turn_id,
-        .prompt = owned_prompt,
+    const job: worker_runtime.CompatibilityExecutionJob = try worker_runtime.admitSynchronousSubmission(alloc, .{ .turn_id = ctx.active_turn_id, .prompt = owned_prompt }, .{
         .images = current_images,
         .authorized_image_catalog = authorized_image_catalog,
         .model = @constCast(ctx.model),
@@ -2080,7 +2078,7 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
         // immutable snapshot allocations alive for the whole call.
         .context_snapshot = ctx.context_snapshot,
         .recovery_checkpoint = recovery_checkpoint,
-    };
+    });
 
     const deps = agentRuntimeDeps(&ctx);
     const semantic_presentation = if (ctx.presenter) |value| value.semanticSink() else null;

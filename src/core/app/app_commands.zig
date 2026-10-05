@@ -3602,14 +3602,9 @@ test "workspace mutation admission rejects queue-zero processing gap" {
     }{};
     defer app.worker.deinit(alloc);
 
-    try app.worker.enqueuePrompt(alloc, .{
-        .prompt = try alloc.dupe(u8, "active turn"),
-        .images = &.{},
-        .model = try alloc.dupe(u8, "test-model"),
-        .api_key = try alloc.dupe(u8, "test-key"),
-        .permission_mode = .auto,
-        .history = try alloc.alloc(types.HistoryTurn, 0),
-        .grants = try alloc.alloc(types.PermissionGrant, 0),
+    try (submission: {
+        const captured: worker_runtime.CapturedSubmission = .{ .work = .{ .prompt = try alloc.dupe(u8, "active turn") }, .snapshot = .{ .images = &.{}, .model = try alloc.dupe(u8, "test-model"), .api_key = try alloc.dupe(u8, "test-key"), .permission_mode = .auto, .history = try alloc.alloc(types.HistoryTurn, 0), .grants = try alloc.alloc(types.PermissionGrant, 0) } };
+        break :submission app.worker.enqueuePrompt(alloc, captured.work, captured.snapshot);
     });
     const active = (try app.worker.waitAndTakeNextPrompt(alloc)).?;
     defer worker_runtime.freeCompatibilityExecutionJob(alloc, active);
@@ -3648,14 +3643,9 @@ test "workspace list refresh waits for an idle turn" {
     try std.testing.expectEqual(@as(usize, 0), app.index_refresh_count);
 
     app.stream.active = false;
-    try app.worker.enqueuePrompt(alloc, .{
-        .prompt = try alloc.dupe(u8, "active turn"),
-        .images = &.{},
-        .model = try alloc.dupe(u8, "test-model"),
-        .api_key = try alloc.dupe(u8, "test-key"),
-        .permission_mode = .auto,
-        .history = try alloc.alloc(types.HistoryTurn, 0),
-        .grants = try alloc.alloc(types.PermissionGrant, 0),
+    try (submission: {
+        const captured: worker_runtime.CapturedSubmission = .{ .work = .{ .prompt = try alloc.dupe(u8, "active turn") }, .snapshot = .{ .images = &.{}, .model = try alloc.dupe(u8, "test-model"), .api_key = try alloc.dupe(u8, "test-key"), .permission_mode = .auto, .history = try alloc.alloc(types.HistoryTurn, 0), .grants = try alloc.alloc(types.PermissionGrant, 0) } };
+        break :submission app.worker.enqueuePrompt(alloc, captured.work, captured.snapshot);
     });
     const queued = (try app.worker.waitAndTakeNextPrompt(alloc)).?;
     defer worker_runtime.freeCompatibilityExecutionJob(alloc, queued);

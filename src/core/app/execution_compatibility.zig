@@ -1,10 +1,10 @@
 const worker = @import("../agent/worker_runtime.zig");
-const queue = @import("../agent/queued_turn.zig");
+const submission = @import("../agent/submission.zig");
 
 /// Transfers the captured host snapshot into the legacy execution shape.
 /// No allocations, current-configuration reads, refreshes, or ownership copies.
 /// Only the worker's execution handoff calls this conversion.
-pub fn resolve(queued: queue.QueuedTurn, snapshot: worker.ExecutionSnapshot) worker.CompatibilityExecutionJob {
+pub fn resolve(queued: submission.Submission, snapshot: worker.ExecutionSnapshot) worker.CompatibilityExecutionJob {
     return .{
         .turn_id = queued.turn_id,
         .prompt = queued.prompt,
