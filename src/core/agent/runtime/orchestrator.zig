@@ -5304,7 +5304,8 @@ fn processQueuedPromptInner(
         io_mod.milliTimestamp(),
         if (config.origin == .root) job.prompt else "",
     );
-    const turn_id = job.turn_id;
+    var coordinator = execution_compatibility.coordinator(job, &agent.turn, config.cancel_flag, config.agent_step_limit);
+    const turn_id = coordinator.turn_id;
     var finish_trace = PromptFinishTrace{ .ctx = .{ .turn_id = turn_id, .subagent_id = config.subagent_id } };
     errdefer {
         if (config.cancel_flag.load(.seq_cst)) {
@@ -5516,7 +5517,7 @@ fn processQueuedPromptInner(
         "history_turns={d} gateway_messages_before={d} interrupted_turns={d} history_turn_kinds={s}",
         .{ active_history.len, history_messages_before, interrupted_turns, history_turn_kinds },
     );
-    if (job.delivery.isContinuation()) {
+    if (coordinator.delivery.isContinuation()) {
         try session_runtime.appendSteeringActiveContextHistoryChatMessages(
             arena,
             &history_messages,
@@ -5546,7 +5547,7 @@ fn processQueuedPromptInner(
 
     const current_user_message: ChatMessage = .{
         .role = .user,
-        .content = if (job.delivery.isContinuation())
+        .content = if (coordinator.delivery.isContinuation())
             try runtime_execution_memory.steeringMessage(arena, job.prompt)
         else
             job.prompt,
@@ -5567,7 +5568,7 @@ fn processQueuedPromptInner(
         base_nested_read_tool_result_advertised,
         finalization,
         arena,
-        turn_id,
+        &coordinator,
         &stable_prefix,
         &history_messages,
         &within_turn_suffix,
@@ -6468,7 +6469,7 @@ fn processQueuedPromptLoop(
     base_nested_read_tool_result_advertised: bool,
     finalization: *TurnFinalizationGuard,
     arena: Allocator,
-    turn_id: u64,
+    coordinator: *@import("../turn_coordinator.zig").TurnCoordinator,
     stable_prefix_ptr: *std.ArrayList(ChatMessage),
     history_messages_ptr: *std.ArrayList(ChatMessage),
     within_turn_suffix_ptr: *std.ArrayList(ChatMessage),
@@ -6599,7 +6600,7 @@ fn processQueuedPromptLoop(
         !selection_changed and restored_attempts >= checkpoint.max_provider_attempts
     else
         false;
-    const semantic_limit = if (selection_changed or restored_budget_exhausted)
+    coordinator.attempt_limit = if (selection_changed or restored_budget_exhausted)
         semanticAttemptLimit(config.max_provider_attempts)
     else if (job.recovery_checkpoint) |checkpoint|
         checkpoint.max_provider_attempts
@@ -6617,7 +6618,7 @@ fn processQueuedPromptLoop(
     // Attachment pixel sizes probed during this turn, so each step does not
     // reread every attachment snapshot. Entries live in the turn arena.
     var attachment_dimensions: image_attachments.AttachmentDimensionCache = .empty;
-    var semantic_attempt: usize = if (selection_changed or restored_budget_exhausted)
+    coordinator.attempt = if (selection_changed or restored_budget_exhausted)
         0
     else
         restored_attempts;
@@ -6651,22 +6652,22 @@ fn processQueuedPromptLoop(
     else
         .none;
     var restore_recovery_source = job.recovery_checkpoint != null;
-    var step: usize = 0;
-    agent_steps_loop: while (agent_steps.allowsStep(config.agent_step_limit, step)) : (step += 1) {
-        current_step_index = step + 1;
-        const step_ctx: TraceContext = .{ .turn_id = turn_id, .step_id = debug_trace.nextStepId(), .subagent_id = config.subagent_id };
+
+    agent_steps_loop: while (agent_steps.allowsStep(coordinator.step_limit, coordinator.step)) : (coordinator.step += 1) {
+        current_step_index = coordinator.step + 1;
+        const step_ctx: TraceContext = .{ .turn_id = coordinator.turn_id, .step_id = debug_trace.nextStepId(), .subagent_id = config.subagent_id };
         const presentation_group_id = runtime_tool_presentation.presentationGroupForStep(
             active_presentation_group_id,
-            turn_id,
+            coordinator.turn_id,
             step_ctx.step_id,
         );
         last_step_ctx = step_ctx;
-        if (config.cancel_flag.load(.seq_cst)) {
+        if (coordinator.cancel_flag.load(.seq_cst)) {
             if (try append_immediate_steering_after_cancel(
                 deps,
                 arena,
                 &within_turn_suffix,
-                turn_id,
+                coordinator.turn_id,
                 "",
             )) continue :agent_steps_loop;
             runtime_telemetry.traceCancelObserved(step_ctx, false);
@@ -6682,7 +6683,7 @@ fn processQueuedPromptLoop(
             arena,
             overlay_arena,
             &within_turn_suffix,
-            turn_id,
+            coordinator.turn_id,
             config.origin,
             .model,
         );
@@ -6736,15 +6737,15 @@ fn processQueuedPromptLoop(
             response_language_context_conflicts(response_language_expectation, history_messages.items) or
             response_language_context_conflicts(response_language_expectation, within_turn_suffix.items);
 
-        debug_trace.logf("agent", "step start step={d} limit={d} messages={d}", .{ current_step_index, config.agent_step_limit, gateway_instructions.items.len + gateway_messages.items.len });
-        debug_trace.eventf("agent", "step_begin", step_ctx, "step_index={d} step_limit={d} gateway_messages={d}", .{ current_step_index, config.agent_step_limit, gateway_instructions.items.len + gateway_messages.items.len });
+        debug_trace.logf("agent", "step start step={d} limit={d} messages={d}", .{ current_step_index, coordinator.step_limit, gateway_instructions.items.len + gateway_messages.items.len });
+        debug_trace.eventf("agent", "step_begin", step_ctx, "step_index={d} step_limit={d} gateway_messages={d}", .{ current_step_index, coordinator.step_limit, gateway_instructions.items.len + gateway_messages.items.len });
 
         var stream_ctx = runtime_assistant_stream.StreamChunkContext{
             .hooks = deps,
             .flush_assistant_stream_per_content_chunk = deps.flush_assistant_stream_per_content_chunk,
             .semantic_presentation = semantic_presentation,
             .token_progress = &summary_accumulator,
-            .turn_id = turn_id,
+            .turn_id = coordinator.turn_id,
             .step_id = step_ctx.step_id,
             .response_language_expected = response_language_expectation,
             .response_language_hold_until_completion = response_language_hold_until_completion,
@@ -6783,7 +6784,7 @@ fn processQueuedPromptLoop(
         var successful_recovery_strategy: ?model_response_recovery.Strategy = null;
         defer {
             if (recovery_has_unexecuted_tool_start and finalization.outcome != .paused) {
-                settle_deferred_tool_starts(deps, &stream_ctx, arena, turn_id, config.cancel_flag);
+                settle_deferred_tool_starts(deps, &stream_ctx, arena, coordinator.turn_id, coordinator.cancel_flag);
             }
         }
 
@@ -6805,8 +6806,8 @@ fn processQueuedPromptLoop(
                     gateway_model,
                     selected_fast_mode,
                     route_fast_mode,
-                    semantic_limit,
-                    semantic_attempt,
+                    coordinator.attempt_limit,
+                    coordinator.attempt,
                     false,
                     recovery_cause,
                     recovery_strategy,
@@ -6820,8 +6821,8 @@ fn processQueuedPromptLoop(
                     arena,
                     &finish_trace,
                     recovery_cause,
-                    semantic_attempt,
-                    semantic_limit,
+                    coordinator.attempt,
+                    coordinator.attempt_limit,
                     pausedRequiredAction(preserved_tool_evidence),
                     latest_recovery_diagnostic,
                 );
@@ -7054,7 +7055,7 @@ fn processQueuedPromptLoop(
                 .vision_mode = vision_mode,
                 .provider_options = provider_opts,
                 .max_output_tokens = model_capabilities.requestOutputTokens(request_capabilities),
-                .budget = .{ .cancel_flag = config.cancel_flag },
+                .budget = .{ .cancel_flag = coordinator.cancel_flag },
             };
             var prepared_request_body: ?[]const u8 = null;
             var request_cost_for_attempt: ?runtime_prompt_context.RequestCost = null;
@@ -7139,8 +7140,8 @@ fn processQueuedPromptLoop(
                         .route_model = gateway_model,
                         .requested_fast_mode = selected_fast_mode,
                         .fast_mode = route_fast_mode,
-                        .attempt_limit = semantic_limit,
-                        .consumed_attempts = semantic_attempt,
+                        .attempt_limit = coordinator.attempt_limit,
+                        .consumed_attempts = coordinator.attempt,
                         .tool_evidence = preserved_tool_evidence,
                         .trace_ctx = step_ctx,
                     };
@@ -7176,11 +7177,11 @@ fn processQueuedPromptLoop(
                             .size = size,
                             .caller = summary_model.caller(),
                             .records = if (config.session_child_capability) |capability| result_store.compactorStore(capability) else null,
-                            .cancel_flag = config.cancel_flag,
+                            .cancel_flag = coordinator.cancel_flag,
                             .trace_ctx = step_ctx,
                         },
                     }) catch |err| {
-                        if (compaction_activity.failure(err, .summary, config.cancel_flag.load(.seq_cst)).outcome == .cancelled) {
+                        if (compaction_activity.failure(err, .summary, coordinator.cancel_flag.load(.seq_cst)).outcome == .cancelled) {
                             runtime_telemetry.traceCancelObserved(step_ctx, false);
                             try runtime_interruption.persistCompactionInterruptedTurnOnce(
                                 deps,
@@ -7236,7 +7237,7 @@ fn processQueuedPromptLoop(
                             arena,
                             overlay_arena,
                             &within_turn_suffix,
-                            turn_id,
+                            coordinator.turn_id,
                             config.origin,
                             .model,
                         );
@@ -7276,8 +7277,8 @@ fn processQueuedPromptLoop(
                     gateway_model,
                     selected_fast_mode,
                     route_fast_mode,
-                    semantic_limit,
-                    semantic_attempt,
+                    coordinator.attempt_limit,
+                    coordinator.attempt,
                     true,
                     recovery_cause,
                     recovery_strategy,
@@ -7323,7 +7324,7 @@ fn processQueuedPromptLoop(
                 .attempt_evidence = &gateway_attempt_evidence,
                 .events = .{ .context = &provider_events, .emit_fn = onProviderEvent },
                 .admission = .{ .context = &provider_admission, .admit_fn = ProviderAdmission.admit },
-                .cancel_flag = config.cancel_flag,
+                .cancel_flag = coordinator.cancel_flag,
                 .provider_attempt_owner = .agent,
             };
             stream_result = runtime_gateway_step.streamModelCompletion(
@@ -7341,8 +7342,8 @@ fn processQueuedPromptLoop(
                 runtime_assistant_stream.pushTokenProgressUpdate(&stream_ctx, summary_accumulator.finishTokenRequestWithoutUsage(gateway_delivery.load() == .possibly_sent)) catch |progress_err| {
                     debug_trace.logf("agent", "token progress publication failed source=gateway_error err={s}", .{@errorName(progress_err)});
                 };
-                const cancel_requested = config.cancel_flag.load(.seq_cst);
-                const consumed_attempts = semantic_attempt +
+                const cancel_requested = coordinator.cancel_flag.load(.seq_cst);
+                const consumed_attempts = coordinator.attempt +
                     @as(usize, @intFromBool(gateway_attempt_evidence.provider_admitted));
                 const network_failure = gateway_attempt_evidence.network_failure;
                 const failure_cause: model_response_recovery.FailureCause = if (network_failure) |evidence|
@@ -7366,7 +7367,7 @@ fn processQueuedPromptLoop(
                         gateway_model,
                         selected_fast_mode,
                         route_fast_mode,
-                        semantic_limit,
+                        coordinator.attempt_limit,
                         consumed_attempts,
                         false,
                         failure_cause,
@@ -7387,7 +7388,7 @@ fn processQueuedPromptLoop(
                         &finish_trace,
                         failure_cause,
                         consumed_attempts,
-                        semantic_limit,
+                        coordinator.attempt_limit,
                         pausedRequiredAction(effectiveRecoveryToolEvidence(
                             preserved_tool_evidence,
                             null,
@@ -7421,7 +7422,7 @@ fn processQueuedPromptLoop(
                             .definitely_unsent => .definitely_unsent,
                             .possibly_sent => .possibly_sent,
                         },
-                        .attempts = .{ .consumed = consumed_attempts, .limit = semantic_limit },
+                        .attempts = .{ .consumed = consumed_attempts, .limit = coordinator.attempt_limit },
                         .pacing = retry_pacing,
                         .output = if (stream_ctx.interruption_source_or("").len > 0) .partial else .none,
                         .tool = effectiveRecoveryToolEvidence(
@@ -7454,7 +7455,7 @@ fn processQueuedPromptLoop(
                         @errorName(err),
                         if (cancel_requested) "true" else "false",
                         consumed_attempts,
-                        semantic_limit,
+                        coordinator.attempt_limit,
                         if (stream_ctx.saw_visible_text) "true" else "false",
                         if (stream_ctx.saw_tool_start) "true" else "false",
                         if (stream_ctx.saw_provider_tool_start) "true" else "false",
@@ -7479,7 +7480,7 @@ fn processQueuedPromptLoop(
                     gateway_model,
                     selected_fast_mode,
                     route_fast_mode,
-                    semantic_limit,
+                    coordinator.attempt_limit,
                     consumed_attempts,
                     false,
                     failure_cause,
@@ -7497,14 +7498,14 @@ fn processQueuedPromptLoop(
                     retry_deadline = try pushAutoRetryStatus(
                         deps,
                         consumed_attempts,
-                        semantic_limit,
+                        coordinator.attempt_limit,
                         failure_cause,
                         recovery_decision,
                         failure_diagnostic,
                     );
                 }
                 const delay_completed = !will_auto_retry or wait_for_recovery_deadline(
-                    config.cancel_flag,
+                    coordinator.cancel_flag,
                     retry_deadline.?,
                 );
                 if (recoveryPauseRequested(config)) {
@@ -7517,7 +7518,7 @@ fn processQueuedPromptLoop(
                         gateway_model,
                         selected_fast_mode,
                         route_fast_mode,
-                        semantic_limit,
+                        coordinator.attempt_limit,
                         consumed_attempts,
                         false,
                         failure_cause,
@@ -7538,7 +7539,7 @@ fn processQueuedPromptLoop(
                         &finish_trace,
                         failure_cause,
                         consumed_attempts,
-                        semantic_limit,
+                        coordinator.attempt_limit,
                         pausedRequiredAction(effectiveRecoveryToolEvidence(
                             preserved_tool_evidence,
                             null,
@@ -7559,7 +7560,7 @@ fn processQueuedPromptLoop(
                         deps,
                         stream_ctx.alloc,
                         arena,
-                        turn_id,
+                        coordinator.turn_id,
                     );
                     const interruption_source = stream_ctx.interruption_source_or("");
                     try runtime_assistant_stream.flushAssistantStream(&stream_ctx);
@@ -7567,7 +7568,7 @@ fn processQueuedPromptLoop(
                         deps,
                         arena,
                         &within_turn_suffix,
-                        turn_id,
+                        coordinator.turn_id,
                         interruption_source,
                     )) {
                         reset_recovery_after_immediate_steering(
@@ -7591,7 +7592,7 @@ fn processQueuedPromptLoop(
                     std.debug.assert(pending_auto_retry_status == null);
                     pending_auto_retry_status = auto_retry_status(
                         consumed_attempts + 1,
-                        semantic_limit,
+                        coordinator.attempt_limit,
                         failure_cause,
                         recovery_decision.strategy,
                         inFlightDelaySeconds(recovery_decision.delay_ns),
@@ -7609,7 +7610,7 @@ fn processQueuedPromptLoop(
                     if (recovery_strategy == .regenerate_tool) {
                         recovery_has_unexecuted_tool_start = true;
                     }
-                    semantic_attempt = consumed_attempts;
+                    coordinator.attempt = consumed_attempts;
                     reset_stream_for_next_attempt = true;
                     continue;
                 }
@@ -7623,7 +7624,7 @@ fn processQueuedPromptLoop(
                         &finish_trace,
                         failure_cause,
                         consumed_attempts,
-                        semantic_limit,
+                        coordinator.attempt_limit,
                         recoveryRequiredAction(recovery_decision.required_action),
                         failure_diagnostic,
                     );
@@ -7639,7 +7640,7 @@ fn processQueuedPromptLoop(
                         &finish_trace,
                         failure_cause,
                         consumed_attempts,
-                        semantic_limit,
+                        coordinator.attempt_limit,
                         failure_diagnostic,
                     );
                     restorePromptAfterTerminalFailure(deps, job, config);
@@ -7649,12 +7650,12 @@ fn processQueuedPromptLoop(
                     const exhausted_retryable =
                         stream_ctx.interruption_source_or("").len == 0 and
                         !stream_ctx.saw_provider_tool_start and
-                        consumed_attempts >= semantic_limit;
+                        consumed_attempts >= coordinator.attempt_limit;
                     if (replay_safe or exhausted_retryable) {
                         try pushRouteRecoveryStatus(deps, .{
                             .kind = .terminal_provider_error,
                             .failed_attempt = consumed_attempts,
-                            .attempt_limit = semantic_limit,
+                            .attempt_limit = coordinator.attempt_limit,
                             .cause = checkpointCause(failure_cause),
                             .required_action = recoveryRequiredAction(recovery_decision.required_action),
                             .diagnostic = failure_diagnostic,
@@ -7672,11 +7673,11 @@ fn processQueuedPromptLoop(
                         );
                         restorePromptAfterTerminalFailure(deps, job, config);
                     }
-                } else if (semantic_attempt > 0) {
+                } else if (coordinator.attempt > 0) {
                     try pushRouteRecoveryStatus(deps, .{
                         .kind = .terminal_provider_error,
                         .failed_attempt = consumed_attempts,
-                        .attempt_limit = semantic_limit,
+                        .attempt_limit = coordinator.attempt_limit,
                         .cause = checkpointCause(failure_cause),
                         .required_action = recoveryRequiredAction(recovery_decision.required_action),
                         .diagnostic = failure_diagnostic,
@@ -7701,7 +7702,7 @@ fn processQueuedPromptLoop(
                         deps,
                         stream_ctx.alloc,
                         arena,
-                        turn_id,
+                        coordinator.turn_id,
                         &.{},
                     );
                 }
@@ -7771,7 +7772,7 @@ fn processQueuedPromptLoop(
                         "authenticated_request_replayed",
                         step_ctx,
                         "semantic_attempt={d}",
-                        .{semantic_attempt + 1},
+                        .{coordinator.attempt + 1},
                     );
                 }
             }
@@ -7832,8 +7833,8 @@ fn processQueuedPromptLoop(
                     gateway_model,
                     selected_fast_mode,
                     route_fast_mode,
-                    semantic_limit,
-                    semantic_attempt + 1,
+                    coordinator.attempt_limit,
+                    coordinator.attempt + 1,
                     false,
                     recovery_cause,
                     .pause,
@@ -7848,8 +7849,8 @@ fn processQueuedPromptLoop(
                     arena,
                     &finish_trace,
                     recovery_cause,
-                    semantic_attempt + 1,
-                    semantic_limit,
+                    coordinator.attempt + 1,
+                    coordinator.attempt_limit,
                     .inspect_uncertain_tool,
                     types.ModelFailureDiagnostic.init("UnexpectedToolCallDuringReconciliation"),
                 );
@@ -7867,7 +7868,7 @@ fn processQueuedPromptLoop(
                     has_compactable_context,
                     streamReplaySafe(&stream_ctx),
                     context_overflow_recovery == .ready,
-                    config.cancel_flag.load(.seq_cst),
+                    coordinator.cancel_flag.load(.seq_cst),
                 )) {
                     compactor.traceEvent(
                         step_ctx,
@@ -7901,7 +7902,7 @@ fn processQueuedPromptLoop(
                     &stream_ctx,
                     arena,
                     config,
-                    turn_id,
+                    coordinator.turn_id,
                     response_completion,
                     .{ .provider = job.provider, .model = gateway_model },
                     advertised_dynamic_tool_names,
@@ -7910,7 +7911,7 @@ fn processQueuedPromptLoop(
                     &completed_tool_names,
                 );
             }
-            const settled_attempts = semantic_attempt + 1;
+            const settled_attempts = coordinator.attempt + 1;
             if (job.provider == .gateway or
                 response_failure == null or response_failure.?.kind != .unauthorized)
             {
@@ -7923,7 +7924,7 @@ fn processQueuedPromptLoop(
                     gateway_model,
                     selected_fast_mode,
                     route_fast_mode,
-                    semantic_limit,
+                    coordinator.attempt_limit,
                     settled_attempts,
                     false,
                     recovery_cause,
@@ -7943,7 +7944,7 @@ fn processQueuedPromptLoop(
             summary_accumulator.addThinkingWait(gateway_wait_started_ms, stream_ctx.first_model_output_at_ms orelse gateway_wait_finished_ms);
 
             const prefill_tool_name: ?[]const u8 = if (!assistant_prefill_recovery_used and
-                semantic_attempt + 1 < semantic_limit and
+                coordinator.attempt + 1 < coordinator.attempt_limit and
                 streamReplaySafe(&stream_ctx))
                 postToolAssistantPrefillRejection(
                     if (response_failure) |failure| failureHttpStatus(failure.kind) else .ok,
@@ -7958,7 +7959,7 @@ fn processQueuedPromptLoop(
                     "assistant_prefill_recovery",
                     step_ctx,
                     "tool_name={s} provider_attempt={d}/{d}",
-                    .{ tool_name, semantic_attempt + 1, semantic_limit },
+                    .{ tool_name, coordinator.attempt + 1, coordinator.attempt_limit },
                 );
                 try within_turn_suffix.append(arena, .{
                     .role = .user,
@@ -7967,7 +7968,7 @@ fn processQueuedPromptLoop(
                 stream_result.deinit(arena);
                 stream_result_set = false;
                 assistant_prefill_recovery_used = true;
-                semantic_attempt += 1;
+                coordinator.attempt += 1;
                 retry_pacing = .idle;
                 reset_stream_for_next_attempt = true;
                 continue;
@@ -8001,7 +8002,7 @@ fn processQueuedPromptLoop(
                 const decision = model_response_recovery.decide(.{
                     .cause = cause,
                     .delivery = .possibly_sent,
-                    .attempts = .{ .consumed = semantic_attempt + 1, .limit = semantic_limit },
+                    .attempts = .{ .consumed = coordinator.attempt + 1, .limit = coordinator.attempt_limit },
                     .pacing = retry_pacing,
                     .output = if (stream_ctx.interruption_source_or("").len > 0) .partial else .none,
                     .tool = effectiveRecoveryToolEvidence(
@@ -8010,7 +8011,7 @@ fn processQueuedPromptLoop(
                         &stream_ctx,
                     ),
                     .retry_after_seconds = failure.retry_after_seconds,
-                    .cancelled = config.cancel_flag.load(.seq_cst),
+                    .cancelled = coordinator.cancel_flag.load(.seq_cst),
                     .recovery_elapsed_ns = recovery_elapsed_ns,
                 });
                 if (decision.strategy == .pause) {
@@ -8023,8 +8024,8 @@ fn processQueuedPromptLoop(
                         gateway_model,
                         selected_fast_mode,
                         route_fast_mode,
-                        semantic_limit,
-                        semantic_attempt + 1,
+                        coordinator.attempt_limit,
+                        coordinator.attempt + 1,
                         false,
                         cause,
                         .pause,
@@ -8043,8 +8044,8 @@ fn processQueuedPromptLoop(
                         arena,
                         &finish_trace,
                         cause,
-                        semantic_attempt + 1,
-                        semantic_limit,
+                        coordinator.attempt + 1,
+                        coordinator.attempt_limit,
                         recoveryRequiredAction(decision.required_action),
                         diagnostic,
                     );
@@ -8059,8 +8060,8 @@ fn processQueuedPromptLoop(
                         arena,
                         &finish_trace,
                         cause,
-                        semantic_attempt + 1,
-                        semantic_limit,
+                        coordinator.attempt + 1,
+                        coordinator.attempt_limit,
                         diagnostic,
                     );
                     restorePromptAfterTerminalFailure(deps, job, config);
@@ -8077,8 +8078,8 @@ fn processQueuedPromptLoop(
                             gateway_model,
                             selected_fast_mode,
                             route_fast_mode,
-                            semantic_limit,
-                            semantic_attempt + 1,
+                            coordinator.attempt_limit,
+                            coordinator.attempt + 1,
                             false,
                             cause,
                             decision.strategy,
@@ -8092,17 +8093,17 @@ fn processQueuedPromptLoop(
                     }
                     const retry_deadline = try pushAutoRetryStatus(
                         deps,
-                        semantic_attempt + 1,
-                        semantic_limit,
+                        coordinator.attempt + 1,
+                        coordinator.attempt_limit,
                         cause,
                         decision,
                         diagnostic,
                     );
-                    if (wait_for_recovery_deadline(config.cancel_flag, retry_deadline)) {
+                    if (wait_for_recovery_deadline(coordinator.cancel_flag, retry_deadline)) {
                         std.debug.assert(pending_auto_retry_status == null);
                         pending_auto_retry_status = auto_retry_status(
-                            semantic_attempt + 2,
-                            semantic_limit,
+                            coordinator.attempt + 2,
+                            coordinator.attempt_limit,
                             cause,
                             decision.strategy,
                             inFlightDelaySeconds(decision.delay_ns),
@@ -8116,14 +8117,14 @@ fn processQueuedPromptLoop(
                         );
                         stream_result.deinit(arena);
                         stream_result_set = false;
-                        semantic_attempt += 1;
+                        coordinator.attempt += 1;
                         recovery_strategy = decision.strategy;
                         recovery_cause = cause;
                         retry_pacing = decision.next_pacing;
                         reset_stream_for_next_attempt = true;
                         continue;
                     }
-                    if (config.cancel_flag.load(.seq_cst)) {
+                    if (coordinator.cancel_flag.load(.seq_cst)) {
                         runtime_telemetry.traceCancelObserved(step_ctx, false);
                         try clearAutoRetryStatusIfNeeded(deps, true);
                         try finishPendingCancelledCalls(
@@ -8132,7 +8133,7 @@ fn processQueuedPromptLoop(
                             stream_ctx.alloc,
                             arena,
                             config,
-                            turn_id,
+                            coordinator.turn_id,
                             response_completion.tool_calls,
                             advertised_dynamic_tool_names,
                         );
@@ -8141,7 +8142,7 @@ fn processQueuedPromptLoop(
                             deps,
                             arena,
                             &within_turn_suffix,
-                            turn_id,
+                            coordinator.turn_id,
                             interruption_source,
                         )) {
                             reset_recovery_after_immediate_steering(
@@ -8175,7 +8176,7 @@ fn processQueuedPromptLoop(
                 attempt_completion.content orelse "",
             );
 
-            if (config.cancel_flag.load(.seq_cst)) {
+            if (coordinator.cancel_flag.load(.seq_cst)) {
                 runtime_telemetry.traceCancelObserved(step_ctx, false);
                 try clearAutoRetryStatusIfNeeded(deps, recovery_strategy != null);
                 try finishPendingCancelledCalls(
@@ -8184,7 +8185,7 @@ fn processQueuedPromptLoop(
                     stream_ctx.alloc,
                     arena,
                     config,
-                    turn_id,
+                    coordinator.turn_id,
                     attempt_completion.tool_calls,
                     advertised_dynamic_tool_names,
                 );
@@ -8195,7 +8196,7 @@ fn processQueuedPromptLoop(
                     deps,
                     arena,
                     &within_turn_suffix,
-                    turn_id,
+                    coordinator.turn_id,
                     interruption_source,
                 )) {
                     reset_recovery_after_immediate_steering(
@@ -8245,8 +8246,8 @@ fn processQueuedPromptLoop(
                                 @tagName(response_language_expectation.?),
                                 @tagName(candidate_language.script.?),
                                 gateway_model,
-                                semantic_attempt + 1,
-                                semantic_limit,
+                                coordinator.attempt + 1,
+                                coordinator.attempt_limit,
                             },
                         );
                         stream_ctx.drop_staged_response_language_candidate();
@@ -8254,7 +8255,7 @@ fn processQueuedPromptLoop(
                     .retry_once, .fail_without_commit => {
                         const observed = candidate_language.script.?;
                         const can_retry = language_decision == .retry_once and
-                            semantic_attempt + 1 < semantic_limit;
+                            coordinator.attempt + 1 < coordinator.attempt_limit;
                         debug_trace.eventf(
                             "agent",
                             "response_language_mismatch",
@@ -8264,8 +8265,8 @@ fn processQueuedPromptLoop(
                                 @tagName(response_language_expectation.?),
                                 @tagName(observed),
                                 gateway_model,
-                                semantic_attempt + 1,
-                                semantic_limit,
+                                coordinator.attempt + 1,
+                                coordinator.attempt_limit,
                                 if (can_retry) "true" else "false",
                             },
                         );
@@ -8280,7 +8281,7 @@ fn processQueuedPromptLoop(
                             stream_ctx.drop_staged_response_language_candidate();
                             stream_result.deinit(arena);
                             stream_result_set = false;
-                            semantic_attempt += 1;
+                            coordinator.attempt += 1;
                             response_language_correction_attempted = true;
                             reset_stream_for_next_attempt = true;
                             continue;
@@ -8348,7 +8349,7 @@ fn processQueuedPromptLoop(
                     model_response_recovery.decide(.{
                         .cause = cause,
                         .delivery = .possibly_sent,
-                        .attempts = .{ .consumed = semantic_attempt + 1, .limit = semantic_limit },
+                        .attempts = .{ .consumed = coordinator.attempt + 1, .limit = coordinator.attempt_limit },
                         .pacing = retry_pacing,
                         .output = if (partial_assistant.len > 0) .partial else .none,
                         .tool = effectiveRecoveryToolEvidence(
@@ -8356,7 +8357,7 @@ fn processQueuedPromptLoop(
                             attempt_completion,
                             &stream_ctx,
                         ),
-                        .cancelled = config.cancel_flag.load(.seq_cst),
+                        .cancelled = coordinator.cancel_flag.load(.seq_cst),
                         .progress = if (track_progress and recovery_no_progress_streak >= 2)
                             .stalled
                         else
@@ -8371,8 +8372,8 @@ fn processQueuedPromptLoop(
                         job.model,
                         gateway_model,
                         route_fast_mode,
-                        semantic_attempt + 1,
-                        semantic_limit,
+                        coordinator.attempt + 1,
+                        coordinator.attempt_limit,
                         attempt_completion,
                         &stream_ctx,
                         decision.reserve_provider_attempt,
@@ -8396,8 +8397,8 @@ fn processQueuedPromptLoop(
                         gateway_model,
                         selected_fast_mode,
                         route_fast_mode,
-                        semantic_limit,
-                        semantic_attempt + 1,
+                        coordinator.attempt_limit,
+                        coordinator.attempt + 1,
                         false,
                         cause,
                         .pause,
@@ -8415,8 +8416,8 @@ fn processQueuedPromptLoop(
                         arena,
                         &finish_trace,
                         cause,
-                        semantic_attempt + 1,
-                        semantic_limit,
+                        coordinator.attempt + 1,
+                        coordinator.attempt_limit,
                         recoveryRequiredAction(decision.required_action),
                         diagnostic,
                     );
@@ -8431,8 +8432,8 @@ fn processQueuedPromptLoop(
                         arena,
                         &finish_trace,
                         cause,
-                        semantic_attempt + 1,
-                        semantic_limit,
+                        coordinator.attempt + 1,
+                        coordinator.attempt_limit,
                         diagnostic,
                     );
                     restorePromptAfterTerminalFailure(deps, job, config);
@@ -8450,8 +8451,8 @@ fn processQueuedPromptLoop(
                             gateway_model,
                             selected_fast_mode,
                             route_fast_mode,
-                            semantic_limit,
-                            semantic_attempt + 1,
+                            coordinator.attempt_limit,
+                            coordinator.attempt + 1,
                             false,
                             cause,
                             decision.strategy,
@@ -8465,17 +8466,17 @@ fn processQueuedPromptLoop(
                     }
                     const retry_deadline = try pushAutoRetryStatus(
                         deps,
-                        semantic_attempt + 1,
-                        semantic_limit,
+                        coordinator.attempt + 1,
+                        coordinator.attempt_limit,
                         cause,
                         decision,
                         diagnostic,
                     );
-                    if (wait_for_recovery_deadline(config.cancel_flag, retry_deadline)) {
+                    if (wait_for_recovery_deadline(coordinator.cancel_flag, retry_deadline)) {
                         std.debug.assert(pending_auto_retry_status == null);
                         pending_auto_retry_status = auto_retry_status(
-                            semantic_attempt + 2,
-                            semantic_limit,
+                            coordinator.attempt + 2,
+                            coordinator.attempt_limit,
                             cause,
                             decision.strategy,
                             inFlightDelaySeconds(decision.delay_ns),
@@ -8489,7 +8490,7 @@ fn processQueuedPromptLoop(
                         );
                         // Probes and connectivity waits are not provider
                         // attempts: nothing billable was sent.
-                        if (decision.reserve_provider_attempt) semantic_attempt += 1;
+                        if (decision.reserve_provider_attempt) coordinator.attempt += 1;
                         recovery_strategy = decision.strategy;
                         recovery_cause = cause;
                         retry_pacing = decision.next_pacing;
@@ -8499,7 +8500,7 @@ fn processQueuedPromptLoop(
                         reset_stream_for_next_attempt = true;
                         continue;
                     }
-                    if (config.cancel_flag.load(.seq_cst)) {
+                    if (coordinator.cancel_flag.load(.seq_cst)) {
                         runtime_telemetry.traceCancelObserved(step_ctx, false);
                         try clearAutoRetryStatusIfNeeded(deps, true);
                         try finishPendingCancelledCalls(
@@ -8508,7 +8509,7 @@ fn processQueuedPromptLoop(
                             stream_ctx.alloc,
                             arena,
                             config,
-                            turn_id,
+                            coordinator.turn_id,
                             attempt_completion.tool_calls,
                             advertised_dynamic_tool_names,
                         );
@@ -8516,7 +8517,7 @@ fn processQueuedPromptLoop(
                             deps,
                             arena,
                             &within_turn_suffix,
-                            turn_id,
+                            coordinator.turn_id,
                             partial_assistant,
                         )) {
                             reset_recovery_after_immediate_steering(
@@ -8570,8 +8571,8 @@ fn processQueuedPromptLoop(
                     if (replay_safe) {
                         try pushTerminalProviderFailureStatus(
                             deps,
-                            semantic_attempt + 1,
-                            semantic_limit,
+                            coordinator.attempt + 1,
+                            coordinator.attempt_limit,
                             attempt_completion,
                             diagnostic,
                         );
@@ -8588,8 +8589,8 @@ fn processQueuedPromptLoop(
                 if (finish_reason == .content_filter) {
                     try pushTerminalProviderFailureStatus(
                         deps,
-                        semantic_attempt + 1,
-                        semantic_limit,
+                        coordinator.attempt + 1,
+                        coordinator.attempt_limit,
                         attempt_completion,
                         diagnostic,
                     );
@@ -8600,7 +8601,7 @@ fn processQueuedPromptLoop(
                             .fast_mode = route_fast_mode,
                             .replay_safe = false,
                             .finish_reason = finish_reason,
-                            .semantic_attempts = semantic_attempt + 1,
+                            .semantic_attempts = coordinator.attempt + 1,
                             .provider_failure_detail = attempt_completion.provider_failure_detail,
                         });
                         debug_trace.eventf("agent", "route_recovery_decision", step_ctx, "decision={s} replay_safe=false", .{@tagName(decision)});
@@ -8673,7 +8674,7 @@ fn processQueuedPromptLoop(
                 if (!has_novel_content) {
                     try stream_ctx.start_response();
                     if (successful_recovery_strategy != null) {
-                        try pushAutoRecoveredStatus(deps, semantic_attempt, semantic_limit);
+                        try pushAutoRecoveredStatus(deps, coordinator.attempt, coordinator.attempt_limit);
                     }
                     latest_recovery_diagnostic = null;
                     recovery_strategy = null;
@@ -8770,8 +8771,8 @@ fn processQueuedPromptLoop(
                 try pushTerminalAutoRetryStatusIfNeeded(
                     deps,
                     successful_recovery_strategy != null,
-                    semantic_attempt,
-                    semantic_limit,
+                    coordinator.attempt,
+                    coordinator.attempt_limit,
                     types.ModelFailureDiagnostic.init("StreamInterrupted"),
                 );
                 debug_trace.eventf("agent", "provider_finish_missing", step_ctx, "content_bytes={d} tool_call_count={d}", .{
@@ -8795,8 +8796,8 @@ fn processQueuedPromptLoop(
                 try pushTerminalAutoRetryStatusIfNeeded(
                     deps,
                     successful_recovery_strategy != null,
-                    semantic_attempt,
-                    semantic_limit,
+                    coordinator.attempt,
+                    coordinator.attempt_limit,
                     types.ModelFailureDiagnostic.init("InvalidProviderCompletion"),
                 );
                 const finish_reason = completion.finish_reason.?;
@@ -8816,8 +8817,8 @@ fn processQueuedPromptLoop(
             try pushTerminalAutoRetryStatusIfNeeded(
                 deps,
                 successful_recovery_strategy != null,
-                semantic_attempt,
-                semantic_limit,
+                coordinator.attempt,
+                coordinator.attempt_limit,
                 types.ModelFailureDiagnostic.init("RequiredVisionToolCallMissing"),
             );
             debug_trace.eventf(
@@ -8835,14 +8836,14 @@ fn processQueuedPromptLoop(
                 deps,
                 stream_ctx.alloc,
                 arena,
-                turn_id,
+                coordinator.turn_id,
                 completion.tool_calls,
             );
             recovery_has_unexecuted_tool_start = false;
         }
         const finish_reason = completion.finish_reason.?;
         if (successful_recovery_strategy != null) {
-            try pushAutoRecoveredStatus(deps, semantic_attempt, semantic_limit);
+            try pushAutoRecoveredStatus(deps, coordinator.attempt, coordinator.attempt_limit);
         }
         latest_recovery_diagnostic = null;
         recovery_strategy = null;
@@ -8863,25 +8864,25 @@ fn processQueuedPromptLoop(
             switch (tool_admission) {
                 .admitted => reportProviderExecutedUsage(deps, completion.tool_calls),
                 .reject_duplicate_identity => {
-                    try stream_ctx.provisional_statuses.finishRejectedCompletions(deps, arena, turn_id, completion.tool_calls, advertised_dynamic_tool_names);
+                    try stream_ctx.provisional_statuses.finishRejectedCompletions(deps, arena, coordinator.turn_id, completion.tool_calls, advertised_dynamic_tool_names);
                     debug_trace.eventf("agent", "authoritative_tool_admission_rejected", step_ctx, "failure=duplicate", .{});
                     finish_trace.finish("duplicate_tool_identity");
                     return error.MalformedAuthoritativeToolIdentity;
                 },
                 .reject_malformed_identity => |failure| {
-                    try stream_ctx.provisional_statuses.finishRejectedCompletions(deps, arena, turn_id, completion.tool_calls, advertised_dynamic_tool_names);
+                    try stream_ctx.provisional_statuses.finishRejectedCompletions(deps, arena, coordinator.turn_id, completion.tool_calls, advertised_dynamic_tool_names);
                     debug_trace.eventf("agent", "authoritative_tool_admission_rejected", step_ctx, "failure={s} provenance=fx_local", .{@tagName(failure)});
                     finish_trace.finish("malformed_tool_identity");
                     return error.MalformedAuthoritativeToolIdentity;
                 },
                 .reject_unstorable_identity => |failure| {
-                    try stream_ctx.provisional_statuses.finishRejectedCompletions(deps, arena, turn_id, completion.tool_calls, advertised_dynamic_tool_names);
+                    try stream_ctx.provisional_statuses.finishRejectedCompletions(deps, arena, coordinator.turn_id, completion.tool_calls, advertised_dynamic_tool_names);
                     debug_trace.eventf("agent", "authoritative_tool_admission_rejected", step_ctx, "field={s} failure={s}", .{ @tagName(failure.field), @tagName(failure.reason) });
                     finish_trace.finish("unstorable_tool_identity");
                     return error.MalformedAuthoritativeToolIdentity;
                 },
                 .reject_malformed_provider_result => |failure| {
-                    try stream_ctx.provisional_statuses.finishRejectedCompletions(deps, arena, turn_id, completion.tool_calls, advertised_dynamic_tool_names);
+                    try stream_ctx.provisional_statuses.finishRejectedCompletions(deps, arena, coordinator.turn_id, completion.tool_calls, advertised_dynamic_tool_names);
                     debug_trace.eventf("agent", "authoritative_tool_admission_rejected", step_ctx, "failure={s} provenance=provider_executed", .{@tagName(failure)});
                     finish_trace.finish("malformed_provider_result");
                     return error.MalformedProviderResultIdentity;
@@ -8890,7 +8891,7 @@ fn processQueuedPromptLoop(
                     try stream_ctx.provisional_statuses.finishMalformedProviderToolArguments(
                         deps,
                         arena,
-                        turn_id,
+                        coordinator.turn_id,
                         completion.tool_calls,
                     );
                     debug_trace.eventf(
@@ -8920,7 +8921,7 @@ fn processQueuedPromptLoop(
             runtime_tool_presentation.transitionPresentationGroup(
                 active_presentation_group_id,
                 stream_ctx.provisional_statuses.presentation_group_id,
-                turn_id,
+                coordinator.turn_id,
                 step_ctx.step_id,
                 .{
                     .has_visible_tool_calls = step_has_visible_tool_calls,
@@ -8951,7 +8952,7 @@ fn processQueuedPromptLoop(
             "agent",
             "step completion step={d} content_bytes={d} tool_calls={d} finish_reason={s}",
             .{
-                step + 1,
+                coordinator.step + 1,
                 if (completion.content) |content| content.len else 0,
                 completion.tool_calls.len,
                 finish_reason.label(),
@@ -8982,12 +8983,12 @@ fn processQueuedPromptLoop(
                 finish_reason.label(),
                 completion.tool_calls.len,
             });
-            if (agent_steps.allowsStep(config.agent_step_limit, step + 1) and
+            if (agent_steps.allowsStep(coordinator.step_limit, coordinator.step + 1) and
                 try append_pending_steering_after_assistant(
                     deps,
                     arena,
                     &within_turn_suffix,
-                    turn_id,
+                    coordinator.turn_id,
                     assistant_text,
                     provider_replay,
                     config.origin,
@@ -9071,12 +9072,12 @@ fn processQueuedPromptLoop(
             const history_text = try arena.dupe(u8, raw_final);
             const history_replay = if (has_content) final_provider_replay else try deps.agent_stream_provider.projectReplay(arena, final_provider_replay, &.{}, false, true);
 
-            if (agent_steps.allowsStep(config.agent_step_limit, step + 1) and
+            if (agent_steps.allowsStep(coordinator.step_limit, coordinator.step + 1) and
                 try append_pending_steering_after_assistant(
                     deps,
                     arena,
                     &within_turn_suffix,
-                    turn_id,
+                    coordinator.turn_id,
                     history_text,
                     history_replay,
                     config.origin,
@@ -9087,8 +9088,8 @@ fn processQueuedPromptLoop(
                 continue;
             }
 
-            if (disposition == .completed and agent_steps.allowsStep(config.agent_step_limit, step + 1) and
-                try continue_pending_subagent(deps, arena, &within_turn_suffix, turn_id, step_ctx.step_id, history_text, history_replay)) continue;
+            if (disposition == .completed and agent_steps.allowsStep(coordinator.step_limit, coordinator.step + 1) and
+                try continue_pending_subagent(deps, arena, &within_turn_suffix, coordinator.turn_id, step_ctx.step_id, history_text, history_replay)) continue;
 
             if (!lifecycle.view.hasStop() or stop_state.dispatched) {
                 if (!has_content) {
@@ -9138,13 +9139,13 @@ fn processQueuedPromptLoop(
 
             var stop_outcome = runtime_lifecycle.dispatchStopCheckpoint(
                 lifecycle,
-                config.cancel_flag,
+                coordinator.cancel_flag,
                 .{
-                    .turn_id = turn_id,
+                    .turn_id = coordinator.turn_id,
                     .step_index = current_step_index,
                     .assistant_text = rendered,
                     .provider_disposition = disposition,
-                    .can_continue = agent_steps.allowsStep(config.agent_step_limit, step + 1),
+                    .can_continue = agent_steps.allowsStep(coordinator.step_limit, coordinator.step + 1),
                 },
             ) catch |err| switch (err) {
                 error.Cancelled => {
@@ -9152,7 +9153,7 @@ fn processQueuedPromptLoop(
                         deps,
                         arena,
                         &within_turn_suffix,
-                        turn_id,
+                        coordinator.turn_id,
                         "",
                     )) {
                         stop_state.retained_candidate = null;
@@ -9274,12 +9275,12 @@ fn processQueuedPromptLoop(
             prepared_tool_calls[tool_call_index] = runtime_lifecycle.prepareToolCallForLifecycle(
                 arena,
                 lifecycle,
-                config.cancel_flag,
-                turn_id,
+                coordinator.cancel_flag,
+                coordinator.turn_id,
                 current_step_index,
                 tool_call,
             ) catch |err| {
-                if (err == error.Cancelled and config.cancel_flag.load(.seq_cst)) {
+                if (err == error.Cancelled and coordinator.cancel_flag.load(.seq_cst)) {
                     runtime_telemetry.traceCancelObserved(step_ctx, true);
                     try finishPreparedCallsOnCancellation(
                         deps,
@@ -9287,7 +9288,7 @@ fn processQueuedPromptLoop(
                         stream_ctx.alloc,
                         arena,
                         config,
-                        turn_id,
+                        coordinator.turn_id,
                         prepared_tool_calls[0..tool_call_index],
                         &.{},
                         advertised_dynamic_tool_names,
@@ -9298,7 +9299,7 @@ fn processQueuedPromptLoop(
                         stream_ctx.alloc,
                         arena,
                         config,
-                        turn_id,
+                        coordinator.turn_id,
                         completion.tool_calls[tool_call_index..],
                         advertised_dynamic_tool_names,
                     );
@@ -9346,7 +9347,7 @@ fn processQueuedPromptLoop(
                 deps,
                 &stream_ctx.provisional_statuses,
                 stream_ctx.alloc,
-                turn_id,
+                coordinator.turn_id,
                 effective_tool_calls,
                 advertised_dynamic_tool_names,
                 err,
@@ -9368,7 +9369,7 @@ fn processQueuedPromptLoop(
                     .workspace_root = config.workspace_root,
                     .access_scope = config.access_scope,
                     .advertised_dynamic_tool_names = advertised_dynamic_tool_names,
-                    .cancel_flag = config.cancel_flag,
+                    .cancel_flag = coordinator.cancel_flag,
                     .classifiers = .{
                         .ctx = @ptrCast(&classifier_ctx),
                         .idempotent = prepareNoIdempotentTerminal,
@@ -9377,7 +9378,7 @@ fn processQueuedPromptLoop(
                         .deferred_dynamic = prepareDeferredDynamicCandidate,
                     },
                 }) catch |err| {
-                    if (err == error.Cancelled and config.cancel_flag.load(.seq_cst)) {
+                    if (err == error.Cancelled and coordinator.cancel_flag.load(.seq_cst)) {
                         runtime_telemetry.traceCancelObserved(step_ctx, true);
                         try finishPreparedCallsOnCancellation(
                             deps,
@@ -9385,7 +9386,7 @@ fn processQueuedPromptLoop(
                             stream_ctx.alloc,
                             arena,
                             config,
-                            turn_id,
+                            coordinator.turn_id,
                             prepared_tool_calls,
                             preparation_batch.preparations,
                             advertised_dynamic_tool_names,
@@ -9410,7 +9411,7 @@ fn processQueuedPromptLoop(
                         deps,
                         &stream_ctx.provisional_statuses,
                         stream_ctx.alloc,
-                        turn_id,
+                        coordinator.turn_id,
                         effective_tool_calls,
                         advertised_dynamic_tool_names,
                         err,
@@ -9424,7 +9425,7 @@ fn processQueuedPromptLoop(
                 deps,
                 &stream_ctx.provisional_statuses,
                 stream_ctx.alloc,
-                turn_id,
+                coordinator.turn_id,
                 effective_tool_calls,
                 advertised_dynamic_tool_names,
                 err,
@@ -9447,7 +9448,7 @@ fn processQueuedPromptLoop(
                     deps,
                     &stream_ctx.provisional_statuses,
                     stream_ctx.alloc,
-                    turn_id,
+                    coordinator.turn_id,
                     effective_tool_calls,
                     advertised_dynamic_tool_names,
                     err,
@@ -9467,7 +9468,7 @@ fn processQueuedPromptLoop(
                             context_deferred_calls[0] = preparation == .candidate;
                         }
                     }
-                } else if (!config.cancel_flag.load(.seq_cst)) context_probes: {
+                } else if (!coordinator.cancel_flag.load(.seq_cst)) context_probes: {
                     for (preparation_batch.preparations, effective_tool_calls, 0..) |maybe_preparation, tool_call, index| {
                         if (runtime_parallel_execution.isReadOnlyCall(
                             deps.tool_registry,
@@ -9485,23 +9486,23 @@ fn processQueuedPromptLoop(
                             &context_delivery_state,
                             candidate,
                         ) catch |err| {
-                            if (config.cancel_flag.load(.seq_cst)) break :context_probes;
+                            if (coordinator.cancel_flag.load(.seq_cst)) break :context_probes;
                             return settleFailedContextGate(
                                 deps,
                                 &stream_ctx.provisional_statuses,
                                 stream_ctx.alloc,
-                                turn_id,
+                                coordinator.turn_id,
                                 effective_tool_calls,
                                 advertised_dynamic_tool_names,
                                 err,
                             );
                         };
-                        if (config.cancel_flag.load(.seq_cst)) break :context_probes;
+                        if (coordinator.cancel_flag.load(.seq_cst)) break :context_probes;
                     }
                 }
             }
 
-            if (config.cancel_flag.load(.seq_cst)) {
+            if (coordinator.cancel_flag.load(.seq_cst)) {
                 var cancelled_call: ?ToolCall = null;
                 find_scoped_candidate: for (preparation_batch.preparations, effective_tool_calls) |maybe_preparation, tool_call| {
                     const preparation = maybe_preparation orelse continue;
@@ -9522,7 +9523,7 @@ fn processQueuedPromptLoop(
                     stream_ctx.alloc,
                     arena,
                     config,
-                    turn_id,
+                    coordinator.turn_id,
                     prepared_tool_calls,
                     preparation_batch.preparations,
                     advertised_dynamic_tool_names,
@@ -9554,7 +9555,7 @@ fn processQueuedPromptLoop(
                     deps,
                     &stream_ctx.provisional_statuses,
                     stream_ctx.alloc,
-                    turn_id,
+                    coordinator.turn_id,
                     effective_tool_calls,
                     advertised_dynamic_tool_names,
                     err,
@@ -9636,7 +9637,7 @@ fn processQueuedPromptLoop(
                         deps,
                         &stream_ctx.provisional_statuses,
                         stream_ctx.alloc,
-                        turn_id,
+                        coordinator.turn_id,
                         effective_tool_calls[tool_call_index..],
                         advertised_dynamic_tool_names,
                         err,
@@ -9678,7 +9679,7 @@ fn processQueuedPromptLoop(
                         .provider_executed => unreachable,
                         .ready => {},
                     }
-                    if (config.cancel_flag.load(.seq_cst)) {
+                    if (coordinator.cancel_flag.load(.seq_cst)) {
                         runtime_telemetry.traceCancelObserved(step_ctx, true);
                         try finishPendingParallelCancelled(
                             deps,
@@ -9686,7 +9687,7 @@ fn processQueuedPromptLoop(
                             stream_ctx.alloc,
                             arena,
                             config,
-                            turn_id,
+                            coordinator.turn_id,
                             parallel_calls,
                             precomputed_results,
                             parallel_status_started,
@@ -9739,7 +9740,7 @@ fn processQueuedPromptLoop(
                 for (parallel_calls, precomputed_results, 0..) |unbound_call, precomputed, group_index| {
                     if (precomputed != null) continue;
                     var parallel_call = unbound_call;
-                    if (config.cancel_flag.load(.seq_cst)) {
+                    if (coordinator.cancel_flag.load(.seq_cst)) {
                         runtime_telemetry.traceCancelObserved(step_ctx, true);
                         try finishPendingParallelCancelled(
                             deps,
@@ -9747,7 +9748,7 @@ fn processQueuedPromptLoop(
                             stream_ctx.alloc,
                             arena,
                             config,
-                            turn_id,
+                            coordinator.turn_id,
                             parallel_calls,
                             precomputed_results,
                             parallel_status_started,
@@ -9760,7 +9761,7 @@ fn processQueuedPromptLoop(
                         return;
                     }
                     parallel_skill_preparations[group_index] = prepareSkillCall(deps, arena, parallel_call, if (skills.catalog) |catalog| &catalog.locations else null) catch |err| {
-                        if (err != error.Cancelled or !config.cancel_flag.load(.seq_cst)) return err;
+                        if (err != error.Cancelled or !coordinator.cancel_flag.load(.seq_cst)) return err;
                         runtime_telemetry.traceCancelObserved(step_ctx, true);
                         try finishPendingParallelCancelled(
                             deps,
@@ -9768,7 +9769,7 @@ fn processQueuedPromptLoop(
                             stream_ctx.alloc,
                             arena,
                             config,
-                            turn_id,
+                            coordinator.turn_id,
                             parallel_calls,
                             precomputed_results,
                             parallel_status_started,
@@ -9791,7 +9792,7 @@ fn processQueuedPromptLoop(
                         },
                     };
                     if (!runtime_tool_admission.deferVisibleLifecycleUntilAfterPermission(parallel_call.name)) {
-                        parallel_status_started[group_index] = try runtime_tool_presentation.startToolVisibleLifecycle(deps, arena, turn_id, stream_ctx.provisional_statuses.presentation_group_id, parallel_call, null, advertised_dynamic_tool_names);
+                        parallel_status_started[group_index] = try runtime_tool_presentation.startToolVisibleLifecycle(deps, arena, coordinator.turn_id, stream_ctx.provisional_statuses.presentation_group_id, parallel_call, null, advertised_dynamic_tool_names);
                     }
 
                     const parallel_preserved_review_hold = if (root_action_permission_mode == .auto)
@@ -9823,10 +9824,10 @@ fn processQueuedPromptLoop(
                         outcome
                     else
                         runtime_tool_admission.requestToolPermissionTraced(deps, arena, parallel_call, parallel_review_context, root_action_permission_mode, local_grants.items, null, null, advertised_dynamic_tool_names, advertised_dynamic_tools, config.workspace_root, step_ctx) catch |err| blk: {
-                            if (err != error.Cancelled or !config.cancel_flag.load(.seq_cst)) return err;
+                            if (err != error.Cancelled or !coordinator.cancel_flag.load(.seq_cst)) return err;
                             break :blk null;
                         };
-                    if (maybe_parallel_permission == null or config.cancel_flag.load(.seq_cst)) {
+                    if (maybe_parallel_permission == null or coordinator.cancel_flag.load(.seq_cst)) {
                         runtime_telemetry.traceCancelObserved(step_ctx, true);
                         try finishPendingParallelCancelled(
                             deps,
@@ -9834,7 +9835,7 @@ fn processQueuedPromptLoop(
                             stream_ctx.alloc,
                             arena,
                             config,
-                            turn_id,
+                            coordinator.turn_id,
                             parallel_calls,
                             precomputed_results,
                             parallel_status_started,
@@ -9876,7 +9877,7 @@ fn processQueuedPromptLoop(
                             deps,
                             stream_ctx.alloc,
                             arena,
-                            turn_id,
+                            coordinator.turn_id,
                             parallel_call,
                             parallel_status_started[group_index],
                             null,
@@ -9899,7 +9900,7 @@ fn processQueuedPromptLoop(
                     }
 
                     if (!parallel_status_started[group_index]) {
-                        parallel_status_started[group_index] = try runtime_tool_presentation.startToolVisibleLifecycle(deps, arena, turn_id, stream_ctx.provisional_statuses.presentation_group_id, parallel_call, null, advertised_dynamic_tool_names);
+                        parallel_status_started[group_index] = try runtime_tool_presentation.startToolVisibleLifecycle(deps, arena, coordinator.turn_id, stream_ctx.provisional_statuses.presentation_group_id, parallel_call, null, advertised_dynamic_tool_names);
                     }
                     const parallel_authority = permission_outcome.execution_authority orelse
                         return error.MissingToolExecutionAuthority;
@@ -9922,7 +9923,7 @@ fn processQueuedPromptLoop(
 
                 var parallel_run: ?runtime_parallel_execution.ParallelRunResult = null;
                 if (executable_calls.items.len > 0) {
-                    if (config.cancel_flag.load(.seq_cst)) {
+                    if (coordinator.cancel_flag.load(.seq_cst)) {
                         runtime_telemetry.traceCancelObserved(step_ctx, true);
                         try finishPendingParallelCancelled(
                             deps,
@@ -9930,7 +9931,7 @@ fn processQueuedPromptLoop(
                             stream_ctx.alloc,
                             arena,
                             config,
-                            turn_id,
+                            coordinator.turn_id,
                             parallel_calls,
                             precomputed_results,
                             parallel_status_started,
@@ -9993,7 +9994,7 @@ fn processQueuedPromptLoop(
                     var parallel_exec_ctx = runtime_parallel_execution.ParallelHookExecContext{
                         .skill_locations = if (skills.catalog) |catalog| &catalog.locations else null,
                         .hooks = deps,
-                        .turn_id = turn_id,
+                        .turn_id = coordinator.turn_id,
                         .root_user_intent_context = parallel_execution_root_user_context,
                         .current_turn_messages = within_turn_suffix.items,
                         .session_grants = local_grants.items,
@@ -10004,7 +10005,7 @@ fn processQueuedPromptLoop(
                     };
                     var completion_publisher = ParallelSubagentCompletionPublisher{
                         .deps = deps,
-                        .turn_id = turn_id,
+                        .turn_id = coordinator.turn_id,
                         .advertised_dynamic_tool_names = advertised_dynamic_tool_names,
                         .step_ctx = step_ctx,
                     };
@@ -10018,7 +10019,7 @@ fn processQueuedPromptLoop(
                             .execute = runtime_parallel_execution.parallelHookExecute,
                             .format_ctx = &parallel_exec_ctx,
                             .format_error = runtime_parallel_execution.parallelHookFormatError,
-                            .cancel_flag = config.cancel_flag,
+                            .cancel_flag = coordinator.cancel_flag,
                             .attempt_observer = attempt_observer,
                         });
                     } else {
@@ -10027,7 +10028,7 @@ fn processQueuedPromptLoop(
                             .execute = runtime_parallel_execution.parallelHookExecute,
                             .format_ctx = &parallel_exec_ctx,
                             .format_error = runtime_parallel_execution.parallelHookFormatError,
-                            .cancel_flag = config.cancel_flag,
+                            .cancel_flag = coordinator.cancel_flag,
                             .attempt_observer = attempt_observer,
                         });
                     }
@@ -10076,7 +10077,7 @@ fn processQueuedPromptLoop(
                     if (parallel_run) |run| run.attempts else &.{},
                     admitted_status_started,
                     parallel_status_terminalized,
-                    turn_id,
+                    coordinator.turn_id,
                     advertised_dynamic_tool_names,
                     step_ctx,
                 );
@@ -10090,7 +10091,7 @@ fn processQueuedPromptLoop(
                         if (parallel_run) |run| run.attempts.len else 0,
                     },
                 );
-                if (config.cancel_flag.load(.seq_cst)) {
+                if (coordinator.cancel_flag.load(.seq_cst)) {
                     runtime_telemetry.traceCancelObserved(step_ctx, true);
                     try runtime_tool_batch.drainPendingUserSuffix(arena, &step_batch, &within_turn_suffix);
                     try runtime_interruption.persistInterruptedTurnOnce(deps, finalization, job, partial_assistant, cancelled_call, completed_tool_names.items, &interrupted_persisted, step_ctx, within_turn_suffix.items, stop_state.retained_candidate, &stop_state.terminal_materializing);
@@ -10156,7 +10157,7 @@ fn processQueuedPromptLoop(
                             deps,
                             stream_ctx.alloc,
                             arena,
-                            turn_id,
+                            coordinator.turn_id,
                             tool_call,
                             false,
                             tool_display_target,
@@ -10204,7 +10205,7 @@ fn processQueuedPromptLoop(
             if (tool_call.argument_integrity != .valid) {
                 unreachable;
             }
-            if (config.cancel_flag.load(.seq_cst)) {
+            if (coordinator.cancel_flag.load(.seq_cst)) {
                 runtime_telemetry.traceCancelObserved(step_ctx, true);
                 try finishPendingCancelledCalls(
                     deps,
@@ -10212,7 +10213,7 @@ fn processQueuedPromptLoop(
                     stream_ctx.alloc,
                     arena,
                     config,
-                    turn_id,
+                    coordinator.turn_id,
                     effective_tool_calls[tool_call_index..],
                     advertised_dynamic_tool_names,
                 );
@@ -10227,7 +10228,7 @@ fn processQueuedPromptLoop(
                     &stream_ctx,
                     arena,
                     config,
-                    turn_id,
+                    coordinator.turn_id,
                     tool_call,
                     advertised_dynamic_tool_names,
                     step_ctx,
@@ -10245,7 +10246,7 @@ fn processQueuedPromptLoop(
                             &stream_ctx.provisional_statuses,
                             stream_ctx.alloc,
                             arena,
-                            turn_id,
+                            coordinator.turn_id,
                             tool_call,
                             advertised_dynamic_tool_names,
                             step_ctx,
@@ -10283,7 +10284,7 @@ fn processQueuedPromptLoop(
                                     deps,
                                     stream_ctx.alloc,
                                     arena,
-                                    turn_id,
+                                    coordinator.turn_id,
                                     tool_call,
                                     false,
                                     tool_display_target,
@@ -10324,7 +10325,7 @@ fn processQueuedPromptLoop(
                                     deps,
                                     stream_ctx.alloc,
                                     arena,
-                                    turn_id,
+                                    coordinator.turn_id,
                                     tool_call,
                                     false,
                                     tool_display_target,
@@ -10356,7 +10357,7 @@ fn processQueuedPromptLoop(
                                 const status_started = try runtime_tool_presentation.startToolVisibleLifecycle(
                                     deps,
                                     arena,
-                                    turn_id,
+                                    coordinator.turn_id,
                                     stream_ctx.provisional_statuses.presentation_group_id,
                                     tool_call,
                                     tool_display_target,
@@ -10371,7 +10372,7 @@ fn processQueuedPromptLoop(
                                     deps,
                                     stream_ctx.alloc,
                                     arena,
-                                    turn_id,
+                                    coordinator.turn_id,
                                     tool_call,
                                     status_started,
                                     tool_display_target,
@@ -10408,7 +10409,7 @@ fn processQueuedPromptLoop(
                                     deps,
                                     stream_ctx.alloc,
                                     arena,
-                                    turn_id,
+                                    coordinator.turn_id,
                                     tool_call,
                                     false,
                                     tool_display_target,
@@ -10485,7 +10486,7 @@ fn processQueuedPromptLoop(
                         deps,
                         stream_ctx.alloc,
                         arena,
-                        turn_id,
+                        coordinator.turn_id,
                         tool_call,
                         false,
                         tool_display_target,
@@ -10522,7 +10523,7 @@ fn processQueuedPromptLoop(
                         deps,
                         stream_ctx.alloc,
                         arena,
-                        turn_id,
+                        coordinator.turn_id,
                         tool_call,
                         false,
                         tool_display_target,
@@ -10554,7 +10555,7 @@ fn processQueuedPromptLoop(
                 }
             }
             var skill_preparation = prepareSkillCall(deps, arena, tool_call, if (skills.catalog) |catalog| &catalog.locations else null) catch |err| {
-                if (err != error.Cancelled or !config.cancel_flag.load(.seq_cst)) return err;
+                if (err != error.Cancelled or !coordinator.cancel_flag.load(.seq_cst)) return err;
                 runtime_telemetry.traceCancelObserved(step_ctx, true);
                 try finishPendingCancelledCalls(
                     deps,
@@ -10562,7 +10563,7 @@ fn processQueuedPromptLoop(
                     stream_ctx.alloc,
                     arena,
                     config,
-                    turn_id,
+                    coordinator.turn_id,
                     effective_tool_calls[tool_call_index..],
                     advertised_dynamic_tool_names,
                 );
@@ -10582,7 +10583,7 @@ fn processQueuedPromptLoop(
                             deps,
                             stream_ctx.alloc,
                             arena,
-                            turn_id,
+                            coordinator.turn_id,
                             tool_call,
                             false,
                             tool_display_target,
@@ -10633,7 +10634,7 @@ fn processQueuedPromptLoop(
                         deps,
                         &stream_ctx.provisional_statuses,
                         stream_ctx.alloc,
-                        turn_id,
+                        coordinator.turn_id,
                         effective_tool_calls[tool_call_index..],
                         advertised_dynamic_tool_names,
                         err,
@@ -10667,7 +10668,7 @@ fn processQueuedPromptLoop(
                         deps,
                         &stream_ctx.provisional_statuses,
                         stream_ctx.alloc,
-                        turn_id,
+                        coordinator.turn_id,
                         effective_tool_calls[tool_call_index..],
                         advertised_dynamic_tool_names,
                         err,
@@ -10681,7 +10682,7 @@ fn processQueuedPromptLoop(
                     &stream_ctx.provisional_statuses,
                     stream_ctx.alloc,
                     arena,
-                    turn_id,
+                    coordinator.turn_id,
                     tool_call,
                     advertised_dynamic_tool_names,
                     step_ctx,
@@ -10744,7 +10745,7 @@ fn processQueuedPromptLoop(
                         &stream_ctx.provisional_statuses,
                         stream_ctx.alloc,
                         arena,
-                        turn_id,
+                        coordinator.turn_id,
                         tool_call,
                         advertised_dynamic_tool_names,
                         step_ctx,
@@ -10780,7 +10781,7 @@ fn processQueuedPromptLoop(
             if (!runtime_tool_admission.deferVisibleLifecycleUntilAfterPermission(tool_call.name) and
                 !defer_auto_command_lifecycle)
             {
-                status_started = try runtime_tool_presentation.startToolVisibleLifecycle(deps, arena, turn_id, stream_ctx.provisional_statuses.presentation_group_id, tool_call, tool_display_target, advertised_dynamic_tool_names);
+                status_started = try runtime_tool_presentation.startToolVisibleLifecycle(deps, arena, coordinator.turn_id, stream_ctx.provisional_statuses.presentation_group_id, tool_call, tool_display_target, advertised_dynamic_tool_names);
             }
 
             var file_call_arena_state: std.heap.ArenaAllocator = undefined;
@@ -10871,16 +10872,16 @@ fn processQueuedPromptLoop(
                         config.workspace_root,
                         step_ctx,
                     )) catch |err| blk: {
-                    if (err != error.Cancelled or !config.cancel_flag.load(.seq_cst)) return err;
+                    if (err != error.Cancelled or !coordinator.cancel_flag.load(.seq_cst)) return err;
                     break :blk null;
                 };
-            if (maybe_permission == null or config.cancel_flag.load(.seq_cst)) {
+            if (maybe_permission == null or coordinator.cancel_flag.load(.seq_cst)) {
                 runtime_telemetry.traceCancelObserved(step_ctx, true);
                 if (!status_started and (is_file_mutation or defer_auto_command_lifecycle)) {
                     status_started = try runtime_tool_presentation.startToolVisibleLifecycle(
                         deps,
                         call_allocator,
-                        turn_id,
+                        coordinator.turn_id,
                         stream_ctx.provisional_statuses.presentation_group_id,
                         execution_call,
                         tool_display_target,
@@ -10891,7 +10892,7 @@ fn processQueuedPromptLoop(
                     deps,
                     stream_ctx.alloc,
                     call_allocator,
-                    turn_id,
+                    coordinator.turn_id,
                     execution_call,
                     status_started,
                     tool_display_target,
@@ -10904,7 +10905,7 @@ fn processQueuedPromptLoop(
                     stream_ctx.alloc,
                     arena,
                     config,
-                    turn_id,
+                    coordinator.turn_id,
                     effective_tool_calls[tool_call_index + 1 ..],
                     advertised_dynamic_tool_names,
                 );
@@ -10969,16 +10970,16 @@ fn processQueuedPromptLoop(
                     config.workspace_root,
                     step_ctx,
                 ) catch |err| blk: {
-                    if (err != error.Cancelled or !config.cancel_flag.load(.seq_cst)) return err;
+                    if (err != error.Cancelled or !coordinator.cancel_flag.load(.seq_cst)) return err;
                     break :blk null;
                 };
-                if (maybe_revalidated == null or config.cancel_flag.load(.seq_cst)) {
+                if (maybe_revalidated == null or coordinator.cancel_flag.load(.seq_cst)) {
                     runtime_telemetry.traceCancelObserved(step_ctx, true);
                     if (!status_started and (is_file_mutation or defer_auto_command_lifecycle)) {
                         status_started = try runtime_tool_presentation.startToolVisibleLifecycle(
                             deps,
                             call_allocator,
-                            turn_id,
+                            coordinator.turn_id,
                             null,
                             execution_call,
                             tool_display_target,
@@ -10988,7 +10989,7 @@ fn processQueuedPromptLoop(
                     try runtime_tool_presentation.finishDeniedToolStatus(
                         deps,
                         call_allocator,
-                        turn_id,
+                        coordinator.turn_id,
                         execution_call,
                         status_started,
                         tool_display_target,
@@ -11017,7 +11018,7 @@ fn processQueuedPromptLoop(
                     status_started = try runtime_tool_presentation.startToolVisibleLifecycle(
                         deps,
                         call_allocator,
-                        turn_id,
+                        coordinator.turn_id,
                         stream_ctx.provisional_statuses.presentation_group_id,
                         execution_call,
                         tool_display_target,
@@ -11040,7 +11041,7 @@ fn processQueuedPromptLoop(
                     deps,
                     stream_ctx.alloc,
                     call_allocator,
-                    turn_id,
+                    coordinator.turn_id,
                     execution_call,
                     status_started,
                     tool_display_target,
@@ -11106,7 +11107,7 @@ fn processQueuedPromptLoop(
                     status_started = try runtime_tool_presentation.startToolVisibleLifecycle(
                         deps,
                         call_allocator,
-                        turn_id,
+                        coordinator.turn_id,
                         stream_ctx.provisional_statuses.presentation_group_id,
                         execution_call,
                         tool_display_target,
@@ -11117,7 +11118,7 @@ fn processQueuedPromptLoop(
                     deps,
                     stream_ctx.alloc,
                     call_allocator,
-                    turn_id,
+                    coordinator.turn_id,
                     execution_call,
                     status_started,
                     tool_display_target,
@@ -11209,7 +11210,7 @@ fn processQueuedPromptLoop(
                 status_started = try runtime_tool_presentation.startToolVisibleLifecycle(
                     deps,
                     call_allocator,
-                    turn_id,
+                    coordinator.turn_id,
                     stream_ctx.provisional_statuses.presentation_group_id,
                     execution_call,
                     tool_display_target,
@@ -11267,13 +11268,13 @@ fn processQueuedPromptLoop(
                 }
             }
 
-            if (config.cancel_flag.load(.seq_cst)) {
+            if (coordinator.cancel_flag.load(.seq_cst)) {
                 runtime_telemetry.traceCancelObserved(step_ctx, true);
                 _ = try stream_ctx.provisional_statuses.finishDeniedCall(
                     deps,
                     stream_ctx.alloc,
                     call_allocator,
-                    turn_id,
+                    coordinator.turn_id,
                     execution_call,
                     status_started,
                     tool_display_target,
@@ -11286,7 +11287,7 @@ fn processQueuedPromptLoop(
                     stream_ctx.alloc,
                     arena,
                     config,
-                    turn_id,
+                    coordinator.turn_id,
                     effective_tool_calls[tool_call_index + 1 ..],
                     advertised_dynamic_tool_names,
                 );
@@ -11323,7 +11324,7 @@ fn processQueuedPromptLoop(
                     );
                 };
             }
-            const execution_lifecycle_id = types.ToolLifecycleId{ .turn_id = turn_id, .call_id = execution_call.id };
+            const execution_lifecycle_id = types.ToolLifecycleId{ .turn_id = coordinator.turn_id, .call_id = execution_call.id };
             const execution_is_command = runtime_tool_presentation.activityKindForCall(arena, deps.tool_registry, tool_call) == .command;
             var execution_error: ?anyerror = null;
             var execution = deps.execute_tool_call(deps.ctx, .{
@@ -11357,7 +11358,7 @@ fn processQueuedPromptLoop(
                 .lifecycle_id = execution_lifecycle_id,
             }) catch |err| blk: {
                 if (err == error.OutOfMemory) return error.OutOfMemory;
-                if (err == error.Cancelled and config.cancel_flag.load(.seq_cst)) {
+                if (err == error.Cancelled and coordinator.cancel_flag.load(.seq_cst)) {
                     break :blk ToolExecutionResult{
                         .status = .failure,
                         .cancelled = true,
@@ -11372,7 +11373,7 @@ fn processQueuedPromptLoop(
                 execution.result_commit.?.cancel();
             };
 
-            if (execution.cancelled and config.cancel_flag.load(.seq_cst)) {
+            if (execution.cancelled and coordinator.cancel_flag.load(.seq_cst)) {
                 runtime_telemetry.traceCancelObserved(step_ctx, true);
                 if (execution.result_commit) |commit| {
                     try commit.commit();
@@ -11396,7 +11397,7 @@ fn processQueuedPromptLoop(
                     deps,
                     stream_ctx.alloc,
                     call_allocator,
-                    turn_id,
+                    coordinator.turn_id,
                     execution_call,
                     status_started,
                     tool_display_target,
@@ -11409,7 +11410,7 @@ fn processQueuedPromptLoop(
                     stream_ctx.alloc,
                     arena,
                     config,
-                    turn_id,
+                    coordinator.turn_id,
                     effective_tool_calls[tool_call_index + 1 ..],
                     advertised_dynamic_tool_names,
                 );
@@ -11509,7 +11510,7 @@ fn processQueuedPromptLoop(
                     status_started,
                     file_display_path,
                     is_file_mutation,
-                    turn_id,
+                    coordinator.turn_id,
                     advertised_dynamic_tool_names,
                     step_ctx,
                 );
@@ -11588,7 +11589,7 @@ fn processQueuedPromptLoop(
             try runtime_tool_presentation.finishExecutedToolStatus(
                 deps,
                 call_allocator,
-                turn_id,
+                coordinator.turn_id,
                 execution_call,
                 status_started,
                 tool_display_target,
@@ -11753,13 +11754,13 @@ fn processQueuedPromptLoop(
             &step_batch,
         );
         if (malformed_arguments_retry.finishBatch()) {
-            if (agent_steps.allowsStep(config.agent_step_limit, step + 1)) {
+            if (agent_steps.allowsStep(coordinator.step_limit, coordinator.step + 1)) {
                 const terminal_action = try observe_steering_boundary(
                     deps,
                     arena,
                     arena,
                     &within_turn_suffix,
-                    turn_id,
+                    coordinator.turn_id,
                     config.origin,
                     .finalizing,
                 );
@@ -11792,13 +11793,13 @@ fn processQueuedPromptLoop(
             return;
         }
         if (terminal_validation_retry.finishBatch()) {
-            if (agent_steps.allowsStep(config.agent_step_limit, step + 1)) {
+            if (agent_steps.allowsStep(coordinator.step_limit, coordinator.step + 1)) {
                 const terminal_action = try observe_steering_boundary(
                     deps,
                     arena,
                     arena,
                     &within_turn_suffix,
-                    turn_id,
+                    coordinator.turn_id,
                     config.origin,
                     .finalizing,
                 );
@@ -11837,13 +11838,13 @@ fn processQueuedPromptLoop(
             return;
         }
         if (shell_execution_failure_retry.finishBatch()) {
-            if (agent_steps.allowsStep(config.agent_step_limit, step + 1)) {
+            if (agent_steps.allowsStep(coordinator.step_limit, coordinator.step + 1)) {
                 const terminal_action = try observe_steering_boundary(
                     deps,
                     arena,
                     arena,
                     &within_turn_suffix,
-                    turn_id,
+                    coordinator.turn_id,
                     config.origin,
                     .finalizing,
                 );
@@ -11878,12 +11879,12 @@ fn processQueuedPromptLoop(
             const final_text = try runtime_assistant_stream.normalizeAssistantTextForDisplay(arena, raw_final);
             const rendered = if (final_text.len > 0) final_text else "Done.";
 
-            if (agent_steps.allowsStep(config.agent_step_limit, step + 1) and
+            if (agent_steps.allowsStep(coordinator.step_limit, coordinator.step + 1) and
                 try append_pending_steering_after_assistant(
                     deps,
                     arena,
                     &within_turn_suffix,
-                    turn_id,
+                    coordinator.turn_id,
                     raw_final,
                     final_provider_replay,
                     config.origin,
@@ -11894,8 +11895,8 @@ fn processQueuedPromptLoop(
                 continue;
             }
 
-            if (agent_steps.allowsStep(config.agent_step_limit, step + 1) and
-                try continue_pending_subagent(deps, arena, &within_turn_suffix, turn_id, step_ctx.step_id, raw_final, final_provider_replay)) continue;
+            if (agent_steps.allowsStep(coordinator.step_limit, coordinator.step + 1) and
+                try continue_pending_subagent(deps, arena, &within_turn_suffix, coordinator.turn_id, step_ctx.step_id, raw_final, final_provider_replay)) continue;
 
             if (!lifecycle.view.hasStop() or stop_state.dispatched) {
                 try deps.push_text(deps.ctx, .{ .assistant_rendered = "\n" });
@@ -11938,13 +11939,13 @@ fn processQueuedPromptLoop(
 
             var stop_outcome = runtime_lifecycle.dispatchStopCheckpoint(
                 lifecycle,
-                config.cancel_flag,
+                coordinator.cancel_flag,
                 .{
-                    .turn_id = turn_id,
+                    .turn_id = coordinator.turn_id,
                     .step_index = current_step_index,
                     .assistant_text = rendered,
                     .provider_disposition = disposition,
-                    .can_continue = agent_steps.allowsStep(config.agent_step_limit, step + 1),
+                    .can_continue = agent_steps.allowsStep(coordinator.step_limit, coordinator.step + 1),
                 },
             ) catch |err| switch (err) {
                 error.Cancelled => {
@@ -12006,7 +12007,7 @@ fn processQueuedPromptLoop(
     runtime_telemetry.traceStepLimitReached(.{
         .ctx = last_step_ctx,
         .step_index = current_step_index,
-        .step_limit = config.agent_step_limit,
+        .step_limit = coordinator.step_limit,
         .gateway_message_count = last_gateway_message_count,
         .completed_tool_names = completed_tool_names.items,
         .last_tool_call_name = last_tool_call_name,
