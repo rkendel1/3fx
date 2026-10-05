@@ -911,26 +911,7 @@ pub fn handlePrompt(
         try session.session_rt.snapshotImageCatalog(alloc, current_images);
     defer if (recovery_checkpoint == null) types.freeImageAttachmentSlice(alloc, authorized_image_catalog);
 
-    const job: worker_runtime.CompatibilityExecutionJob = .{
-        .turn_id = if (recovery_checkpoint) |checkpoint| checkpoint.turn_id else 0,
-        .prompt = @constCast(owned_prompt),
-        .images = @constCast(current_images),
-        .authorized_image_catalog = authorized_image_catalog,
-        .model = session.model,
-        .api_key = @constCast(session.api_key),
-        .credential_source = session.credential_source,
-        .account_id = if (session.account_id) |account_id| @constCast(account_id) else null,
-        .provider = session.provider,
-        .gateway_team = state.gateway_team,
-        .permission_mode = captured_permission_mode,
-        .history = context_history,
-        .unversioned_history_count = session.session_rt.unversionedHistoryEnd(),
-        .root_user_intent_context = root_user_intent_context,
-        .grants = session.session_grants,
-        .context_snapshot = context_snapshot,
-        .recovery_checkpoint = recovery_checkpoint,
-        .recovery_source_already_presented = recovery_checkpoint != null,
-    };
+    const job: worker_runtime.CompatibilityExecutionJob = try worker_runtime.admitSynchronousSubmission(alloc, .{ .turn_id = if (recovery_checkpoint) |checkpoint| checkpoint.turn_id else 0, .prompt = @constCast(owned_prompt) }, .{ .images = @constCast(current_images), .authorized_image_catalog = authorized_image_catalog, .model = session.model, .api_key = @constCast(session.api_key), .credential_source = session.credential_source, .account_id = if (session.account_id) |account_id| @constCast(account_id) else null, .provider = session.provider, .gateway_team = state.gateway_team, .permission_mode = captured_permission_mode, .history = context_history, .unversioned_history_count = session.session_rt.unversionedHistoryEnd(), .root_user_intent_context = root_user_intent_context, .grants = session.session_grants, .context_snapshot = context_snapshot, .recovery_checkpoint = recovery_checkpoint, .recovery_source_already_presented = recovery_checkpoint != null });
 
     session.session_rt.usage.configureCheckpointSink(
         if (session.writable != null or session.v2 != null)
