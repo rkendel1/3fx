@@ -3,13 +3,12 @@ const types = @import("../shared/types.zig");
 const model_provider = @import("./model_provider.zig");
 const stream_provider = @import("./stream_provider.zig");
 
-/// Prove that credentials are separable at the provider request boundary.
-/// The existing stream_provider.ModelRequest contains credentials via the
-/// `credential` field. This test demonstrates that the neutral execution data
-/// (messages, tools, deadlines, etc.) is entirely independent of credential state.
+// Prove that credentials are separable at the provider request boundary.
+// The existing stream_provider.ModelRequest contains credentials via the
+// `credential` field. This test demonstrates that the neutral execution data
+// (messages, tools, deadlines, etc.) is entirely independent of credential state.
 
 test "stream_provider.ModelRequest separates neutral execution data from credentials" {
-    const alloc = std.testing.allocator;
     var cancelled: std.atomic.Value(bool) = .init(false);
     var delivery: stream_provider.DeliveryCertainty = .init();
     var attempt: stream_provider.AttemptEvidence = .{};
@@ -20,7 +19,7 @@ test "stream_provider.ModelRequest separates neutral execution data from credent
     }.emit;
 
     // Construct a request with host credential
-    var request: stream_provider.ModelRequest = .{
+    const request: stream_provider.ModelRequest = .{
         .credential = .host_managed,
         .session_id = "session-123",
         .model = "test-model",
@@ -29,6 +28,7 @@ test "stream_provider.ModelRequest separates neutral execution data from credent
         .tool_choice = .auto,
         .provider_options = .{},
         .trace_ctx = .{},
+        .content_capture_limit = null,
         .delivery = &delivery,
         .attempt_evidence = &attempt,
         .events = .{ .context = &events_context, .emit_fn = fn_emit },
@@ -76,7 +76,6 @@ test "stream_provider.Result contains only neutral completion data, no credentia
 }
 
 test "credential injection happens at stream_provider.ModelRequest construction only" {
-    const alloc = std.testing.allocator;
     var cancelled: std.atomic.Value(bool) = .init(false);
     var delivery: stream_provider.DeliveryCertainty = .init();
     var attempt: stream_provider.AttemptEvidence = .{};
@@ -102,6 +101,7 @@ test "credential injection happens at stream_provider.ModelRequest construction 
         .tool_choice = .auto,
         .provider_options = .{},
         .trace_ctx = .{},
+        .content_capture_limit = null,
         .delivery = &delivery,
         .attempt_evidence = &attempt,
         .events = .{ .context = &events_context, .emit_fn = fn_emit },
