@@ -16,6 +16,7 @@ const provider_runtime = @import("provider_runtime.zig");
 const core_input_runtime = @import("../input/runtime.zig");
 const app_worker_runtime = @import("app_worker_runtime.zig");
 const app_session_runtime = @import("app_session_runtime.zig");
+const execution_compatibility = @import("execution_compatibility.zig");
 const runtime_profile = @import("../hosts/runtime_profile.zig");
 const change_tracker_mod = @import("../workspace/change_tracker.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
@@ -437,7 +438,7 @@ pub fn Bindings(comptime App: type) type {
             const worker_token = try alloc.dupe(u8, refreshed.token);
             errdefer secret.zeroAndFree(alloc, worker_token);
             try app_worker_runtime.Runtime(App).pushOwnedEvent(app, .{
-                .credential_refreshed = refreshed,
+                .credential_refreshed = execution_compatibility.projectedRefreshedCredential(refreshed),
             });
             owns_refreshed = false;
             return worker_token;
@@ -1549,10 +1550,19 @@ pub fn Bindings(comptime App: type) type {
 
         fn workerBridgeCredentialRefreshed(
             ctx: *anyopaque,
-            credential: credentials.Credential,
+            refreshed: worker_runtime.RefreshedCredential,
         ) !void {
             if (comptime !@hasField(App, "auth")) return;
             const app: *App = @ptrCast(@alignCast(ctx));
+            // Reconstruct the credentials.Credential from the event payload
+            var credential: credentials.Credential = .{
+                .token = refreshed.token,
+                .source = refreshed.source,
+                .account_id = refreshed.account_id,
+                .team_id = refreshed.team_id,
+                .team_slug = refreshed.team_slug,
+                .refresh_after_ms = refreshed.refresh_after_ms,
+            };
             var owned = try credential.clone(app.alloc);
             defer owned.deinit(app.alloc);
             if (app.auth.preparedCredentialChange(owned) == .authority) {

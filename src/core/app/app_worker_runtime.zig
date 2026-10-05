@@ -53,7 +53,7 @@ fn discardContextCompaction(_: *anyopaque, _: worker_runtime.ContextCompaction) 
 fn unavailableFreshPrompt(_: *anyopaque, _: worker_runtime.FreshPromptPreparation) !worker_runtime.FreshPromptHistory {
     return error.SessionPersistenceUnavailable;
 }
-fn discardCredentialRefresh(_: *anyopaque, _: credentials.Credential) !void {}
+fn discardCredentialRefresh(_: *anyopaque, _: worker_runtime.RefreshedCredential) !void {}
 
 /// A retained delivery owns its own payload; a settled delivery acknowledges history.
 pub const HistoryDelivery = union(enum) {
@@ -73,7 +73,7 @@ pub const WorkerEventHandlers = struct {
     drain_assistant_text: *const fn (*anyopaque) anyerror!AssistantTextDrainResult,
     open_model_picker: *const fn (*anyopaque) anyerror!void,
     semantic_notice: *const fn (*anyopaque, types.SemanticNotice) anyerror!void,
-    credential_refreshed: *const fn (*anyopaque, credentials.Credential) anyerror!void = discardCredentialRefresh,
+    credential_refreshed: *const fn (*anyopaque, worker_runtime.RefreshedCredential) anyerror!void = discardCredentialRefresh,
     command_output: *const fn (*anyopaque, ?types.ToolLifecycleId, command_output_content.Stream, []const u8) anyerror!void,
     command_output_complete: *const fn (*anyopaque, ?types.ToolLifecycleId) anyerror!void,
     diff_block: *const fn (*anyopaque, diff_mod.DiffEntryPayload) anyerror!void,
