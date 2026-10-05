@@ -1,3 +1,4 @@
+const ToolArgumentIntegrity = @import("../../tool_argument_integrity.zig").ToolArgumentIntegrity;
 const std = @import("std");
 const builtin = @import("builtin");
 const builtin_context = @import("../../../../builtins/context.zig");
@@ -1019,7 +1020,7 @@ test "processQueuedPrompt recovers malformed local arguments before tool semanti
     const execution = hooks.history_turns.items[0].assistant.execution;
     try std.testing.expectEqual(@as(usize, 1), execution.tool_steps.len);
     try std.testing.expectEqualStrings("{}", execution.tool_steps[0].tool_calls[0].arguments_json);
-    try std.testing.expectEqual(types.ToolArgumentIntegrity.valid, execution.tool_steps[0].tool_calls[0].argument_integrity);
+    try std.testing.expectEqual(ToolArgumentIntegrity.valid, execution.tool_steps[0].tool_calls[0].argument_integrity);
     try std.testing.expectEqual(@as(usize, 1), execution.tool_steps[0].tool_results.len);
     try std.testing.expectEqual(types.PersistedToolStatus.failure, execution.tool_steps[0].tool_results[0].status);
     try std.testing.expect(tool_result_errors.isToolExecutionFailedOutput(execution.tool_steps[0].tool_results[0].output));
@@ -1027,7 +1028,7 @@ test "processQueuedPrompt recovers malformed local arguments before tool semanti
 
 test "processQueuedPrompt settles rejected shell arguments without streamed activity" {
     const alloc = std.testing.allocator;
-    for ([_]types.ToolArgumentIntegrity{ .malformed_json, .non_object_json }) |integrity| {
+    for ([_]ToolArgumentIntegrity{ .malformed_json, .non_object_json }) |integrity| {
         const calls = [_]ToolCall{.{
             .id = "rejected_shell",
             .name = "shell",

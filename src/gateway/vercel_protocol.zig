@@ -1,3 +1,4 @@
+const ToolArgumentIntegrity = @import("../core/agent/tool_argument_integrity.zig").ToolArgumentIntegrity;
 const std = @import("std");
 const stream_provider = @import("../core/agent/stream_provider.zig");
 const image_attachments = @import("../core/images/image_attachments.zig");
@@ -560,9 +561,9 @@ fn validateAssistantToolCalls(alloc: std.mem.Allocator, calls: []const ToolCall)
     for (calls, 0..) |call, i| {
         if (call.id.len == 0 or call.name.len == 0 or call.arguments_json.len == 0) return error.InvalidGatewayHistory;
         const integrity = if (call.provenance == .provider_executed)
-            try types.ToolArgumentIntegrity.classifySerialized(alloc, call.arguments_json)
+            try ToolArgumentIntegrity.classifySerialized(alloc, call.arguments_json)
         else
-            try types.ToolArgumentIntegrity.classifyFunctionInput(alloc, call.arguments_json);
+            try ToolArgumentIntegrity.classifyFunctionInput(alloc, call.arguments_json);
         if (integrity != .valid) {
             return error.InvalidGatewayHistory;
         }
@@ -1170,7 +1171,7 @@ pub fn parseGatewayCompletion(alloc: std.mem.Allocator, body: []const u8) !Gatew
                 const name = fn_value.object.get("name") orelse continue;
                 const args = fn_value.object.get("arguments") orelse continue;
                 if (name != .string or args != .string) continue;
-                if (try types.ToolArgumentIntegrity.classifySerialized(alloc, args.string) == .malformed_json) {
+                if (try ToolArgumentIntegrity.classifySerialized(alloc, args.string) == .malformed_json) {
                     return error.InvalidGatewayResponse;
                 }
                 const id_copy = try alloc.dupe(u8, id.string);

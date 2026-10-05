@@ -1,3 +1,4 @@
+const ToolArgumentIntegrity = @import("../tool_argument_integrity.zig").ToolArgumentIntegrity;
 const std = @import("std");
 const skill_runtime = @import("../../skills/skill_runtime.zig");
 const skill_contract = @import("../../skills/skill_contract.zig");
@@ -1136,7 +1137,7 @@ test "rejected subagent arguments keep their call and result during projection" 
     };
     // Rewriting a malformed call into an assistant-role summary would leave
     // the next request ending in assistant prefill.
-    for ([_]types.ToolArgumentIntegrity{ .non_object_json, .malformed_json, .valid }) |integrity| {
+    for ([_]ToolArgumentIntegrity{ .non_object_json, .malformed_json, .valid }) |integrity| {
         calls[0].argument_integrity = integrity;
         const projected = try project_subagent_request_messages(
             alloc,

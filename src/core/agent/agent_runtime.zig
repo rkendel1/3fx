@@ -47,6 +47,7 @@ pub const classifyProviderExecutedResultStatus = runtime_execution_memory.classi
 pub const normalizeAssistantTextForDisplay = runtime_assistant_stream.normalizeAssistantTextForDisplay;
 
 test {
+    _ = @import("tool_argument_integrity.zig");
     _ = @import("tool_preparation_terminal_kind.zig");
     _ = @import("parallel_group_decision.zig");
     _ = @import("steering_decision.zig");

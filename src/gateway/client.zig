@@ -1,3 +1,4 @@
+const ToolArgumentIntegrity = @import("../core/agent/tool_argument_integrity.zig").ToolArgumentIntegrity;
 const std = @import("std");
 const builtin = @import("builtin");
 const build_options = @import("build_options");
@@ -2750,7 +2751,7 @@ const SseToolCallAccumulator = struct {
     name: std.ArrayList(u8),
     arguments: std.ArrayList(u8),
     provisional_id: std.ArrayList(u8) = .empty,
-    argument_integrity: types.ToolArgumentIntegrity = .valid,
+    argument_integrity: ToolArgumentIntegrity = .valid,
     argument_diagnostic: ?types.ToolArgumentDiagnostic = null,
     provider_result: ?[]u8 = null,
     provider_result_state: ProviderResultState = .none,
@@ -2928,7 +2929,7 @@ const FinalToolInputState = enum {
 };
 
 const ClassifiedToolArguments = struct {
-    integrity: types.ToolArgumentIntegrity,
+    integrity: ToolArgumentIntegrity,
     diagnostic: ?types.ToolArgumentDiagnostic = null,
 };
 
@@ -2940,7 +2941,7 @@ fn appendSerializedToolArguments(
     tool_name: []const u8,
     source: ToolArgumentSource,
 ) !ClassifiedToolArguments {
-    const integrity = try types.ToolArgumentIntegrity.classifySerialized(alloc, serialized);
+    const integrity = try ToolArgumentIntegrity.classifySerialized(alloc, serialized);
     if (integrity == .valid) {
         try destination.appendSlice(alloc, serialized);
         return .{ .integrity = .valid };
@@ -5171,7 +5172,7 @@ test "consumeSseStream serializes tool-call input that arrives as an array" {
     defer deinitGatewayCompletion(std.testing.allocator, &completion);
 
     try std.testing.expectEqualStrings("[1,{\"nested\":true}]", completion.tool_calls[0].arguments_json);
-    try std.testing.expectEqual(types.ToolArgumentIntegrity.valid, completion.tool_calls[0].argument_integrity);
+    try std.testing.expectEqual(ToolArgumentIntegrity.valid, completion.tool_calls[0].argument_integrity);
 }
 
 test "consumeSseStream preserves valid serialized final input bytes exactly" {
@@ -5190,7 +5191,7 @@ test "consumeSseStream preserves valid serialized final input bytes exactly" {
     defer deinitGatewayCompletion(std.testing.allocator, &completion);
 
     try std.testing.expectEqualStrings(expected, completion.tool_calls[0].arguments_json);
-    try std.testing.expectEqual(types.ToolArgumentIntegrity.valid, completion.tool_calls[0].argument_integrity);
+    try std.testing.expectEqual(ToolArgumentIntegrity.valid, completion.tool_calls[0].argument_integrity);
 }
 
 test "consumeSseStream preserves valid serialized scalar roots" {
@@ -5223,7 +5224,7 @@ test "consumeSseStream preserves valid serialized scalar roots" {
         defer deinitGatewayCompletion(std.testing.allocator, &completion);
 
         try std.testing.expectEqualStrings(input, completion.tool_calls[0].arguments_json);
-        try std.testing.expectEqual(types.ToolArgumentIntegrity.valid, completion.tool_calls[0].argument_integrity);
+        try std.testing.expectEqual(ToolArgumentIntegrity.valid, completion.tool_calls[0].argument_integrity);
     }
 }
 
@@ -5264,7 +5265,7 @@ test "consumeSseStream replaces malformed trailing or duplicate-key serialized f
 
         const call = completion.tool_calls[0];
         try std.testing.expectEqualStrings("{}", call.arguments_json);
-        try std.testing.expectEqual(types.ToolArgumentIntegrity.malformed_json, call.argument_integrity);
+        try std.testing.expectEqual(ToolArgumentIntegrity.malformed_json, call.argument_integrity);
         const diagnostic = call.argument_diagnostic.?;
         try std.testing.expectEqual(case.failure, diagnostic.failure);
         try std.testing.expectEqual(case.input.len, diagnostic.input_bytes);
@@ -5289,7 +5290,7 @@ test "consumeSseStream replaces duplicate-key exact-id ended fallback with safe 
     defer deinitGatewayCompletion(std.testing.allocator, &completion);
 
     try std.testing.expectEqualStrings("{}", completion.tool_calls[0].arguments_json);
-    try std.testing.expectEqual(types.ToolArgumentIntegrity.malformed_json, completion.tool_calls[0].argument_integrity);
+    try std.testing.expectEqual(ToolArgumentIntegrity.malformed_json, completion.tool_calls[0].argument_integrity);
 }
 
 test "consumeSseStream absent outer input uses exact-id ended fallback for compatible names" {
@@ -5319,7 +5320,7 @@ test "consumeSseStream absent outer input uses exact-id ended fallback for compa
         defer deinitGatewayCompletion(std.testing.allocator, &completion);
 
         try std.testing.expectEqualStrings("{\"path\":\"README.md\"}", completion.tool_calls[0].arguments_json);
-        try std.testing.expectEqual(types.ToolArgumentIntegrity.valid, completion.tool_calls[0].argument_integrity);
+        try std.testing.expectEqual(ToolArgumentIntegrity.valid, completion.tool_calls[0].argument_integrity);
         try std.testing.expectEqual(
             types.AuthoritativeToolAdmission.admitted,
             types.authoritativeToolAdmission(completion),
@@ -5355,7 +5356,7 @@ test "consumeSseStream present unsupported final input does not use streamed fal
         defer deinitGatewayCompletion(std.testing.allocator, &completion);
 
         try std.testing.expectEqualStrings("{}", completion.tool_calls[0].arguments_json);
-        try std.testing.expectEqual(types.ToolArgumentIntegrity.malformed_json, completion.tool_calls[0].argument_integrity);
+        try std.testing.expectEqual(ToolArgumentIntegrity.malformed_json, completion.tool_calls[0].argument_integrity);
     }
 }
 
@@ -5428,7 +5429,7 @@ test "consumeSseStream replaces malformed exact-id ended fallback with safe JSON
     defer deinitGatewayCompletion(std.testing.allocator, &completion);
 
     try std.testing.expectEqualStrings("{}", completion.tool_calls[0].arguments_json);
-    try std.testing.expectEqual(types.ToolArgumentIntegrity.malformed_json, completion.tool_calls[0].argument_integrity);
+    try std.testing.expectEqual(ToolArgumentIntegrity.malformed_json, completion.tool_calls[0].argument_integrity);
     const diagnostic = completion.tool_calls[0].argument_diagnostic.?;
     try std.testing.expectEqual(types.ToolArgumentDiagnostic.Failure.syntax_error, diagnostic.failure);
     try std.testing.expectEqual(@as(?usize, 1), diagnostic.error_offset);
@@ -5473,7 +5474,7 @@ test "consumeSseStream does not publish labels from malformed streamed arguments
     try std.testing.expectEqual(@as(usize, 0), capture.labels);
     try std.testing.expect(!capture.leaked_sentinel);
     try std.testing.expectEqualStrings("{}", completion.tool_calls[0].arguments_json);
-    try std.testing.expectEqual(types.ToolArgumentIntegrity.malformed_json, completion.tool_calls[0].argument_integrity);
+    try std.testing.expectEqual(ToolArgumentIntegrity.malformed_json, completion.tool_calls[0].argument_integrity);
 }
 
 test "consumeSseStream traces malformed argument metadata without source bytes" {

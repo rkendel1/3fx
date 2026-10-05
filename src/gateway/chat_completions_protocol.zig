@@ -1,3 +1,4 @@
+const ToolArgumentIntegrity = @import("../core/agent/tool_argument_integrity.zig").ToolArgumentIntegrity;
 const std = @import("std");
 const stream_provider = @import("../core/agent/stream_provider.zig");
 const types = @import("../core/shared/types.zig");
@@ -285,7 +286,7 @@ test "chat completions error masking releases partial allocations" {
 
 fn validate_arguments(alloc: Allocator, text: []const u8) Error!void {
     try check_json_depth(text);
-    if (try types.ToolArgumentIntegrity.classifyFunctionInput(alloc, text) != .valid) return error.InvalidToolArguments;
+    if (try ToolArgumentIntegrity.classifyFunctionInput(alloc, text) != .valid) return error.InvalidToolArguments;
 }
 
 fn validate_history(alloc: Allocator, messages: []const types.ChatMessage) Error!void {

@@ -1,3 +1,4 @@
+const ToolArgumentIntegrity = @import("../agent/tool_argument_integrity.zig").ToolArgumentIntegrity;
 const std = @import("std");
 const debug_trace = @import("../shared/debug_trace.zig");
 const image_data = @import("../images/image_data.zig");
@@ -610,7 +611,7 @@ fn parseToolCall(alloc: Allocator, value: std.json.Value) !session.ToolCall {
     const name = try alloc.dupe(u8, try requireString(object, "name"));
     errdefer mem_utils.free(alloc, name);
     const raw_arguments_json = try requireString(object, "arguments_json");
-    const argument_integrity = try types.ToolArgumentIntegrity.classifyFunctionInput(alloc, raw_arguments_json);
+    const argument_integrity = try ToolArgumentIntegrity.classifyFunctionInput(alloc, raw_arguments_json);
     const arguments_json = try alloc.dupe(u8, if (argument_integrity == .malformed_json) "{}" else raw_arguments_json);
     errdefer mem_utils.free(alloc, arguments_json);
     const provider_result = try optionalStringDup(alloc, object.get("provider_result"));
@@ -1633,7 +1634,7 @@ test "non-object legacy function inputs are repaired without changing recorded o
             const step = decoded.tool_steps[0];
             try std.testing.expectEqualStrings(if (native_kind == 0) "{}" else "[]", step.tool_calls[0].arguments_json);
             try std.testing.expectEqual(if (native_kind == 0) types.ToolExecutionProvenance.fx_local else .provider_executed, step.tool_calls[0].provenance);
-            try std.testing.expectEqual(types.ToolArgumentIntegrity.valid, step.tool_calls[0].argument_integrity);
+            try std.testing.expectEqual(ToolArgumentIntegrity.valid, step.tool_calls[0].argument_integrity);
             try std.testing.expectEqual(status, step.tool_results[0].status);
             try std.testing.expectEqualStrings("recorded", step.tool_results[0].output);
             try std.testing.expectEqual(@as(usize, 8), step.tool_results[0].stored_output_bytes);
