@@ -1,3 +1,4 @@
+const ToolArgumentDiagnostic = @import("../core/agent/tool_argument_diagnostic.zig").ToolArgumentDiagnostic;
 const ToolArgumentIntegrity = @import("../core/agent/tool_argument_integrity.zig").ToolArgumentIntegrity;
 const std = @import("std");
 const builtin = @import("builtin");
@@ -2752,7 +2753,7 @@ const SseToolCallAccumulator = struct {
     arguments: std.ArrayList(u8),
     provisional_id: std.ArrayList(u8) = .empty,
     argument_integrity: ToolArgumentIntegrity = .valid,
-    argument_diagnostic: ?types.ToolArgumentDiagnostic = null,
+    argument_diagnostic: ?ToolArgumentDiagnostic = null,
     provider_result: ?[]u8 = null,
     provider_result_state: ProviderResultState = .none,
     final_identity: types.FinalToolIdentity = .valid,
@@ -2930,7 +2931,7 @@ const FinalToolInputState = enum {
 
 const ClassifiedToolArguments = struct {
     integrity: ToolArgumentIntegrity,
-    diagnostic: ?types.ToolArgumentDiagnostic = null,
+    diagnostic: ?ToolArgumentDiagnostic = null,
 };
 
 fn appendSerializedToolArguments(
@@ -2948,7 +2949,7 @@ fn appendSerializedToolArguments(
     }
 
     // The raw bytes are replaced below; keep what the model needs to repair them.
-    const diagnostic = try types.ToolArgumentDiagnostic.diagnose(alloc, serialized);
+    const diagnostic = try ToolArgumentDiagnostic.diagnose(alloc, serialized);
     try destination.appendSlice(alloc, "{}");
     debug_trace.logf(
         "sse",
@@ -5231,7 +5232,7 @@ test "consumeSseStream preserves valid serialized scalar roots" {
 test "consumeSseStream replaces malformed trailing or duplicate-key serialized final input with safe JSON" {
     const Case = struct {
         input: []const u8,
-        failure: types.ToolArgumentDiagnostic.Failure,
+        failure: ToolArgumentDiagnostic.Failure,
     };
     const cases = [_]Case{
         .{ .input = "{]FX_FINAL_MALFORMED_SENTINEL", .failure = .syntax_error },
@@ -5431,7 +5432,7 @@ test "consumeSseStream replaces malformed exact-id ended fallback with safe JSON
     try std.testing.expectEqualStrings("{}", completion.tool_calls[0].arguments_json);
     try std.testing.expectEqual(ToolArgumentIntegrity.malformed_json, completion.tool_calls[0].argument_integrity);
     const diagnostic = completion.tool_calls[0].argument_diagnostic.?;
-    try std.testing.expectEqual(types.ToolArgumentDiagnostic.Failure.syntax_error, diagnostic.failure);
+    try std.testing.expectEqual(ToolArgumentDiagnostic.Failure.syntax_error, diagnostic.failure);
     try std.testing.expectEqual(@as(?usize, 1), diagnostic.error_offset);
 }
 
