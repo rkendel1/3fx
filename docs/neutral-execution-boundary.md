@@ -466,6 +466,45 @@ These are separate, larger efforts. This boundary demonstrates the pattern: extr
 
 ---
 
+## Hardening (October 2026)
+
+Comprehensive audit of the verified neutral execution path identified one redundant transitional plumbing pattern:
+
+### Removed: Unused TurnExecutionInput Projection in Orchestrator
+
+**Location**: `src/core/agent/runtime/orchestrator.zig` lines 5172-5173, parameter line 5293
+
+**Finding**: 
+- The `TurnExecutionInput` neutral projection was computed via `execution_compatibility.turnExecutionInput()` and passed as a parameter to `processQueuedPromptInner()`
+- The parameter was accepted but never referenced anywhere in the function body
+- This was transitional plumbing created when the boundary was established but never actually consumed
+
+**Removal**:
+- Removed the projection call in `processAgentPrompt()`
+- Removed the unused parameter from `processQueuedPromptInner()` function signature
+- No behavior change; the function constructs everything it needs from `borrowed_job`
+
+**Proof of Safety**:
+- The function still receives `CompatibilityExecutionJob` with full authority data
+- All necessary fields (prompt, model, images, history, context) are available in the job
+- Caller (`processAgentPrompt`) continues to pass all required parameters
+- Boundary diagnostic: 0 violations (unchanged)
+
+### Audit Results
+
+Comprehensive audit verified:
+- ✓ All field copies in `ModelRequest` construction are necessary and not duplicated
+- ✓ Credential injection at `gateway_step.streamNeutralModelCompletion()` is the only auth boundary
+- ✓ `copyAuthorityForTurn()` allocation is necessary for turn-scoped ownership
+- ✓ Coordinator and loop-control projections are actively used throughout orchestration
+- ✓ No redundant imports in neutral modules
+- ✓ No unnecessary allocations identified in critical path
+- ✓ No back-reaches from neutral types into auth/billing fields
+
+All five architectural seams remain intact; hardening removed only unused transitional plumbing.
+
+---
+
 ## Summary
 
 The neutral execution boundary consists of five established seams:
@@ -484,4 +523,4 @@ Together these ensure:
 - Provider protocol (replay, state) owned by provider layer
 - Remaining coupling is correct by necessity
 
-This is the production architecture. No further refactoring is required; violations outside the boundary are acceptable.
+This is the hardened, production architecture. The verified boundary has no unused transitional plumbing; violations outside the boundary are acceptable.
