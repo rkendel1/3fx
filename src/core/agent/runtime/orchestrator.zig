@@ -3443,7 +3443,7 @@ fn finishPendingCancelledCalls(
 pub const CommonStopState = struct {
     retained_candidate: ?[]const u8 = null,
     latest_partial: ?[]const u8 = null,
-    dispatched: bool = false,
+    control: @import("../stop_control.zig").StopControl = .{},
     terminal_materializing: bool = false,
 };
 
@@ -9082,7 +9082,7 @@ fn processQueuedPromptLoop(
                     history_text,
                     history_replay,
                     config.origin,
-                    if (!lifecycle.view.hasStop() or stop_state.dispatched) .finalizing else .model,
+                    if (!lifecycle.view.hasStop() or !stop_state.control.needsDispatch()) .finalizing else .model,
                 ))
             {
                 try deps.push_text(deps.ctx, .{ .assistant_rendered = "\n" });
@@ -9092,7 +9092,7 @@ fn processQueuedPromptLoop(
             if (disposition == .completed and agent_steps.allowsStep(control.coordinator.step_limit, control.coordinator.step + 1) and
                 try continue_pending_subagent(deps, arena, &within_turn_suffix, control.coordinator.turn_id, step_ctx.step_id, history_text, history_replay)) continue;
 
-            if (!lifecycle.view.hasStop() or stop_state.dispatched) {
+            if (!lifecycle.view.hasStop() or !stop_state.control.needsDispatch()) {
                 if (!has_content) {
                     try deps.push_text(deps.ctx, .{ .operational = rendered });
                 }
@@ -9181,7 +9181,7 @@ fn processQueuedPromptLoop(
             };
             defer stop_outcome.deinit(lifecycle.outcome_allocator);
 
-            stop_state.dispatched = true;
+            stop_state.control.markDispatched();
             switch (stop_outcome) {
                 .allow => {
                     stop_state.terminal_materializing = true;
@@ -11889,7 +11889,7 @@ fn processQueuedPromptLoop(
                     raw_final,
                     final_provider_replay,
                     config.origin,
-                    if (!lifecycle.view.hasStop() or stop_state.dispatched) .finalizing else .model,
+                    if (!lifecycle.view.hasStop() or !stop_state.control.needsDispatch()) .finalizing else .model,
                 ))
             {
                 try deps.push_text(deps.ctx, .{ .assistant_rendered = "\n" });
@@ -11899,7 +11899,7 @@ fn processQueuedPromptLoop(
             if (agent_steps.allowsStep(control.coordinator.step_limit, control.coordinator.step + 1) and
                 try continue_pending_subagent(deps, arena, &within_turn_suffix, control.coordinator.turn_id, step_ctx.step_id, raw_final, final_provider_replay)) continue;
 
-            if (!lifecycle.view.hasStop() or stop_state.dispatched) {
+            if (!lifecycle.view.hasStop() or !stop_state.control.needsDispatch()) {
                 try deps.push_text(deps.ctx, .{ .assistant_rendered = "\n" });
 
                 const history_text = try arena.dupe(u8, raw_final);
@@ -11970,7 +11970,7 @@ fn processQueuedPromptLoop(
             };
             defer stop_outcome.deinit(lifecycle.outcome_allocator);
 
-            stop_state.dispatched = true;
+            stop_state.control.markDispatched();
             switch (stop_outcome) {
                 .allow => {
                     stop_state.terminal_materializing = true;
