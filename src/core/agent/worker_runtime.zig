@@ -22,6 +22,11 @@ const types = @import("../shared/types.zig");
 const model_provider = @import("../config/model_provider.zig");
 const assistant_presentation = @import("assistant_presentation.zig");
 const compaction_activity = @import("../output/compaction_activity.zig");
+const neutral = @import("neutral_execution_boundary.zig");
+
+pub const TurnExecutionInput = neutral.TurnExecutionInput;
+pub const NeutralModelRequest = neutral.NeutralModelRequest;
+pub const NeutralModelCompletion = neutral.NeutralModelCompletion;
 
 pub const AgentTurnSettings = struct {
     max_tool_result_bytes: usize = tool_result_limits.default_max_tool_result_bytes,
