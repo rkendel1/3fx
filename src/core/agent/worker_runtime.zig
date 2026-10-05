@@ -1,3 +1,6 @@
+const neutral_queue = @import("queued_turn.zig");
+pub const NeutralQueuedTurn = neutral_queue.QueuedTurn;
+pub const ExecutionSnapshotId = neutral_queue.ExecutionSnapshotId;
 const std = @import("std");
 const credentials = @import("../auth/credentials.zig");
 const secret = @import("../auth/secret.zig");
@@ -78,6 +81,9 @@ pub const SteeringBoundaryResult = union(enum) {
     interrupt,
 };
 
+/// Compatibility ingress/execution job. This is no longer stored in the FIFO:
+/// enqueue separates it into QueuedTurn and ExecutionSnapshot, and dequeue
+/// reassembles it for the unchanged legacy turn consumer.
 pub const QueuedPrompt = struct {
     turn_id: u64 = 0,
     steering_receipt: ?*SteeringReceipt = null,
@@ -115,6 +121,34 @@ pub const QueuedPrompt = struct {
     /// The interactive transcript already contains this exact user turn.
     /// Worker begin publishes only its identity so the UI can consume the
     /// pending owner without painting a duplicate card.
+    user_prompt_already_presented: bool = false,
+};
+
+/// Enqueue-time execution authority/configuration, owned by this host worker.
+/// Explicit queue-sync operations continue updating only the fields they did
+/// before extraction. Dequeue never reads current model or auth configuration.
+pub const ExecutionSnapshot = struct {
+    steering_receipt: ?*SteeringReceipt = null,
+    images: []types.ImageAttachment,
+    authorized_image_catalog: []types.ImageAttachment = &.{},
+    model: []u8,
+    provider: model_provider.ProviderId = .gateway,
+    api_key: []u8,
+    gateway_team: ?[]u8 = null,
+    credential_source: ?types.CredentialSource = null,
+    account_id: ?[]u8 = null,
+    permission_mode: types.PermissionMode,
+    history: []types.HistoryTurn,
+    unversioned_history_count: usize = std.math.maxInt(usize),
+    root_user_intent_context: []u8 = &.{},
+    grants: []types.PermissionGrant,
+    skill_bindings: []SkillBinding = &.{},
+    skill_display_spans: []SkillDisplaySpan = &.{},
+    context_snapshot: context_contract.GatheredContextSnapshot = .{},
+    agent_settings: AgentTurnSettings = .{},
+    snapshot_file_ownerships: []types.SnapshotFileOwnership = &.{},
+    recovery_checkpoint: ?session_codec.RecoveryCheckpoint = null,
+    recovery_source_already_presented: bool = false,
     user_prompt_already_presented: bool = false,
 };
 
@@ -522,7 +556,9 @@ pub const WorkerRuntime = struct {
     worker_cond: std.Io.Condition = .init,
     /// One admission-ordered queue for ordinary prompts and steering. Steering
     /// remains in place until its target turn consumes or demotes it.
-    queued_prompts: std.ArrayList(QueuedPrompt) = .empty,
+    queued_prompts: std.ArrayList(NeutralQueuedTurn) = .empty,
+    execution_snapshots: std.AutoHashMapUnmanaged(ExecutionSnapshotId, ExecutionSnapshot) = .empty,
+    next_execution_snapshot_id: u64 = 1,
     /// One immutable conversation snapshot shared by every queued prompt.
     /// It is transferred or copied only when a prompt actually begins.
     queued_history: []types.HistoryTurn = &.{},
@@ -659,8 +695,10 @@ pub const WorkerRuntime = struct {
         freeQuestionResponse(alloc, self.pending_question_response);
         self.pending_question_response = .pending;
 
-        for (self.queued_prompts.items) |prompt| discardQueuedPrompt(alloc, prompt, &.{});
+        for (self.queued_prompts.items) |prompt| discardQueuedPrompt(alloc, self.takeExecutionSnapshot(prompt), &.{});
         self.queued_prompts.deinit(alloc);
+        std.debug.assert(self.execution_snapshots.count() == 0);
+        self.execution_snapshots.deinit(alloc);
         types.freeHistoryTurnSlice(alloc, self.queued_history);
         if (self.queued_context_compaction) |task| freeContextCompactionTask(alloc, task);
 
@@ -702,8 +740,8 @@ pub const WorkerRuntime = struct {
         self.agent_turn_settings.provider_order = owned;
         self.agent_turn_settings.provider_strict = strict;
         for (self.queued_prompts.items) |*prompt| {
-            prompt.agent_settings.provider_order = owned;
-            prompt.agent_settings.provider_strict = strict;
+            self.executionSnapshot(prompt.execution_snapshot_id).agent_settings.provider_order = owned;
+            self.executionSnapshot(prompt.execution_snapshot_id).agent_settings.provider_strict = strict;
         }
     }
 
@@ -1090,9 +1128,55 @@ pub const WorkerRuntime = struct {
             prompt.skill_display_spans.len == 0;
     }
 
+    /// Borrow while holding worker_mutex, or before starting worker threads.
+    fn executionSnapshot(self: *WorkerRuntime, id: ExecutionSnapshotId) *ExecutionSnapshot {
+        return self.execution_snapshots.getPtr(id) orelse unreachable;
+    }
+
+    fn queuedSteeringEligible(self: *WorkerRuntime, queued: NeutralQueuedTurn) bool {
+        const snapshot = self.executionSnapshot(queued.execution_snapshot_id);
+        return snapshot.images.len == 0 and snapshot.skill_bindings.len == 0 and snapshot.skill_display_spans.len == 0;
+    }
+
+    /// Terminal ownership transfer: called for execution, discard, or steering
+    /// consumption. After this point the legacy job owns all snapshot slices.
+    fn takeExecutionSnapshot(self: *WorkerRuntime, queued: NeutralQueuedTurn) QueuedPrompt {
+        const entry = self.execution_snapshots.fetchRemove(queued.execution_snapshot_id) orelse unreachable;
+        const snapshot = entry.value;
+        return .{
+            .turn_id = queued.turn_id,
+            .prompt = queued.prompt,
+            .delivery = queued.delivery,
+            .steering_receipt = snapshot.steering_receipt,
+            .images = snapshot.images,
+            .authorized_image_catalog = snapshot.authorized_image_catalog,
+            .model = snapshot.model,
+            .provider = snapshot.provider,
+            .api_key = snapshot.api_key,
+            .gateway_team = snapshot.gateway_team,
+            .credential_source = snapshot.credential_source,
+            .account_id = snapshot.account_id,
+            .permission_mode = snapshot.permission_mode,
+            .history = snapshot.history,
+            .unversioned_history_count = snapshot.unversioned_history_count,
+            .root_user_intent_context = snapshot.root_user_intent_context,
+            .grants = snapshot.grants,
+            .skill_bindings = snapshot.skill_bindings,
+            .skill_display_spans = snapshot.skill_display_spans,
+            .context_snapshot = snapshot.context_snapshot,
+            .agent_settings = snapshot.agent_settings,
+            .snapshot_file_ownerships = snapshot.snapshot_file_ownerships,
+            .recovery_checkpoint = snapshot.recovery_checkpoint,
+            .recovery_source_already_presented = snapshot.recovery_source_already_presented,
+            .user_prompt_already_presented = snapshot.user_prompt_already_presented,
+        };
+    }
+
     fn enqueuePromptLocked(self: *WorkerRuntime, alloc: std.mem.Allocator, queued_value: QueuedPrompt) !void {
         var queued = queued_value;
         try self.queued_prompts.ensureUnusedCapacity(alloc, 1);
+        if (self.next_execution_snapshot_id == std.math.maxInt(u64)) return error.OutOfMemory;
+        try self.execution_snapshots.ensureUnusedCapacity(alloc, 1);
         const supplied_history = queued.history;
         queued.history = &.{};
         if (self.queued_prompts.items.len == 0) {
@@ -1101,7 +1185,33 @@ pub const WorkerRuntime = struct {
         } else {
             types.freeHistoryTurnSlice(alloc, supplied_history);
         }
-        self.queued_prompts.appendAssumeCapacity(queued);
+        const snapshot_id: ExecutionSnapshotId = .{ .value = self.next_execution_snapshot_id };
+        self.next_execution_snapshot_id += 1;
+        self.execution_snapshots.putAssumeCapacity(snapshot_id, .{
+            .steering_receipt = queued.steering_receipt,
+            .images = queued.images,
+            .authorized_image_catalog = queued.authorized_image_catalog,
+            .model = queued.model,
+            .provider = queued.provider,
+            .api_key = queued.api_key,
+            .gateway_team = queued.gateway_team,
+            .credential_source = queued.credential_source,
+            .account_id = queued.account_id,
+            .permission_mode = queued.permission_mode,
+            .history = queued.history,
+            .unversioned_history_count = queued.unversioned_history_count,
+            .root_user_intent_context = queued.root_user_intent_context,
+            .grants = queued.grants,
+            .skill_bindings = queued.skill_bindings,
+            .skill_display_spans = queued.skill_display_spans,
+            .context_snapshot = queued.context_snapshot,
+            .agent_settings = queued.agent_settings,
+            .snapshot_file_ownerships = queued.snapshot_file_ownerships,
+            .recovery_checkpoint = queued.recovery_checkpoint,
+            .recovery_source_already_presented = queued.recovery_source_already_presented,
+            .user_prompt_already_presented = queued.user_prompt_already_presented,
+        });
+        self.queued_prompts.appendAssumeCapacity(.{ .turn_id = queued.turn_id, .prompt = queued.prompt, .delivery = queued.delivery, .execution_snapshot_id = snapshot_id });
         debug_trace.logf(
             "worker",
             "queued prompt bytes={d} queue_depth={d} fast_mode={s} effort={s}",
@@ -1124,7 +1234,7 @@ pub const WorkerRuntime = struct {
         var pending = false;
         for (self.queued_prompts.items) |prompt| {
             if (prompt.delivery.activeTurnId() != self.active_turn_id) continue;
-            if (!sameTurnSteeringEligible(prompt)) return false;
+            if (!self.queuedSteeringEligible(prompt)) return false;
             pending = true;
         }
         return pending;
@@ -1182,7 +1292,7 @@ pub const WorkerRuntime = struct {
                 if (cancel_requested) return .none;
                 for (self.queued_prompts.items) |prompt| {
                     if (prompt.delivery.activeTurnId() == turn_id and
-                        !sameTurnSteeringEligible(prompt)) return .handoff;
+                        !self.queuedSteeringEligible(prompt)) return .handoff;
                 }
                 const messages = try self.takeSteeringLocked(alloc, result_alloc, turn_id);
                 if (kind == .finalizing and messages.len == 0) self.direct_steering_closed = true;
@@ -1198,7 +1308,7 @@ pub const WorkerRuntime = struct {
         var steering_count: usize = 0;
         for (self.queued_prompts.items) |prompt| {
             if (prompt.delivery.activeTurnId() != turn_id) continue;
-            if (!sameTurnSteeringEligible(prompt)) return &.{};
+            if (!self.queuedSteeringEligible(prompt)) return &.{};
             steering_count += 1;
         }
         if (steering_count == 0) return &.{};
@@ -1219,7 +1329,7 @@ pub const WorkerRuntime = struct {
             if (prompt.delivery.activeTurnId() != turn_id) continue;
             messages[copied] = try result_alloc.dupe(u8, prompt.prompt);
             copied += 1;
-            if (prompt.steering_receipt == null) {
+            if (self.executionSnapshot(prompt.execution_snapshot_id).steering_receipt == null) {
                 events[event_count] = .{
                     .append_user_feedback = try alloc.dupe(u8, prompt.prompt),
                 };
@@ -1237,11 +1347,11 @@ pub const WorkerRuntime = struct {
                 continue;
             }
             const prompt = self.queued_prompts.orderedRemove(index);
-            if (prompt.steering_receipt) |receipt| {
+            if (self.executionSnapshot(prompt.execution_snapshot_id).steering_receipt) |receipt| {
                 receipt.state.store(.applied, .seq_cst);
                 debug_trace.eventf("subagent", "feedback_applied", .{}, "operation={s}", .{receipt.operation_id});
             }
-            freeQueuedPrompt(alloc, prompt);
+            freeQueuedPrompt(alloc, self.takeExecutionSnapshot(prompt));
         }
         if (self.queued_prompts.items.len == 0) {
             types.freeHistoryTurnSlice(alloc, self.queued_history);
@@ -1296,7 +1406,7 @@ pub const WorkerRuntime = struct {
         retained_images: []const types.ImageAttachment,
     ) bool {
         self.worker_mutex.lockUncancelable(io_mod.getIo());
-        var removed: ?QueuedPrompt = null;
+        var removed: ?NeutralQueuedTurn = null;
         for (self.queued_prompts.items, 0..) |queued, index| {
             if (queued.turn_id != turn_id) continue;
             removed = self.queued_prompts.orderedRemove(index);
@@ -1310,7 +1420,7 @@ pub const WorkerRuntime = struct {
         self.worker_mutex.unlock(io_mod.getIo());
 
         const prompt = removed orelse return false;
-        discardQueuedPrompt(alloc, prompt, retained_images);
+        discardQueuedPrompt(alloc, self.takeExecutionSnapshot(prompt), retained_images);
         debug_trace.eventf(
             "worker",
             "queued_prompt_removed",
@@ -1341,7 +1451,7 @@ pub const WorkerRuntime = struct {
             index -= 1;
             const prompt = self.queued_prompts.items[index];
             if (prompt.delivery.activeTurnId() != self.active_turn_id) continue;
-            if (!sameTurnSteeringEligible(prompt)) continue;
+            if (!self.queuedSteeringEligible(prompt)) continue;
             retractable = index;
             break;
         }
@@ -1355,7 +1465,7 @@ pub const WorkerRuntime = struct {
         }
         const turn_id = prompt.turn_id;
         const remaining = self.queuedWorkCountLocked();
-        freeQueuedPrompt(alloc, prompt);
+        freeQueuedPrompt(alloc, self.takeExecutionSnapshot(prompt));
         debug_trace.eventf(
             "worker",
             "prompt_steering_retracted",
@@ -1467,17 +1577,17 @@ pub const WorkerRuntime = struct {
         errdefer if (!transfer_history) {
             types.freeHistoryTurnSlice(alloc, job_history);
         };
-        if (queued.recovery_checkpoint == null and queued.user_prompt_already_presented) {
+        if (self.executionSnapshot(queued.execution_snapshot_id).recovery_checkpoint == null and self.executionSnapshot(queued.execution_snapshot_id).user_prompt_already_presented) {
             try self.worker_events.append(alloc, .{
                 .begin_presented_prompt = queued.turn_id,
             });
-        } else if (queued.recovery_checkpoint == null) {
-            const begin_prompt = try types.dupeUserTurn(alloc, .{ .text = queued.prompt, .images = queued.images });
+        } else if (self.executionSnapshot(queued.execution_snapshot_id).recovery_checkpoint == null) {
+            const begin_prompt = try types.dupeUserTurn(alloc, .{ .text = queued.prompt, .images = self.executionSnapshot(queued.execution_snapshot_id).images });
             errdefer types.freeUserTurn(alloc, begin_prompt);
-            if (queued.skill_bindings.len > 0 or queued.skill_display_spans.len > 0) {
-                const skill_bindings = try dupeSkillBindings(alloc, queued.skill_bindings);
+            if (self.executionSnapshot(queued.execution_snapshot_id).skill_bindings.len > 0 or self.executionSnapshot(queued.execution_snapshot_id).skill_display_spans.len > 0) {
+                const skill_bindings = try dupeSkillBindings(alloc, self.executionSnapshot(queued.execution_snapshot_id).skill_bindings);
                 errdefer freeSkillBindings(alloc, skill_bindings);
-                const skill_display_spans = try dupeSkillDisplaySpans(alloc, queued.skill_display_spans);
+                const skill_display_spans = try dupeSkillDisplaySpans(alloc, self.executionSnapshot(queued.execution_snapshot_id).skill_display_spans);
                 errdefer freeSkillDisplaySpans(alloc, skill_display_spans);
                 try self.worker_events.append(alloc, .{
                     .begin_prompt_with_skill_bindings = .{
@@ -1491,7 +1601,7 @@ pub const WorkerRuntime = struct {
             }
         }
 
-        var job = self.queued_prompts.orderedRemove(0);
+        var job = self.takeExecutionSnapshot(self.queued_prompts.orderedRemove(0));
         if (transfer_history) self.queued_history = &.{};
         job.history = job_history;
         self.steering_cancel_turn_id = null;
@@ -1504,7 +1614,7 @@ pub const WorkerRuntime = struct {
         self.tool_phase_step_id = null;
         if (job.delivery.isContinuation()) {
             for (self.queued_prompts.items) |*prompt| {
-                if (!prompt.delivery.isContinuation() or !sameTurnSteeringEligible(prompt.*)) continue;
+                if (!prompt.delivery.isContinuation() or !self.queuedSteeringEligible(prompt.*)) continue;
                 prompt.delivery = .{ .active_turn = job.turn_id };
             }
         }
@@ -1824,7 +1934,7 @@ pub const WorkerRuntime = struct {
             debug_trace.eventf("worker", "queued_prompts_cleared", .{}, "dropped={d}", .{dropped});
         }
         for (self.queued_prompts.items) |prompt| {
-            discardQueuedPrompt(alloc, prompt, retained_images);
+            discardQueuedPrompt(alloc, self.takeExecutionSnapshot(prompt), retained_images);
         }
         self.queued_prompts.clearRetainingCapacity();
         types.freeHistoryTurnSlice(alloc, self.queued_history);
@@ -1848,8 +1958,8 @@ pub const WorkerRuntime = struct {
         defer self.worker_mutex.unlock(io_mod.getIo());
         for (self.queued_prompts.items) |*prompt| {
             const next_model = try alloc.dupe(u8, model);
-            alloc.free(prompt.model);
-            prompt.model = next_model;
+            alloc.free(self.executionSnapshot(prompt.execution_snapshot_id).model);
+            self.executionSnapshot(prompt.execution_snapshot_id).model = next_model;
         }
     }
 
@@ -1857,7 +1967,7 @@ pub const WorkerRuntime = struct {
         self.worker_mutex.lockUncancelable(io_mod.getIo());
         defer self.worker_mutex.unlock(io_mod.getIo());
         for (self.queued_prompts.items) |*prompt| {
-            prompt.permission_mode = snapshot.mode;
+            self.executionSnapshot(prompt.execution_snapshot_id).permission_mode = snapshot.mode;
         }
     }
 
@@ -1865,21 +1975,21 @@ pub const WorkerRuntime = struct {
         self.worker_mutex.lockUncancelable(io_mod.getIo());
         defer self.worker_mutex.unlock(io_mod.getIo());
         self.agent_turn_settings.fast_mode = enabled;
-        for (self.queued_prompts.items) |*prompt| prompt.agent_settings.fast_mode = enabled;
+        for (self.queued_prompts.items) |*prompt| self.executionSnapshot(prompt.execution_snapshot_id).agent_settings.fast_mode = enabled;
     }
 
     pub fn syncQueuedPromptUltrafastMode(self: *WorkerRuntime, enabled: bool) void {
         self.worker_mutex.lockUncancelable(io_mod.getIo());
         defer self.worker_mutex.unlock(io_mod.getIo());
         self.agent_turn_settings.ultrafast_mode = enabled;
-        for (self.queued_prompts.items) |*prompt| prompt.agent_settings.ultrafast_mode = enabled;
+        for (self.queued_prompts.items) |*prompt| self.executionSnapshot(prompt.execution_snapshot_id).agent_settings.ultrafast_mode = enabled;
     }
 
     pub fn syncQueuedPromptEffort(self: *WorkerRuntime, effort: types.ReasoningEffort) void {
         self.worker_mutex.lockUncancelable(io_mod.getIo());
         defer self.worker_mutex.unlock(io_mod.getIo());
         self.agent_turn_settings.effort = effort;
-        for (self.queued_prompts.items) |*prompt| prompt.agent_settings.effort = effort;
+        for (self.queued_prompts.items) |*prompt| self.executionSnapshot(prompt.execution_snapshot_id).agent_settings.effort = effort;
     }
 
     pub fn setActiveAgentTurnSettings(self: *WorkerRuntime, settings: AgentTurnSettings) void {
@@ -1905,9 +2015,9 @@ pub const WorkerRuntime = struct {
         defer self.worker_mutex.unlock(io_mod.getIo());
         for (self.queued_prompts.items) |*prompt| {
             const next_grants = try types.dupePermissionGrantSlice(alloc, grants);
-            types.freePermissionGrantSlice(alloc, prompt.grants);
-            prompt.grants = next_grants;
-            prompt.permission_mode = snapshot.mode;
+            types.freePermissionGrantSlice(alloc, self.executionSnapshot(prompt.execution_snapshot_id).grants);
+            self.executionSnapshot(prompt.execution_snapshot_id).grants = next_grants;
+            self.executionSnapshot(prompt.execution_snapshot_id).permission_mode = snapshot.mode;
         }
     }
 
@@ -2138,21 +2248,21 @@ pub const WorkerRuntime = struct {
             const prompt = self.queued_prompts.items[prepared_count];
             const next_image_catalog = try session_runtime.merge_image_catalog_history_turn(
                 alloc,
-                prompt.authorized_image_catalog,
+                self.executionSnapshot(prompt.execution_snapshot_id).authorized_image_catalog,
                 turn,
             );
             errdefer types.freeImageAttachmentSlice(alloc, next_image_catalog);
             const next_root_user_intent_context = try auto_classifier_context.refreshQueuedRootUserContext(
                 alloc,
                 prompt.prompt,
-                prompt.root_user_intent_context,
+                self.executionSnapshot(prompt.execution_snapshot_id).root_user_intent_context,
                 turn,
             );
             errdefer alloc.free(next_root_user_intent_context);
             const next_snapshot_file_ownerships = if (active_ownership) |ownership| blk: {
                 const ownership_count = std.math.add(
                     usize,
-                    prompt.snapshot_file_ownerships.len,
+                    self.executionSnapshot(prompt.execution_snapshot_id).snapshot_file_ownerships.len,
                     1,
                 ) catch return error.OutOfMemory;
                 const ownerships = try alloc.alloc(
@@ -2161,11 +2271,11 @@ pub const WorkerRuntime = struct {
                 );
                 std.mem.copyForwards(
                     types.SnapshotFileOwnership,
-                    ownerships[0..prompt.snapshot_file_ownerships.len],
-                    prompt.snapshot_file_ownerships,
+                    ownerships[0..self.executionSnapshot(prompt.execution_snapshot_id).snapshot_file_ownerships.len],
+                    self.executionSnapshot(prompt.execution_snapshot_id).snapshot_file_ownerships,
                 );
                 ownership.retain();
-                ownerships[prompt.snapshot_file_ownerships.len] = ownership;
+                ownerships[self.executionSnapshot(prompt.execution_snapshot_id).snapshot_file_ownerships.len] = ownership;
                 break :blk ownerships;
             } else null;
             errdefer {
@@ -2194,16 +2304,16 @@ pub const WorkerRuntime = struct {
         self.queued_history = next_history;
         next_history_owned = false;
         for (self.queued_prompts.items, prepared) |*prompt, next| {
-            if (turn == .compacted_summary) prompt.unversioned_history_count = 0;
-            if (prompt.root_user_intent_context.len > 0) alloc.free(prompt.root_user_intent_context);
-            prompt.root_user_intent_context = next.root_user_intent_context;
-            types.freeImageAttachmentSlice(alloc, prompt.authorized_image_catalog);
-            prompt.authorized_image_catalog = next.authorized_image_catalog;
+            if (turn == .compacted_summary) self.executionSnapshot(prompt.execution_snapshot_id).unversioned_history_count = 0;
+            if (self.executionSnapshot(prompt.execution_snapshot_id).root_user_intent_context.len > 0) alloc.free(self.executionSnapshot(prompt.execution_snapshot_id).root_user_intent_context);
+            self.executionSnapshot(prompt.execution_snapshot_id).root_user_intent_context = next.root_user_intent_context;
+            types.freeImageAttachmentSlice(alloc, self.executionSnapshot(prompt.execution_snapshot_id).authorized_image_catalog);
+            self.executionSnapshot(prompt.execution_snapshot_id).authorized_image_catalog = next.authorized_image_catalog;
             if (next.snapshot_file_ownerships) |ownerships| {
-                if (prompt.snapshot_file_ownerships.len > 0) {
-                    alloc.free(prompt.snapshot_file_ownerships);
+                if (self.executionSnapshot(prompt.execution_snapshot_id).snapshot_file_ownerships.len > 0) {
+                    alloc.free(self.executionSnapshot(prompt.execution_snapshot_id).snapshot_file_ownerships);
                 }
-                prompt.snapshot_file_ownerships = ownerships;
+                self.executionSnapshot(prompt.execution_snapshot_id).snapshot_file_ownerships = ownerships;
             }
         }
         committed = true;
@@ -2286,7 +2396,7 @@ pub const WorkerRuntime = struct {
     pub fn propagateGrant(self: *WorkerRuntime, alloc: std.mem.Allocator, tool_name: []const u8, target_path: []const u8) !void {
         self.worker_mutex.lockUncancelable(io_mod.getIo());
         defer self.worker_mutex.unlock(io_mod.getIo());
-        for (self.queued_prompts.items) |*prompt| try appendGrantToQueuedPrompt(alloc, prompt, tool_name, target_path);
+        for (self.queued_prompts.items) |*prompt| try appendGrantToExecutionSnapshot(alloc, self.executionSnapshot(prompt.execution_snapshot_id), tool_name, target_path);
     }
 
     pub fn requestPermissionBlocking(
@@ -3274,11 +3384,11 @@ test "propagated queued snapshots survive finish failure until the last borrower
     runtime.endActivePromptSnapshots(&active);
 
     for (runtime.queued_prompts.items) |prompt| {
-        try std.testing.expectEqual(@as(usize, 1), prompt.authorized_image_catalog.len);
-        try std.testing.expectEqual(@as(usize, 1), prompt.snapshot_file_ownerships.len);
+        try std.testing.expectEqual(@as(usize, 1), runtime.executionSnapshot(prompt.execution_snapshot_id).authorized_image_catalog.len);
+        try std.testing.expectEqual(@as(usize, 1), runtime.executionSnapshot(prompt.execution_snapshot_id).snapshot_file_ownerships.len);
         try std.Io.Dir.accessAbsolute(
             std.testing.io,
-            prompt.authorized_image_catalog[0].snapshot_path.?,
+            runtime.executionSnapshot(prompt.execution_snapshot_id).authorized_image_catalog[0].snapshot_path.?,
             .{},
         );
     }
@@ -3445,7 +3555,7 @@ test "failed queued prompt dequeue retains borrowed snapshot ownership" {
     try std.testing.expectEqual(@as(usize, 1), runtime.queuedPromptCount());
     try std.testing.expectEqual(
         @as(usize, 1),
-        runtime.queued_prompts.items[0].snapshot_file_ownerships.len,
+        runtime.executionSnapshot(runtime.queued_prompts.items[0].execution_snapshot_id).snapshot_file_ownerships.len,
     );
     try std.Io.Dir.accessAbsolute(std.testing.io, path, .{});
 
@@ -3506,18 +3616,18 @@ fn checkHistoryPropagationAllocation(
     runtime.propagateHistoryTurn(failing.allocator(), turn, 8) catch |err| {
         if (!failing.has_induced_failure) return err;
         for (runtime.queued_prompts.items) |prompt| {
-            try std.testing.expectEqual(@as(usize, 0), prompt.history.len);
-            try std.testing.expectEqual(@as(usize, 0), prompt.authorized_image_catalog.len);
-            try std.testing.expectEqual(@as(usize, 0), prompt.snapshot_file_ownerships.len);
+            try std.testing.expectEqual(@as(usize, 0), runtime.executionSnapshot(prompt.execution_snapshot_id).history.len);
+            try std.testing.expectEqual(@as(usize, 0), runtime.executionSnapshot(prompt.execution_snapshot_id).authorized_image_catalog.len);
+            try std.testing.expectEqual(@as(usize, 0), runtime.executionSnapshot(prompt.execution_snapshot_id).snapshot_file_ownerships.len);
         }
         try std.testing.expectEqual(@as(usize, 0), runtime.queued_history.len);
         return false;
     };
 
     for (runtime.queued_prompts.items) |prompt| {
-        try std.testing.expectEqual(@as(usize, 0), prompt.history.len);
-        try std.testing.expectEqual(@as(usize, 1), prompt.authorized_image_catalog.len);
-        try std.testing.expectEqual(@as(usize, 1), prompt.snapshot_file_ownerships.len);
+        try std.testing.expectEqual(@as(usize, 0), runtime.executionSnapshot(prompt.execution_snapshot_id).history.len);
+        try std.testing.expectEqual(@as(usize, 1), runtime.executionSnapshot(prompt.execution_snapshot_id).authorized_image_catalog.len);
+        try std.testing.expectEqual(@as(usize, 1), runtime.executionSnapshot(prompt.execution_snapshot_id).snapshot_file_ownerships.len);
     }
     try std.testing.expectEqual(@as(usize, 1), runtime.queued_history.len);
     return true;
@@ -4454,8 +4564,8 @@ test "subagent steering peek preserves the existing queue consumer" {
     try std.testing.expect(runtime.hasPendingPlainSteering());
     {
         var images: [1]types.ImageAttachment = undefined;
-        runtime.queued_prompts.items[1].images = &images;
-        defer runtime.queued_prompts.items[1].images = &.{};
+        runtime.executionSnapshot(runtime.queued_prompts.items[1].execution_snapshot_id).images = &images;
+        defer runtime.executionSnapshot(runtime.queued_prompts.items[1].execution_snapshot_id).images = &.{};
         try std.testing.expect(!runtime.hasPendingPlainSteering());
     }
     try std.testing.expectEqual(@as(usize, 2), runtime.queued_prompts.items.len);
@@ -5527,11 +5637,11 @@ test "queue, event, snapshot, sync, history, and grant behavior" {
     try std.testing.expect(events.items[0].begin_prompt.text.ptr != job.prompt.ptr);
 
     try runtime.syncQueuedPromptModel(alloc, "next");
-    try std.testing.expectEqualStrings("next", runtime.queued_prompts.items[0].model);
+    try std.testing.expectEqualStrings("next", runtime.executionSnapshot(runtime.queued_prompts.items[0].execution_snapshot_id).model);
     runtime.syncQueuedPromptPermissionSnapshot(.{
         .mode = .ask,
     });
-    try std.testing.expectEqual(types.PermissionMode.ask, runtime.queued_prompts.items[0].permission_mode);
+    try std.testing.expectEqual(types.PermissionMode.ask, runtime.executionSnapshot(runtime.queued_prompts.items[0].execution_snapshot_id).permission_mode);
     try std.testing.expectEqual(types.PermissionMode.auto, job.permission_mode);
 
     const grant_source = try alloc.alloc(types.PermissionGrant, 1);
@@ -5542,8 +5652,8 @@ test "queue, event, snapshot, sync, history, and grant behavior" {
     });
     grant_source[0].tool_name[0] = 'R';
     grant_source[0].target_path[1] = 'T';
-    try std.testing.expectEqualStrings("read_file", runtime.queued_prompts.items[0].grants[0].tool_name);
-    try std.testing.expectEqualStrings("/tmp/a", runtime.queued_prompts.items[0].grants[0].target_path);
+    try std.testing.expectEqualStrings("read_file", runtime.executionSnapshot(runtime.queued_prompts.items[0].execution_snapshot_id).grants[0].tool_name);
+    try std.testing.expectEqualStrings("/tmp/a", runtime.executionSnapshot(runtime.queued_prompts.items[0].execution_snapshot_id).grants[0].target_path);
 
     const old_turn: types.HistoryTurn = .{ .compacted_summary = .{
         .summary = try alloc.dupe(u8, "old"),
@@ -5569,12 +5679,12 @@ test "queue, event, snapshot, sync, history, and grant behavior" {
     try std.testing.expectEqual(@as(usize, 2), runtime.queued_history.len);
     try std.testing.expect(runtime.queued_history[1] == .compacted_summary);
     try std.testing.expectEqualStrings("summary", runtime.queued_history[1].compacted_summary.summary);
-    try std.testing.expectEqual(@as(usize, 0), runtime.queued_prompts.items[0].unversioned_history_count);
+    try std.testing.expectEqual(@as(usize, 0), runtime.executionSnapshot(runtime.queued_prompts.items[0].execution_snapshot_id).unversioned_history_count);
 
     try runtime.propagateGrant(alloc, "read_file", "/tmp/a");
-    try std.testing.expectEqual(@as(usize, 1), runtime.queued_prompts.items[0].grants.len);
+    try std.testing.expectEqual(@as(usize, 1), runtime.executionSnapshot(runtime.queued_prompts.items[0].execution_snapshot_id).grants.len);
     try runtime.propagateGrant(alloc, "read_file", "/tmp/b");
-    try std.testing.expectEqual(@as(usize, 2), runtime.queued_prompts.items[0].grants.len);
+    try std.testing.expectEqual(@as(usize, 2), runtime.executionSnapshot(runtime.queued_prompts.items[0].execution_snapshot_id).grants.len);
 
     runtime.worker_processing = true;
     runtime.pending_permission_waiting = true;
@@ -5825,7 +5935,7 @@ test "held turn propagation refreshes queued prompt trusted reviewer context" {
     try std.testing.expectEqual(original_prompt_len, runtime.queued_prompts.items[0].prompt.len);
     try std.testing.expect(original_prompt_ptr == runtime.queued_prompts.items[0].prompt.ptr);
 
-    const review_context = runtime.queued_prompts.items[0].root_user_intent_context;
+    const review_context = runtime.executionSnapshot(runtime.queued_prompts.items[0].execution_snapshot_id).root_user_intent_context;
     try std.testing.expect(std.mem.find(
         u8,
         review_context,
@@ -5848,7 +5958,7 @@ test "held turn propagation refreshes queued prompt trusted reviewer context" {
     } };
     defer types.freeHistoryTurn(alloc, newer_turn);
     try runtime.propagateHistoryTurn(alloc, newer_turn, 8);
-    const refreshed = runtime.queued_prompts.items[0].root_user_intent_context;
+    const refreshed = runtime.executionSnapshot(runtime.queued_prompts.items[0].execution_snapshot_id).root_user_intent_context;
     try std.testing.expect(std.mem.find(
         u8,
         refreshed,
@@ -5886,10 +5996,10 @@ test "completed image turns propagate authority to queued follow-ups" {
     try runtime.propagateHistoryTurn(alloc, turn, 1);
 
     const queued = runtime.queued_prompts.items[0];
-    try std.testing.expectEqual(@as(usize, 2), queued.authorized_image_catalog.len);
-    try std.testing.expectEqual(@as(usize, 2), queued.authorized_image_catalog[0].id);
-    try std.testing.expectEqual(@as(usize, 8), queued.authorized_image_catalog[1].id);
-    try std.testing.expectEqualStrings("/tmp/completed.png", queued.authorized_image_catalog[1].path);
+    try std.testing.expectEqual(@as(usize, 2), runtime.executionSnapshot(queued.execution_snapshot_id).authorized_image_catalog.len);
+    try std.testing.expectEqual(@as(usize, 2), runtime.executionSnapshot(queued.execution_snapshot_id).authorized_image_catalog[0].id);
+    try std.testing.expectEqual(@as(usize, 8), runtime.executionSnapshot(queued.execution_snapshot_id).authorized_image_catalog[1].id);
+    try std.testing.expectEqualStrings("/tmp/completed.png", runtime.executionSnapshot(queued.execution_snapshot_id).authorized_image_catalog[1].path);
 }
 
 test "explicit cancellation keeps targeted steering runnable" {
@@ -6068,15 +6178,15 @@ test "sync queued prompt fast mode and effort updates queued prompts and future 
     runtime.syncQueuedPromptFastMode(true);
     runtime.syncQueuedPromptEffort(types.ReasoningEffort.literal("high"));
 
-    try std.testing.expect(runtime.queued_prompts.items[0].agent_settings.fast_mode);
-    try std.testing.expectEqual(types.ReasoningEffort.literal("high"), runtime.queued_prompts.items[0].agent_settings.effort);
+    try std.testing.expect(runtime.executionSnapshot(runtime.queued_prompts.items[0].execution_snapshot_id).agent_settings.fast_mode);
+    try std.testing.expectEqual(types.ReasoningEffort.literal("high"), runtime.executionSnapshot(runtime.queued_prompts.items[0].execution_snapshot_id).agent_settings.effort);
     try std.testing.expect(runtime.agent_turn_settings.fast_mode);
     try std.testing.expectEqual(types.ReasoningEffort.literal("high"), runtime.agent_turn_settings.effort);
 
     try runtime.enqueuePrompt(alloc, try makePrompt(alloc, "future", "model"));
 
-    try std.testing.expect(runtime.queued_prompts.items[1].agent_settings.fast_mode);
-    try std.testing.expectEqual(types.ReasoningEffort.literal("high"), runtime.queued_prompts.items[1].agent_settings.effort);
+    try std.testing.expect(runtime.executionSnapshot(runtime.queued_prompts.items[1].execution_snapshot_id).agent_settings.fast_mode);
+    try std.testing.expectEqual(types.ReasoningEffort.literal("high"), runtime.executionSnapshot(runtime.queued_prompts.items[1].execution_snapshot_id).agent_settings.effort);
 }
 
 const EnqueueThreadState = struct {
@@ -6128,8 +6238,8 @@ test "enqueuePrompt snapshots settings under the same mutex as sync" {
 
     try std.testing.expect(state.err == null);
     try std.testing.expectEqual(@as(usize, 1), runtime.queued_prompts.items.len);
-    try std.testing.expect(runtime.queued_prompts.items[0].agent_settings.fast_mode);
-    try std.testing.expectEqual(types.ReasoningEffort.literal("high"), runtime.queued_prompts.items[0].agent_settings.effort);
+    try std.testing.expect(runtime.executionSnapshot(runtime.queued_prompts.items[0].execution_snapshot_id).agent_settings.fast_mode);
+    try std.testing.expectEqual(types.ReasoningEffort.literal("high"), runtime.executionSnapshot(runtime.queued_prompts.items[0].execution_snapshot_id).agent_settings.effort);
 }
 
 test "taken prompt keeps original fast mode and effort after later sync" {
@@ -6208,7 +6318,7 @@ test "queued permission mode updates without mutating dequeued fallback" {
     });
 
     try std.testing.expectEqual(types.PermissionMode.ask, active.permission_mode);
-    try std.testing.expectEqual(types.PermissionMode.auto, runtime.queued_prompts.items[0].permission_mode);
+    try std.testing.expectEqual(types.PermissionMode.auto, runtime.executionSnapshot(runtime.queued_prompts.items[0].execution_snapshot_id).permission_mode);
 }
 
 test "submitted text only queues while a prompt is active" {
@@ -6275,16 +6385,16 @@ test "prompt take and grant append allocation failures preserve state" {
     try std.testing.expect(runtime.isCancelRequested());
     try std.testing.expectEqual(@as(usize, 0), runtime.worker_events.items.len);
 
-    const original = runtime.queued_prompts.items[0].grants.ptr;
+    const original = runtime.executionSnapshot(runtime.queued_prompts.items[0].execution_snapshot_id).grants.ptr;
     var failing_grant = std.testing.FailingAllocator.init(alloc, .{ .fail_index = 1 });
     try std.testing.expectError(error.OutOfMemory, runtime.propagateGrant(failing_grant.allocator(), "write_file", "/tmp/b"));
-    try std.testing.expectEqual(original, runtime.queued_prompts.items[0].grants.ptr);
-    try std.testing.expectEqual(@as(usize, 1), runtime.queued_prompts.items[0].grants.len);
+    try std.testing.expectEqual(original, runtime.executionSnapshot(runtime.queued_prompts.items[0].execution_snapshot_id).grants.ptr);
+    try std.testing.expectEqual(@as(usize, 1), runtime.executionSnapshot(runtime.queued_prompts.items[0].execution_snapshot_id).grants.len);
 
     var failing_slice = std.testing.FailingAllocator.init(alloc, .{ .fail_index = 2 });
     try std.testing.expectError(error.OutOfMemory, runtime.propagateGrant(failing_slice.allocator(), "write_file", "/tmp/c"));
-    try std.testing.expectEqual(original, runtime.queued_prompts.items[0].grants.ptr);
-    try std.testing.expectEqual(@as(usize, 1), runtime.queued_prompts.items[0].grants.len);
+    try std.testing.expectEqual(original, runtime.executionSnapshot(runtime.queued_prompts.items[0].execution_snapshot_id).grants.ptr);
+    try std.testing.expectEqual(@as(usize, 1), runtime.executionSnapshot(runtime.queued_prompts.items[0].execution_snapshot_id).grants.len);
 }
 
 test "clear queued prompts preserves events and discard frees event payloads" {
@@ -7357,4 +7467,86 @@ test "session transition hold keeps an existing queued prompt until released" {
     defer freeQueuedPrompt(alloc, prompt);
     try std.testing.expectEqualStrings("queued", prompt.prompt);
     try std.testing.expect((try runtime.tryTakeNextPrompt(alloc)) == null);
+}
+
+fn appendGrantToExecutionSnapshot(alloc: std.mem.Allocator, prompt: *ExecutionSnapshot, tool_name: []const u8, target_path: []const u8) !void {
+    for (prompt.grants) |grant| {
+        if (std.mem.eql(u8, grant.tool_name, tool_name) and std.mem.eql(u8, grant.target_path, target_path)) return;
+    }
+    const tool_name_dup = try alloc.dupe(u8, tool_name);
+    errdefer alloc.free(tool_name_dup);
+    const target_path_dup = try alloc.dupe(u8, target_path);
+    errdefer alloc.free(target_path_dup);
+    const current = prompt.grants;
+    const next = try alloc.alloc(types.PermissionGrant, current.len + 1);
+    errdefer alloc.free(next);
+    if (current.len > 0) std.mem.copyForwards(types.PermissionGrant, next[0..current.len], current);
+    next[current.len] = .{ .tool_name = tool_name_dup, .target_path = target_path_dup };
+    alloc.free(current);
+    prompt.grants = next;
+}
+
+test "neutral queue stores typed snapshot handles and executes enqueue-time configuration" {
+    const alloc = std.testing.allocator;
+    var runtime: WorkerRuntime = .{};
+    defer runtime.deinit(alloc);
+    var current_model = "configuration-A".*;
+    var first = try makePrompt(alloc, "first", &current_model);
+    first.turn_id = 101;
+    first.delivery = .continuation;
+    first.provider = .codex;
+    first.account_id = try alloc.dupe(u8, "account-A");
+    try runtime.enqueuePrompt(alloc, first);
+    try runtime.enqueuePrompt(alloc, try makePrompt(alloc, "second", "configuration-B"));
+    try std.testing.expectEqual(@as(usize, 2), runtime.execution_snapshots.count());
+    try std.testing.expectEqualStrings("first", runtime.queued_prompts.items[0].prompt);
+    try std.testing.expect(runtime.queued_prompts.items[0].delivery.isContinuation());
+    try std.testing.expect(runtime.queued_prompts.items[0].execution_snapshot_id.value != runtime.queued_prompts.items[1].execution_snapshot_id.value);
+    // Changing the host's current settings is distinct from an explicit queue
+    // sync operation. Dequeue resolves the captured snapshot, not these values.
+    current_model[current_model.len - 1] = 'B';
+    try std.testing.expectEqualStrings("configuration-B", &current_model);
+    runtime.agent_turn_settings.effort = .literal("high");
+    runtime.worker_cancel_requested.store(true, .seq_cst);
+    const taken = (try runtime.tryTakeNextPrompt(alloc)).?;
+    defer freeQueuedPrompt(alloc, taken);
+    try std.testing.expectEqualStrings("first", taken.prompt);
+    try std.testing.expectEqualStrings("configuration-A", taken.model);
+    try std.testing.expectEqualStrings("account-A", taken.account_id.?);
+    try std.testing.expect(taken.provider == .codex);
+    try std.testing.expect(taken.agent_settings.effort == .auto);
+    try std.testing.expect(taken.delivery.isContinuation());
+    try std.testing.expect(!runtime.worker_cancel_requested.load(.seq_cst));
+    try std.testing.expectEqual(@as(usize, 1), runtime.execution_snapshots.count());
+    runtime.finishProcessing();
+    const second = (try runtime.tryTakeNextPrompt(alloc)).?;
+    defer freeQueuedPrompt(alloc, second);
+    try std.testing.expectEqualStrings("second", second.prompt);
+    try std.testing.expectEqualStrings("configuration-B", second.model);
+    try std.testing.expectEqual(@as(usize, 0), runtime.execution_snapshots.count());
+    runtime.finishProcessing();
+}
+
+test "neutral queue snapshot cleanup covers removal and clearing" {
+    const alloc = std.testing.allocator;
+    var runtime: WorkerRuntime = .{};
+    defer runtime.deinit(alloc);
+    var prompt = try makePrompt(alloc, "remove", "model");
+    prompt.turn_id = 77;
+    try runtime.enqueuePrompt(alloc, prompt);
+    try std.testing.expect(runtime.removeQueuedPrompt(alloc, 77, &.{}));
+    try std.testing.expectEqual(@as(usize, 0), runtime.execution_snapshots.count());
+    try runtime.enqueuePrompt(alloc, try makePrompt(alloc, "clear", "model"));
+    runtime.clearQueuedPrompts(alloc, &.{});
+    try std.testing.expectEqual(@as(usize, 0), runtime.execution_snapshots.count());
+    try std.testing.expectEqual(@as(usize, 0), runtime.queued_prompts.items.len);
+}
+
+test "neutral queue envelope has only text delivery turn id and typed snapshot id" {
+    const fields = std.meta.fields(NeutralQueuedTurn);
+    try std.testing.expectEqual(@as(usize, 4), fields.len);
+    try std.testing.expect(fields[0].type == u64);
+    try std.testing.expect(fields[1].type == []u8);
+    try std.testing.expect(fields[2].type == PromptDelivery);
+    try std.testing.expect(fields[3].type == ExecutionSnapshotId);
 }
