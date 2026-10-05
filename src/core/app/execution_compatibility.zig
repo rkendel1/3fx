@@ -442,3 +442,33 @@ test "execution compatibility turn authority copy is allocation-failure safe" {
     };
     try std.testing.checkAllAllocationFailures(std.testing.allocator, Check.run, .{});
 }
+
+/// Project only neutral turn coordination. The caller has already established
+/// the effective turn ID. Captured execution authority stays in the host job.
+pub fn coordinator(job: worker.CompatibilityExecutionJob, turn: *@import("../agent/turn_state.zig").TurnState, cancel: *std.atomic.Value(bool), step_limit: usize) @import("../agent/turn_coordinator.zig").TurnCoordinator {
+    return .{ .turn_id = job.turn_id, .delivery = job.delivery, .turn_state = turn, .cancel_flag = cancel, .step_limit = step_limit };
+}
+
+test "turn coordinator projection preserves identity delivery and borrowed state links" {
+    var turn: @import("../agent/turn_state.zig").TurnState = .{};
+    var cancel: std.atomic.Value(bool) = .init(false);
+    const job: worker.CompatibilityExecutionJob = .{
+        .turn_id = 77,
+        .delivery = .continuation,
+        .prompt = @constCast("prompt"),
+        .images = &.{},
+        .model = @constCast("model"),
+        .api_key = @constCast("key"),
+        .permission_mode = .ask,
+        .history = &.{},
+        .grants = &.{},
+    };
+    const projected = coordinator(job, &turn, &cancel, 9);
+    try std.testing.expectEqual(@as(u64, 77), projected.turn_id);
+    try std.testing.expect(projected.delivery.isContinuation());
+    try std.testing.expect(projected.turn_state == &turn);
+    try std.testing.expect(projected.cancel_flag == &cancel);
+    try std.testing.expectEqual(@as(usize, 9), projected.step_limit);
+    try std.testing.expectEqual(@as(usize, 0), projected.attempt);
+    try std.testing.expectEqual(@as(usize, 0), projected.step);
+}
