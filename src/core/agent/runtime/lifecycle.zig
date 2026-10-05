@@ -1,3 +1,4 @@
+const ToolArgumentIntegrity = @import("../tool_argument_integrity.zig").ToolArgumentIntegrity;
 const std = @import("std");
 const hooks = @import("../../hooks/hooks.zig");
 const types = @import("../../shared/types.zig");
@@ -221,7 +222,7 @@ test "malformed function arguments report the diagnosed input they replaced" {
     defer from_raw.deinit(alloc);
     try std.testing.expect(from_raw == .blocked);
     try std.testing.expectEqualStrings("{}", from_raw.call().arguments_json);
-    try std.testing.expectEqual(types.ToolArgumentIntegrity.malformed_json, from_raw.call().argument_integrity);
+    try std.testing.expectEqual(ToolArgumentIntegrity.malformed_json, from_raw.call().argument_integrity);
     try expectMalformedFeedback(from_raw.blocked.model_output.?, "truncated", raw);
 
     const provider_raw = "{\"path\":\"a\",}";
@@ -284,7 +285,7 @@ fn prepareToolCallFromCheckpoint(
         return .{ .provider_executed = try types.dupeToolCall(result_allocator, call) };
     }
     const integrity = if (call.argument_integrity == .valid)
-        try types.ToolArgumentIntegrity.classifyFunctionInput(result_allocator, call.arguments_json)
+        try ToolArgumentIntegrity.classifyFunctionInput(result_allocator, call.arguments_json)
     else
         call.argument_integrity;
     if (integrity != .valid) {
@@ -438,7 +439,7 @@ pub fn dupeBlockedToolCall(alloc: Allocator, call: ToolCall) !ToolCall {
     var replay = call;
     if (call.provenance != .provider_executed) {
         replay.argument_integrity = if (call.argument_integrity == .valid)
-            try types.ToolArgumentIntegrity.classifyFunctionInput(alloc, call.arguments_json)
+            try ToolArgumentIntegrity.classifyFunctionInput(alloc, call.arguments_json)
         else
             call.argument_integrity;
         if (replay.argument_integrity != .valid) replay.arguments_json = "{}";

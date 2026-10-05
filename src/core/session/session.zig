@@ -1,3 +1,4 @@
+const ToolArgumentIntegrity = @import("../agent/tool_argument_integrity.zig").ToolArgumentIntegrity;
 const std = @import("std");
 const kernel_agent = @import("../agent/runtime/agent.zig");
 const core_types = @import("../shared/types.zig");
@@ -1553,7 +1554,7 @@ fn tracePersistedToolArgumentsRepair(
     call: ToolCall,
     source: PersistedToolArgumentsSource,
     paired_result: bool,
-    integrity: core_types.ToolArgumentIntegrity,
+    integrity: ToolArgumentIntegrity,
 ) void {
     debug_trace.eventf(
         "session",

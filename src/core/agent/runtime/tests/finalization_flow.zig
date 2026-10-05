@@ -1,3 +1,4 @@
+const ToolArgumentIntegrity = @import("../../tool_argument_integrity.zig").ToolArgumentIntegrity;
 const std = @import("std");
 const types = @import("../../../shared/types.zig");
 const debug_trace = @import("../../../shared/debug_trace.zig");
@@ -376,7 +377,7 @@ test "processQueuedPrompt stops repeated malformed calls before another provider
     for (execution.tool_steps) |step| {
         try std.testing.expectEqual(@as(usize, 1), step.tool_calls.len);
         try std.testing.expectEqualStrings("{}", step.tool_calls[0].arguments_json);
-        try std.testing.expectEqual(types.ToolArgumentIntegrity.valid, step.tool_calls[0].argument_integrity);
+        try std.testing.expectEqual(ToolArgumentIntegrity.valid, step.tool_calls[0].argument_integrity);
         try std.testing.expectEqual(@as(usize, 1), step.tool_results.len);
         try std.testing.expectEqual(types.PersistedToolStatus.failure, step.tool_results[0].status);
         try std.testing.expect(tool_result_errors.isToolExecutionFailedOutput(step.tool_results[0].output));
@@ -546,7 +547,7 @@ test "processQueuedPrompt step limit persists malformed argument failure executi
     const execution = hooks.history_turns.items[0].assistant.execution;
     try std.testing.expectEqual(@as(usize, 1), execution.tool_steps.len);
     try std.testing.expectEqualStrings("{}", execution.tool_steps[0].tool_calls[0].arguments_json);
-    try std.testing.expectEqual(types.ToolArgumentIntegrity.valid, execution.tool_steps[0].tool_calls[0].argument_integrity);
+    try std.testing.expectEqual(ToolArgumentIntegrity.valid, execution.tool_steps[0].tool_calls[0].argument_integrity);
     try std.testing.expectEqual(@as(usize, 1), execution.tool_steps[0].tool_results.len);
     try std.testing.expectEqual(types.PersistedToolStatus.failure, execution.tool_steps[0].tool_results[0].status);
     try std.testing.expect(tool_result_errors.isToolExecutionFailedOutput(execution.tool_steps[0].tool_results[0].output));

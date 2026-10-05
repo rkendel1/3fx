@@ -1,3 +1,4 @@
+const ToolArgumentIntegrity = @import("../agent/tool_argument_integrity.zig").ToolArgumentIntegrity;
 const std = @import("std");
 const builtin = @import("builtin");
 const session = @import("session.zig");
@@ -58,7 +59,7 @@ pub const ConversationToolCall = struct {
     call_id: []const u8,
     tool_name: []const u8,
     arguments_json: []const u8,
-    argument_integrity: types.ToolArgumentIntegrity = .valid,
+    argument_integrity: ToolArgumentIntegrity = .valid,
     provisional_id: ?[]const u8 = null,
     provider_result: ?[]const u8 = null,
     final_identity: types.FinalToolIdentity = .valid,
@@ -2206,7 +2207,7 @@ test "history_turn_committed event decode repairs duplicate-key tool arguments" 
 
     const step = decoded.event.history_turn_committed.turn.assistant.execution.tool_steps[0];
     try std.testing.expectEqualStrings("{}", step.tool_calls[0].arguments_json);
-    try std.testing.expectEqual(types.ToolArgumentIntegrity.valid, step.tool_calls[0].argument_integrity);
+    try std.testing.expectEqual(ToolArgumentIntegrity.valid, step.tool_calls[0].argument_integrity);
     try std.testing.expectEqual(session.PersistedToolStatus.failure, step.tool_results[0].status);
     try std.testing.expect(std.mem.find(u8, step.tool_results[0].output, "tool_execution_failed") != null);
     try std.testing.expect(std.mem.find(u8, step.tool_results[0].output, duplicate_arguments) == null);
