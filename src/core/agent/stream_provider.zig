@@ -213,6 +213,56 @@ pub fn validate_prompt_lanes(
     }
 }
 
+/// Neutral model execution request. Contains only workload data and coordination
+/// fields; credentials, account, and billing information remain outside this
+/// request boundary and are handled at the compatibility layer. Every slice and
+/// JSON value is borrowed for the call.
+pub const NeutralModelRequest = struct {
+    session_id: ?[]const u8 = null,
+    model: []const u8,
+    instructions: []const types.ChatMessage = &.{},
+    messages: []const types.ChatMessage,
+    tools: ToolSelection = .{},
+    tool_choice: types.ToolChoice,
+    vision_mode: VisionMode = .unavailable,
+    provider_options: model_capabilities.ResolvedProviderOptions,
+    max_output_tokens: ?u32 = null,
+    budget: ?BuildBudget = null,
+    verified_images: ?[]const image_attachments.VerifiedSnapshot = null,
+    response_format: ?StructuredResponseFormat = null,
+    /// Exact provider body already built for capacity measurement. Borrowed
+    /// for this call and valid until `stream` returns.
+    prepared_request_body: ?[]const u8 = null,
+    trace_ctx: debug_trace.TraceContext,
+    content_capture_limit: ?usize,
+    /// Optional absolute provider deadline. Transports that support bounded
+    /// execution must stop in-flight I/O before returning `error.Timeout`.
+    deadline: ?std.Io.Clock.Timestamp = null,
+    cooperative_pulse: ?CooperativePulse = null,
+    delivery: *DeliveryCertainty,
+    attempt_evidence: *AttemptEvidence,
+    events: EventSink,
+    admission: Admission = .{},
+    cancel_flag: *std.atomic.Value(bool),
+    provider_attempt_owner: ProviderAttemptOwner = .transport,
+
+    pub fn data(self: NeutralModelRequest) RequestData {
+        return .{
+            .model = self.model,
+            .instructions = self.instructions,
+            .messages = self.messages,
+            .tools = self.tools,
+            .tool_choice = self.tool_choice,
+            .vision_mode = self.vision_mode,
+            .provider_options = self.provider_options,
+            .max_output_tokens = self.max_output_tokens,
+            .budget = self.budget,
+            .verified_images = self.verified_images,
+            .response_format = self.response_format,
+        };
+    }
+};
+
 /// Borrowed typed request. Providers own validation, wire serialization,
 /// endpoint selection, headers, HTTP, and stream reduction.
 pub const ModelRequest = struct {
@@ -285,6 +335,43 @@ pub const FailureDiagnostics = struct {
     schema: ?[]u8 = null,
     request_shape: ?[]u8 = null,
 };
+
+test "neutral model request contains no credential, account, or billing fields" {
+    const neutral_fields = std.meta.fields(NeutralModelRequest);
+
+    for (neutral_fields) |field| {
+        const name = field.name;
+        for (.{
+            "credential",
+            "api_key",
+            "secret",
+            "account_id",
+            "gateway_team",
+            "tenant",
+            "billing",
+            "provider_id",
+            "auth",
+            "source",
+            "retry_count",
+        }) |forbidden| {
+            try std.testing.expect(
+                std.mem.indexOf(u8, name, forbidden) == null,
+            ) catch return std.testing.expect(false);
+        }
+    }
+}
+
+test "model request maintains compatibility with credential field" {
+    const request_fields = std.meta.fields(ModelRequest);
+    var found_credential = false;
+    for (request_fields) |field| {
+        if (std.mem.eql(u8, field.name, "credential")) {
+            found_credential = true;
+            break;
+        }
+    }
+    try std.testing.expect(found_credential);
+}
 
 pub const DeferredUsageReference = struct {
     provider: model_provider.ProviderId,
