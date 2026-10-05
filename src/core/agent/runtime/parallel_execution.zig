@@ -49,11 +49,16 @@ fn parallelSubagentPrefixLen(registry: tool_dispatch.Registry, calls: []const To
     return len;
 }
 
-pub const GroupKind = enum { none, read_only, subagent };
+const ParallelGroupDecision = @import("../parallel_group_decision.zig").ParallelGroupDecision;
 
 pub const LeadingGroup = struct {
-    kind: GroupKind = .none,
+    kind: ParallelGroupDecision = .none,
     len: usize = 0,
+
+    /// Allocation-free projection; group extent and call ownership are unchanged.
+    pub fn decision(self: LeadingGroup) ParallelGroupDecision {
+        return self.kind;
+    }
 };
 
 pub fn leadingParallelGroup(
@@ -649,7 +654,7 @@ test "parallel classifier keeps one leading registered subagent group" {
     };
 
     const group = leadingParallelGroup(registry, &calls);
-    try std.testing.expectEqual(GroupKind.subagent, group.kind);
+    try std.testing.expectEqual(ParallelGroupDecision.subagent, group.kind);
     try std.testing.expectEqual(@as(usize, 2), group.len);
 }
 
@@ -979,4 +984,40 @@ test "parallel result duplication cleans up every allocation failure" {
         checkParallelResultDuplicationAllocationFailures,
         .{},
     );
+}
+
+test "parallel group decision projection preserves extent and all classifications" {
+    inline for (.{ ParallelGroupDecision.none, ParallelGroupDecision.read_only, ParallelGroupDecision.subagent }) |classification| {
+        const group: LeadingGroup = .{ .kind = classification, .len = 3 };
+        try std.testing.expectEqual(classification, group.decision());
+        try std.testing.expectEqual(@as(usize, 3), group.len);
+    }
+}
+
+test "parallel scheduling decision leaves invocation payload and precedence unchanged" {
+    const builtin_tools = @import("../../../builtins/tools.zig");
+    const tools = [_]tool_dispatch.Tool{ builtin_tools.read_file, builtin_tools.subagent, builtin_tools.write_file };
+    const registry: tool_dispatch.Registry = .{ .tools = &tools };
+    const alloc = std.testing.allocator;
+    const args = try alloc.dupe(u8, "{\"path\":\"README.md\"}");
+    defer alloc.free(args);
+    const calls = [_]ToolCall{
+        toolCall("read", "read_file", args),
+        toolCall("child", "subagent", "{\"request\":{\"action\":\"run\",\"task\":\"inspect\"}}"),
+        toolCall("write", "write_file", "{\"path\":\"x\",\"content\":\"y\"}"),
+    };
+    const read = leadingParallelGroup(registry, &calls);
+    try std.testing.expect(read.decision() == .read_only);
+    try std.testing.expectEqual(@as(usize, 1), read.len);
+    try std.testing.expect(calls[0].arguments_json.ptr == args.ptr);
+    try std.testing.expectEqualStrings("read", calls[0].id);
+    const child = leadingParallelGroup(registry, calls[1..]);
+    try std.testing.expect(child.decision() == .subagent);
+    try std.testing.expectEqual(@as(usize, 1), child.len);
+    const mutation = leadingParallelGroup(registry, calls[2..]);
+    try std.testing.expect(mutation.decision() == .none);
+    try std.testing.expectEqual(@as(usize, 0), mutation.len);
+    try std.testing.expect(leadingParallelGroup(.{}, &calls).decision() == .none);
+    try std.testing.expectEqualStrings("{\"path\":\"README.md\"}", args);
+    // No result-owned payload exists to deinit; the caller frees args once.
 }
