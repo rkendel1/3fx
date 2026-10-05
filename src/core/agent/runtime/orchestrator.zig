@@ -9616,7 +9616,7 @@ fn processQueuedPromptLoop(
                 )
             else
                 runtime_parallel_execution.LeadingGroup{};
-            const parallel_permission_eligible = switch (parallel_group.kind) {
+            const parallel_permission_eligible = switch (parallel_group.decision()) {
                 .none => false,
                 .read_only => root_action_permission_mode == .auto or
                     root_action_permission_mode == .yolo,
@@ -9984,7 +9984,7 @@ fn processQueuedPromptLoop(
                         "parallel_tool_group_start",
                         step_ctx,
                         "kind={s} count={d}",
-                        .{ @tagName(parallel_group.kind), executable_calls.items.len },
+                        .{ @tagName(parallel_group.decision()), executable_calls.items.len },
                     );
                     const parallel_execution_root_user_context = try buildToolExecutionRootUserContext(
                         arena,
@@ -10010,7 +10010,7 @@ fn processQueuedPromptLoop(
                         .advertised_dynamic_tool_names = advertised_dynamic_tool_names,
                         .step_ctx = step_ctx,
                     };
-                    const attempt_observer: ?runtime_parallel_execution.ParallelAttemptObserver = if (parallel_group.kind == .subagent)
+                    const attempt_observer: ?runtime_parallel_execution.ParallelAttemptObserver = if (parallel_group.decision() == .subagent)
                         .{ .ctx = &completion_publisher, .notify = ParallelSubagentCompletionPublisher.notify }
                     else
                         null;
@@ -10088,7 +10088,7 @@ fn processQueuedPromptLoop(
                     step_ctx,
                     "kind={s} count={d}",
                     .{
-                        @tagName(parallel_group.kind),
+                        @tagName(parallel_group.decision()),
                         if (parallel_run) |run| run.attempts.len else 0,
                     },
                 );
