@@ -1,3 +1,4 @@
+const FinalToolIdentity = @import("../agent/final_tool_identity.zig").FinalToolIdentity;
 const ToolArgumentIntegrity = @import("../agent/tool_argument_integrity.zig").ToolArgumentIntegrity;
 const std = @import("std");
 const builtin = @import("builtin");
@@ -62,7 +63,7 @@ pub const ConversationToolCall = struct {
     argument_integrity: ToolArgumentIntegrity = .valid,
     provisional_id: ?[]const u8 = null,
     provider_result: ?[]const u8 = null,
-    final_identity: types.FinalToolIdentity = .valid,
+    final_identity: FinalToolIdentity = .valid,
     provenance: types.ToolExecutionProvenance = .fx_local,
 };
 

@@ -1,3 +1,4 @@
+const FinalToolIdentity = @import("../core/agent/final_tool_identity.zig").FinalToolIdentity;
 const ToolArgumentDiagnostic = @import("../core/agent/tool_argument_diagnostic.zig").ToolArgumentDiagnostic;
 const ToolArgumentIntegrity = @import("../core/agent/tool_argument_integrity.zig").ToolArgumentIntegrity;
 const std = @import("std");
@@ -2756,7 +2757,7 @@ const SseToolCallAccumulator = struct {
     argument_diagnostic: ?ToolArgumentDiagnostic = null,
     provider_result: ?[]u8 = null,
     provider_result_state: ProviderResultState = .none,
-    final_identity: types.FinalToolIdentity = .valid,
+    final_identity: FinalToolIdentity = .valid,
     provenance: types.ToolExecutionProvenance = .fx_local,
 
     fn deinit(self: *SseToolCallAccumulator, alloc: std.mem.Allocator) void {
@@ -4076,7 +4077,7 @@ fn consumeSseStreamTraced(
     return completion;
 }
 
-fn finalToolIdentity(value: ?std.json.Value) types.FinalToolIdentity {
+fn finalToolIdentity(value: ?std.json.Value) FinalToolIdentity {
     const actual = value orelse return .absent;
     if (actual != .string) return .wrong_type;
     return if (actual.string.len == 0) .empty else .valid;
@@ -5555,7 +5556,7 @@ test "consumeSseStream malformed final identity borrows no streamed state" {
 test "consumeSseStream preserves final identity states without recency aliases" {
     const Case = struct {
         final_field: []const u8,
-        expected: types.FinalToolIdentity,
+        expected: FinalToolIdentity,
         expected_id: []const u8,
     };
     const cases = [_]Case{
