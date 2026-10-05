@@ -336,6 +336,47 @@ pub const FailureDiagnostics = struct {
     request_shape: ?[]u8 = null,
 };
 
+/// Neutral model completion. Contains only model-execution result data without
+/// credentials, account, billing, or vendor control-plane state.
+///
+/// This is the response-side boundary equivalent to NeutralModelRequest.
+/// The turn orchestration loop receives only neutral results without:
+/// - Account identity (resolved_provider, tenant, account_id)
+/// - Billing state (ProviderBilling, service_tier, delivery_ambiguous, billing object)
+/// - Validation state (generation_metadata_invalid, provider_result_identity_failure)
+/// - Provider control-plane (provider_failure_cause, diagnostics)
+///
+/// Included: execution result (content, tool_calls, usage, finish_reason, provider_state_json).
+/// provider_state_json is provider-owned state for protocol continuation; it is opaque
+/// to the orchestrator and passed through unchanged on retry.
+pub const NeutralModelCompletion = struct {
+    /// Model output text.
+    content: ?[]const u8 = null,
+    /// Called tools with arguments.
+    tool_calls: []const types.ToolCall = &.{},
+    /// Provider generation ID for replay/logging identity.
+    generation_id: ?[]const u8 = null,
+    /// Completion stop reason (stop/length/content_filter/tool_calls).
+    finish_reason: ?types.ProviderFinishReason = null,
+    /// Provider error text for troubleshooting.
+    provider_failure_detail: ?[]const u8 = null,
+    /// Execution facts: token consumption (not billing control).
+    /// Includes input, output, cache_read, cache_write, reasoning tokens.
+    usage: types.Usage = .{},
+    /// Opaque provider-owned state for protocol continuation on retry.
+    /// Never interpreted by neutral orchestration, passed through verbatim.
+    provider_state_json: ?[]const u8 = null,
+    /// Provider hint for retry delay (from HTTP headers).
+    retry_after_seconds: ?u64 = null,
+};
+
+/// Neutral model failure. Contains only neutral error information.
+pub const NeutralFailure = struct {
+    kind: FailureKind,
+    detail: ?[]u8 = null,
+    retry_after_seconds: ?u64 = null,
+};
+
 test "neutral model request contains no credential, account, or billing fields" {
     const neutral_fields = std.meta.fields(NeutralModelRequest);
 
@@ -371,6 +412,56 @@ test "model request maintains compatibility with credential field" {
         }
     }
     try std.testing.expect(found_credential);
+}
+
+test "neutral model completion contains no credential, account, or billing fields" {
+    const neutral_fields = std.meta.fields(NeutralModelCompletion);
+
+    for (neutral_fields) |field| {
+        const name = field.name;
+        for (.{
+            "credential",
+            "api_key",
+            "secret",
+            "account_id",
+            "gateway_team",
+            "tenant",
+            "billing",
+            "resolved_provider",
+            "service_tier",
+            "provider_id",
+            "auth",
+            "source",
+            "diagnostics",
+        }) |forbidden| {
+            try std.testing.expect(
+                std.mem.indexOf(u8, name, forbidden) == null,
+            ) catch return std.testing.expect(false);
+        }
+    }
+}
+
+test "neutral failure contains no credential, account, or billing fields" {
+    const neutral_fields = std.meta.fields(NeutralFailure);
+
+    for (neutral_fields) |field| {
+        const name = field.name;
+        for (.{
+            "credential",
+            "api_key",
+            "secret",
+            "account_id",
+            "gateway_team",
+            "tenant",
+            "billing",
+            "diagnostics",
+            "auth",
+        }) |forbidden| {
+            try std.testing.expect(
+                std.mem.indexOf(u8, name, forbidden) == null,
+            ) catch return std.testing.expect(false);
+        }
+    }
 }
 
 pub const DeferredUsageReference = struct {
@@ -491,6 +582,37 @@ pub const Result = union(enum) {
             },
         }
         self.* = undefined;
+    }
+
+    /// Projects a Completed result to its neutral completion. Borrows string
+    /// references from the original; ownership remains unchanged.
+    pub fn neutralCompletion(self: Result) NeutralModelCompletion {
+        return switch (self) {
+            .completed => |completed| .{
+                .content = completed.completion.content,
+                .tool_calls = completed.completion.tool_calls,
+                .generation_id = completed.completion.generation_id,
+                .finish_reason = completed.completion.finish_reason,
+                .provider_failure_detail = completed.completion.provider_failure_detail,
+                .usage = completed.completion.usage,
+                .provider_state_json = completed.completion.provider_state_json,
+                .retry_after_seconds = null,
+            },
+            .failed => .{},
+        };
+    }
+
+    /// Projects a Failure result to its neutral failure. Borrows string
+    /// references from the original; ownership remains unchanged.
+    pub fn neutralFailure(self: Result) NeutralFailure {
+        return switch (self) {
+            .failed => |failure| .{
+                .kind = failure.kind,
+                .detail = failure.detail,
+                .retry_after_seconds = failure.retry_after_seconds,
+            },
+            .completed => unreachable, // Caller must check result type first
+        };
     }
 };
 
@@ -619,6 +741,77 @@ test "result failure writer preserves exact error type and identity" {
     const failure = failResult(error.Cancelled);
     try std.testing.expect(@TypeOf(failure) == error{Cancelled}!Result);
     try std.testing.expectError(error.Cancelled, failure);
+}
+
+test "neutral completion projection preserves execution result and excludes billing/routing" {
+    const tool_calls = &.{.{
+        .id = "call_1",
+        .name = "read_file",
+        .arguments_json = "{\"path\":\"file.txt\"}",
+        .provisional_id = null,
+        .provider_result = null,
+    }};
+    const result = Result{ .completed = .{
+        .completion = .{
+            .content = "response text",
+            .tool_calls = tool_calls,
+            .generation_id = "gen_123",
+            .resolved_provider = "claude-3-opus", // Should NOT appear in neutral
+            .billing = .{ // Should NOT appear in neutral
+                .created_at_ms = 1234567890,
+                .model = "claude-3-opus",
+                .total_cost = 0.5,
+                .input_tokens = 100,
+                .output_tokens = 50,
+                .cache_read_tokens = 0,
+                .cache_write_tokens = 0,
+                .reasoning_tokens = null,
+                .billable_web_search_calls = 0,
+            },
+            .service_tier = .ultrafast, // Should NOT appear in neutral
+            .finish_reason = .tool_calls,
+            .provider_failure_detail = null,
+            .provider_state_json = "{\"state\":\"data\"}",
+            .usage = .{ .input_tokens = 100, .output_tokens = 50 },
+        },
+    } };
+
+    const neutral = result.neutralCompletion();
+
+    // Verify neutral fields are present
+    try std.testing.expectEqualStrings("response text", neutral.content.?);
+    try std.testing.expectEqual(@as(usize, 1), neutral.tool_calls.len);
+    try std.testing.expectEqualStrings("call_1", neutral.tool_calls[0].id);
+    try std.testing.expectEqualStrings("gen_123", neutral.generation_id.?);
+    try std.testing.expectEqual(types.ProviderFinishReason.tool_calls, neutral.finish_reason.?);
+    try std.testing.expectEqual(@as(?u64, 100), neutral.usage.input_tokens);
+    try std.testing.expectEqual(@as(?u64, 50), neutral.usage.output_tokens);
+    try std.testing.expectEqualStrings("{\"state\":\"data\"}", neutral.provider_state_json.?);
+
+    // Verify control-plane fields are NOT in the projection
+    // (compile-time check via type: neutral has no resolved_provider, billing, service_tier)
+}
+
+test "neutral failure projection preserves error info and excludes diagnostics" {
+    const result = Result{ .failed = .{
+        .kind = .rate_limited,
+        .detail = "too many requests",
+        .diagnostics = .{
+            .schema = "invalid schema", // Should NOT appear in neutral
+            .request_shape = "bad shape", // Should NOT appear in neutral
+        },
+        .retry_after_seconds = 60,
+    } };
+
+    const neutral = result.neutralFailure();
+
+    // Verify neutral fields
+    try std.testing.expectEqual(FailureKind.rate_limited, neutral.kind);
+    try std.testing.expectEqualStrings("too many requests", neutral.detail.?);
+    try std.testing.expectEqual(@as(?u64, 60), neutral.retry_after_seconds);
+
+    // Verify diagnostics are NOT in the projection
+    // (compile-time check: neutral has no diagnostics field)
 }
 
 pub const StreamFn = *const fn (
