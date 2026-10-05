@@ -2149,7 +2149,7 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
                 .interrupted = ctx.processInterruptRequested(),
                 .tool_calls = tool_calls,
                 .error_code = "NonInteractivePermissionRequired",
-                .usage = ctx.session.agent.turn_usage,
+                .usage = ctx.session.agent.turnUsage(),
             };
         },
         else => {
@@ -2300,7 +2300,7 @@ fn takePromptRunResult(ctx: *AskContext, alloc: Allocator) !PromptRunResult {
         .recovery = ctx.last_recovery_status,
         // Sessions v2 keeps no recovery checkpoint yet.
         .recovery_durable = ctx.writable != null,
-        .usage = ctx.session.agent.turn_usage,
+        .usage = ctx.session.agent.turnUsage(),
     };
 }
 

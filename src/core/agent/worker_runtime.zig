@@ -55,29 +55,7 @@ pub const BeginPromptWithSkillBindings = struct {
     skill_display_spans: []SkillDisplaySpan = &.{},
 };
 
-pub const PromptDelivery = union(enum) {
-    ordinary,
-    active_turn: u64,
-    continuation,
-
-    pub fn activeTurnId(self: PromptDelivery) ?u64 {
-        return switch (self) {
-            .active_turn => |turn_id| turn_id,
-            .ordinary, .continuation => null,
-        };
-    }
-
-    pub fn isSteering(self: PromptDelivery) bool {
-        return switch (self) {
-            .ordinary => false,
-            .active_turn, .continuation => true,
-        };
-    }
-
-    pub fn isContinuation(self: PromptDelivery) bool {
-        return self == .continuation;
-    }
-};
+pub const PromptDelivery = @import("turn_state.zig").PromptDelivery;
 
 pub const SteeringBoundaryKind = enum {
     model,

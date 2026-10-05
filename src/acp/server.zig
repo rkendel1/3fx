@@ -1869,7 +1869,7 @@ fn publishPromptOutcome(active: *ActivePrompt, outcome: prompt_handler.TerminalO
             var response: std.Io.Writer.Allocating = .init(active.alloc);
             defer response.deinit();
             const usage = if (active.state.active_session) |*session|
-                session.session_rt.agent.turn_usage
+                session.session_rt.agent.turnUsage()
             else
                 types.Usage{};
             try acp_types.writePromptResponseWithUsage(
