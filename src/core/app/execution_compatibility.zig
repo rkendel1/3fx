@@ -563,3 +563,79 @@ test "turn execution input projection excludes all auth and account state" {
         );
     }
 }
+
+/// Extract neutral model routing from the compatibility job.
+/// Borrows provider and model fields; no allocations.
+/// The compatibility job retains all credential, account, billing, and
+/// authorization state; this projection contains only the routing identity
+/// ("which endpoint/capability should execute this request").
+///
+/// ProviderSelection is the neutral routing type: it contains only the
+/// provider name (gateway, codex, grok, or configured provider name) and the
+/// model identifier, suitable for:
+/// - Model capability queries
+/// - ProviderSelection creation for replay identity
+/// - Recovery selection comparison
+/// - Routing decisions (gateway vs vendor-specific behavior)
+/// - Telemetry/metrics labels
+///
+/// It does NOT contain:
+/// - api_key or secret values
+/// - credential_source (auth provenance)
+/// - account_id (billing/authorization)
+/// - gateway_team (tenant/control-plane)
+/// - permission_mode (authorization policy)
+pub fn neutralModelRoute(job: CompatibilityExecutionJob) model_provider.ProviderSelection {
+    return .{
+        .provider = job.provider,
+        .model = job.model,
+    };
+}
+
+test "neutral model route projection extracts only routing identity" {
+    const job: CompatibilityExecutionJob = .{
+        .turn_id = 42,
+        .delivery = .ordinary,
+        .prompt = @constCast("test"),
+        .images = &.{},
+        .model = @constCast("claude-opus-5-5"),
+        .provider = .gateway,
+        .api_key = @constCast("secret-key-abc123"),
+        .credential_source = .ai_gateway_api_key,
+        .account_id = @constCast("account_xyz"),
+        .gateway_team = @constCast("team_abc"),
+        .permission_mode = .auto,
+        .history = &.{},
+        .grants = &.{},
+    };
+
+    const route = neutralModelRoute(job);
+
+    // Verify routing fields are present
+    try std.testing.expect(route.provider == .gateway);
+    try std.testing.expectEqualStrings("claude-opus-5-5", route.model);
+
+    // Verify the route borrows from the job (no copy)
+    try std.testing.expect(route.model.ptr == job.model.ptr);
+}
+
+test "neutral model route works with configured providers" {
+    const job: CompatibilityExecutionJob = .{
+        .turn_id = 77,
+        .delivery = .ordinary,
+        .prompt = @constCast("test"),
+        .images = &.{},
+        .model = @constCast("mistral-large"),
+        .provider = model_provider.parse("local-ollama").?,
+        .api_key = @constCast("ignored-key"),
+        .permission_mode = .auto,
+        .history = &.{},
+        .grants = &.{},
+    };
+
+    const route = neutralModelRoute(job);
+
+    try std.testing.expect(route.provider == .configured);
+    try std.testing.expectEqualStrings("mistral-large", route.model);
+    try std.testing.expectEqualStrings("local-ollama", route.provider.label());
+}
