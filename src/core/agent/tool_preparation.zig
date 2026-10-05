@@ -55,19 +55,13 @@ pub const ToolStatus = enum {
     failure,
 };
 
-pub const TerminalKind = enum {
-    idempotent_skip,
-    validation_failure,
-    availability_failure,
-    unsupported,
-    file_mutation_failure,
-};
+const ToolPreparationTerminalKind = @import("tool_preparation_terminal_kind.zig").ToolPreparationTerminalKind;
 
 /// A terminal classification made before permission, visible lifecycle, or
 /// execution. `model_output == null` for unsupported calls so each live loop
 /// can retain its existing exact unsupported-tool wording.
 pub const Terminal = struct {
-    kind: TerminalKind,
+    kind: ToolPreparationTerminalKind,
     model_output: ?[]u8 = null,
     status: ToolStatus = .failure,
 
@@ -276,7 +270,7 @@ fn classifyWithCallback(
     return terminal;
 }
 
-fn terminalFromCallback(kind: TerminalKind, terminal: CallbackTerminal) Terminal {
+fn terminalFromCallback(kind: ToolPreparationTerminalKind, terminal: CallbackTerminal) Terminal {
     return .{
         .kind = kind,
         .model_output = terminal.model_output,
@@ -726,7 +720,7 @@ test "advertised dynamic calls stay opaque while unsupported calls are terminal"
         .classifiers = test_classifiers,
     });
     defer unsupported.deinit(alloc);
-    try std.testing.expectEqual(TerminalKind.unsupported, unsupported.terminal.kind);
+    try std.testing.expectEqual(ToolPreparationTerminalKind.unsupported, unsupported.terminal.kind);
     try std.testing.expect(unsupported.terminal.model_output == null);
 }
 
@@ -758,7 +752,7 @@ test "live deferred dynamic calls reach dispatch while true unknown calls stay t
         .arguments_json = "{}",
     }, config);
     defer unknown.deinit(std.testing.allocator);
-    try std.testing.expectEqual(TerminalKind.unsupported, unknown.terminal.kind);
+    try std.testing.expectEqual(ToolPreparationTerminalKind.unsupported, unknown.terminal.kind);
 }
 
 test "classifiers are ordered" {
@@ -810,7 +804,7 @@ test "classifiers are ordered" {
         .arguments_json = "{\"name\":\"demo\",\"location\":\"/tmp/demo\"}",
     }, .{ .tool_registry = registry, .workspace_root = "/tmp/workspace", .classifiers = classifiers });
     defer skipped.deinit(alloc);
-    try std.testing.expectEqual(TerminalKind.idempotent_skip, skipped.terminal.kind);
+    try std.testing.expectEqual(ToolPreparationTerminalKind.idempotent_skip, skipped.terminal.kind);
     try std.testing.expectEqual(@as(usize, 1), Fixture.idempotent_calls);
     try std.testing.expectEqual(@as(usize, 0), Fixture.validation_calls);
     try std.testing.expectEqual(@as(usize, 0), Fixture.availability_calls);
@@ -821,7 +815,7 @@ test "classifiers are ordered" {
         .arguments_json = "{\"query\":\"fx context\"}",
     }, .{ .tool_registry = registry, .workspace_root = "/tmp/workspace", .classifiers = classifiers });
     defer unavailable.deinit(alloc);
-    try std.testing.expectEqual(TerminalKind.availability_failure, unavailable.terminal.kind);
+    try std.testing.expectEqual(ToolPreparationTerminalKind.availability_failure, unavailable.terminal.kind);
     try std.testing.expectEqual(@as(usize, 2), Fixture.idempotent_calls);
     try std.testing.expectEqual(@as(usize, 1), Fixture.validation_calls);
     try std.testing.expectEqual(@as(usize, 1), Fixture.availability_calls);
@@ -854,7 +848,7 @@ test "classifier validation failures remain terminal before execution" {
         },
     });
     defer result.deinit(std.testing.allocator);
-    try std.testing.expectEqual(TerminalKind.validation_failure, result.terminal.kind);
+    try std.testing.expectEqual(ToolPreparationTerminalKind.validation_failure, result.terminal.kind);
     try std.testing.expect(result.terminal.model_output.?.len > 0);
 }
 
@@ -1149,4 +1143,19 @@ test "preparation cancellation and allocation failures clean owned state" {
         checkPreparationAllocationFailures,
         .{workspace},
     );
+}
+
+test "terminal classification preserves caller output ownership" {
+    const alloc = std.testing.allocator;
+    const output = try alloc.dupe(u8, "unchanged output");
+    var terminal: Terminal = .{ .kind = .validation_failure, .model_output = output };
+    defer terminal.deinit(alloc);
+    try std.testing.expect(terminal.kind == .validation_failure);
+    try std.testing.expect(terminal.model_output.?.ptr == output.ptr);
+    try std.testing.expectEqualStrings("unchanged output", terminal.model_output.?);
+    inline for (std.meta.fields(ToolPreparationTerminalKind)) |field| {
+        terminal.kind = @enumFromInt(field.value);
+        try std.testing.expectEqual(field.value, @intFromEnum(terminal.kind));
+        try std.testing.expect(terminal.model_output.?.ptr == output.ptr);
+    }
 }
