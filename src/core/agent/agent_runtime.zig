@@ -68,4 +68,5 @@ test {
     _ = @import("runtime/orchestrator.zig");
     _ = @import("runtime/text_completion.zig");
     _ = @import("runtime/vision_contracts.zig");
+    _ = @import("execution_boundary.zig");
 }
