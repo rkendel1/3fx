@@ -163,9 +163,9 @@ fn observe_steering_boundary(
     kind: worker_runtime.SteeringBoundaryKind,
 ) !SteeringBoundaryAction {
     const boundary = try take_steering_boundary(deps, result_alloc, turn_id, kind);
-    switch (boundary) {
-        .continue_turn => |guidance| {
-            try append_steering_guidance(arena, within_turn_suffix, guidance, origin);
+    switch (boundary.decision()) {
+        .continue_turn => {
+            try append_steering_guidance(arena, within_turn_suffix, boundary.continue_turn, origin);
             return .continued;
         },
         .handoff => return .handoff,
@@ -219,8 +219,8 @@ fn append_pending_steering_after_assistant(
     boundary_kind: worker_runtime.SteeringBoundaryKind,
 ) !bool {
     const boundary = try take_steering_boundary(deps, arena, turn_id, boundary_kind);
-    const guidance = switch (boundary) {
-        .continue_turn => |messages| messages,
+    const guidance = switch (boundary.decision()) {
+        .continue_turn => boundary.continue_turn,
         .none, .handoff, .interrupt => return false,
     };
 
@@ -241,8 +241,8 @@ fn append_immediate_steering_after_cancel(
     assistant_text: []const u8,
 ) !bool {
     const boundary = try take_steering_boundary(deps, arena, turn_id, .cancelled);
-    const guidance = switch (boundary) {
-        .continue_turn => |messages| messages,
+    const guidance = switch (boundary.decision()) {
+        .continue_turn => boundary.continue_turn,
         .none, .handoff, .interrupt => return false,
     };
 

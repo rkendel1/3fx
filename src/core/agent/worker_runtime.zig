@@ -79,6 +79,16 @@ pub const SteeringBoundaryResult = union(enum) {
     continue_turn: [][]u8,
     handoff,
     interrupt,
+
+    /// Pure, allocation-free projection. The result still owns any guidance.
+    pub fn decision(self: SteeringBoundaryResult) @import("steering_decision.zig").SteeringDecision {
+        return switch (self) {
+            .none => .none,
+            .continue_turn => .continue_turn,
+            .handoff => .handoff,
+            .interrupt => .interrupt,
+        };
+    }
 };
 
 /// Resolved legacy execution shape, never ingress or a FIFO item.
@@ -7819,4 +7829,21 @@ test "neutral ingress APIs accept work and snapshot rather than execution jobs" 
         try std.testing.expect(params[3].type.? == ExecutionSnapshot);
         try std.testing.expect(params[2].type.? != CompatibilityExecutionJob);
     }
+}
+
+test "steering decision projection preserves all tags and guidance ownership" {
+    const alloc = std.testing.allocator;
+    const guidance = try alloc.alloc([]u8, 1);
+    defer alloc.free(guidance);
+    guidance[0] = try alloc.dupe(u8, "guidance");
+    defer alloc.free(guidance[0]);
+    const result: SteeringBoundaryResult = .{ .continue_turn = guidance };
+    try std.testing.expect(result.decision() == .continue_turn);
+    const copied = result.decision();
+    try std.testing.expect(copied == .continue_turn);
+    try std.testing.expect(result.continue_turn.ptr == guidance.ptr);
+    try std.testing.expectEqualStrings("guidance", result.continue_turn[0]);
+    try std.testing.expect((@as(SteeringBoundaryResult, .none)).decision() == .none);
+    try std.testing.expect((@as(SteeringBoundaryResult, .handoff)).decision() == .handoff);
+    try std.testing.expect((@as(SteeringBoundaryResult, .interrupt)).decision() == .interrupt);
 }
