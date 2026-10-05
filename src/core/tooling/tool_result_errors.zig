@@ -1,3 +1,4 @@
+const ToolArgumentDiagnostic = @import("../agent/tool_argument_diagnostic.zig").ToolArgumentDiagnostic;
 const std = @import("std");
 const builtin = @import("builtin");
 const auto_classifier = @import("../permissions/auto_classifier.zig");
@@ -415,7 +416,7 @@ fn filesystemAccessDeniedSuggestion() []const u8 {
 pub fn malformedToolArgumentsJson(
     alloc: Allocator,
     tool_name: []const u8,
-    diagnostic: ?types.ToolArgumentDiagnostic,
+    diagnostic: ?ToolArgumentDiagnostic,
 ) Allocator.Error![]u8 {
     const found = diagnostic orelse return toolExecutionFailureJson(alloc, .{
         .tool_name = tool_name,
@@ -874,7 +875,7 @@ test "malformed tool arguments JSON requests a schema-valid retry" {
 test "malformed tool arguments JSON reports the diagnosis without source bytes" {
     const alloc = std.testing.allocator;
     const raw = "{\"request\":{\"task\":\"FX_REJECTED_SOURCE_SENTINEL and more";
-    const diagnostic = try types.ToolArgumentDiagnostic.diagnose(alloc, raw);
+    const diagnostic = try ToolArgumentDiagnostic.diagnose(alloc, raw);
     const payload = try malformedToolArgumentsJson(alloc, "subagent", diagnostic);
     defer alloc.free(payload);
     try std.testing.expect(std.mem.find(u8, payload, "FX_REJECTED_SOURCE_SENTINEL") == null);
@@ -889,7 +890,7 @@ test "malformed tool arguments JSON reports the diagnosis without source bytes" 
     try std.testing.expectEqual(@as(i64, @intCast(raw.len)), details.get("received_bytes").?.integer);
     try std.testing.expectEqual(@as(i64, @intCast(raw.len)), details.get("error_offset").?.integer);
 
-    const rejected = try types.ToolArgumentDiagnostic.diagnose(alloc, "{\"a\":1,\"a\":2}");
+    const rejected = try ToolArgumentDiagnostic.diagnose(alloc, "{\"a\":1,\"a\":2}");
     const rejected_payload = try malformedToolArgumentsJson(alloc, "read_file", rejected);
     defer alloc.free(rejected_payload);
     var rejected_parsed = try std.json.parseFromSlice(std.json.Value, alloc, rejected_payload, .{});

@@ -1,3 +1,4 @@
+const ToolArgumentDiagnostic = @import("../tool_argument_diagnostic.zig").ToolArgumentDiagnostic;
 const ToolArgumentIntegrity = @import("../tool_argument_integrity.zig").ToolArgumentIntegrity;
 const std = @import("std");
 const hooks = @import("../../hooks/hooks.zig");
@@ -226,7 +227,7 @@ test "malformed function arguments report the diagnosed input they replaced" {
     try expectMalformedFeedback(from_raw.blocked.model_output.?, "truncated", raw);
 
     const provider_raw = "{\"path\":\"a\",}";
-    const provider_diagnostic = try types.ToolArgumentDiagnostic.diagnose(alloc, provider_raw);
+    const provider_diagnostic = try ToolArgumentDiagnostic.diagnose(alloc, provider_raw);
     var from_provider = try prepareToolCallForLifecycle(alloc, context, null, 1, 0, .{
         .id = "provider",
         .name = "read_file",
@@ -293,7 +294,7 @@ fn prepareToolCallFromCheckpoint(
         rejected.argument_integrity = integrity;
         // Raw arguments reach this point only when the provider did not classify them.
         if (integrity == .malformed_json and call.argument_integrity == .valid) {
-            rejected.argument_diagnostic = try types.ToolArgumentDiagnostic.diagnose(result_allocator, call.arguments_json);
+            rejected.argument_diagnostic = try ToolArgumentDiagnostic.diagnose(result_allocator, call.arguments_json);
         }
         return makePreparedBlocked(
             result_allocator,
