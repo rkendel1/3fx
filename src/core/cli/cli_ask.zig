@@ -2105,7 +2105,7 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
         .gateway_chat_url = cfg.gateway_chat_url,
         .advertised_tool_names = tool_projection.advertised_names,
         .advertised_functions = tool_projection.advertised_functions,
-        .provider_capabilities = cfg.provider_set.select(ctx.provider).capabilities,
+        .provider_capabilities = cfg.provider_set.select(ctx.provider).agentFeatures(),
         .custom_tool_guidance = tool_projection.custom_guidance,
         .agent_step_limit = startup.agent_step_limit,
         .max_tool_result_bytes = startup.max_tool_result_bytes,

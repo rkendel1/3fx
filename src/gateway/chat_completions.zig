@@ -1,6 +1,5 @@
 const std = @import("std");
 const codec = @import("chat_completions_protocol.zig");
-const client_mod = @import("client.zig");
 const definitions = @import("../core/config/configured_provider.zig");
 const streams = @import("../core/agent/stream_provider.zig");
 const provider_set = @import("../core/gateway/provider_set.zig");
@@ -11,8 +10,6 @@ const model_catalog_metadata = @import("../core/gateway/model_catalog_metadata.z
 const classifier = @import("../core/permissions/auto_classifier.zig");
 const gateway_step = @import("../core/agent/runtime/gateway_step.zig");
 const review_messages = @import("vercel_protocol.zig");
-const io = @import("../core/shared/io.zig");
-const secret = @import("../core/auth/secret.zig");
 const types = @import("../core/shared/types.zig");
 const model_provider = @import("../core/config/model_provider.zig");
 const debug_trace = @import("../core/shared/debug_trace.zig");
@@ -108,97 +105,7 @@ fn stream(raw: ?*anyopaque, alloc: Allocator, request: streams.ModelRequest) !st
     }
     const payload = request.prepared_request_body orelse try build(raw, alloc, request.data());
     defer if (request.prepared_request_body == null) alloc.free(payload);
-    return post(alloc, definition, request, token, payload) catch |err| {
-        request.attempt_evidence.network_failure = client_mod.networkFailureEvidence(err, request.delivery.load());
-        if (request.cancel_flag.load(.seq_cst)) return error.Cancelled;
-        if (request.deadline) |deadline| if (expired(deadline)) return error.Timeout;
-        return err;
-    };
-}
-
-fn expired(deadline: std.Io.Clock.Timestamp) bool {
-    return !std.Io.Clock.Timestamp.compare(std.Io.Clock.Timestamp.now(io.getIo(), .awake), .lt, deadline);
-}
-
-fn phase_deadline(milliseconds: i64, caller: ?std.Io.Clock.Timestamp) std.Io.Clock.Timestamp {
-    const phase = std.Io.Clock.Timestamp.fromNow(io.getIo(), .{ .clock = .awake, .raw = .fromMilliseconds(milliseconds) });
-    if (caller) |deadline| if (std.Io.Clock.Timestamp.compare(deadline, .lt, phase)) return deadline;
-    return phase;
-}
-
-fn post(alloc: Allocator, definition: *const definitions.Definition, request: streams.ModelRequest, token: ?[]const u8, payload: []const u8) !streams.Result {
-    const url = try definition.chat_url(alloc);
-    defer alloc.free(url);
-    const authorization = if (token) |value| try std.fmt.allocPrint(alloc, "Bearer {s}", .{value}) else null;
-    defer if (authorization) |value| secret.zeroAndFree(alloc, value);
-    var client: std.http.Client = .{ .allocator = alloc, .io = io.getIo() };
-    defer client.deinit();
-    var uri = try std.Uri.parse(url);
-    uri.scheme = if (std.ascii.eqlIgnoreCase(uri.scheme, "https")) "https" else if (std.ascii.eqlIgnoreCase(uri.scheme, "http")) "http" else return error.UnsupportedUriScheme;
-    var operation = client_mod.PostOperation{
-        .client = &client,
-        .uri = uri,
-        .authorization = authorization,
-        .extra_headers = &.{.{ .name = "accept", .value = "text/event-stream" }},
-    };
-    try request.admission.admit();
-    var opened = try client_mod.openBoundedPost(alloc, request.cancel_flag, phase_deadline(30_000, request.deadline), &operation);
-    defer opened.deinit(alloc);
-    const http = &opened.request.?;
-    var watch: client_mod.CancelWatch = .{};
-    defer watch.stop();
-    const head_deadline = phase_deadline(120_000, request.deadline);
-    if (http.connection) |connection| try watch.start(request.cancel_flag, head_deadline, connection.stream_writer.stream);
-    http.transfer_encoding = .{ .content_length = payload.len };
-    var buffer: [8192]u8 = undefined;
-    if (request.cancel_flag.load(.seq_cst)) return error.Cancelled;
-    request.delivery.markPossiblySent();
-    var body = try http.sendBodyUnflushed(&buffer);
-    try body.writer.writeAll(payload);
-    try body.end();
-    if (http.connection) |connection| try connection.flush();
-    var response = http.receiveHead(&.{}) catch |err| {
-        if (expired(head_deadline)) return error.Timeout;
-        return err;
-    };
-    watch.stop();
-    if (http.connection) |connection| try watch.start(request.cancel_flag, if (response.head.status == .ok) request.deadline else phase_deadline(30_000, request.deadline), connection.stream_writer.stream);
-    var retry_after: ?u64 = null;
-    var headers = response.head.iterateHeaders();
-    while (headers.next()) |header| if (std.ascii.eqlIgnoreCase(header.name, "retry-after")) {
-        retry_after = std.fmt.parseUnsigned(u64, std.mem.trim(u8, header.value, " \t"), 10) catch null;
-        break;
-    };
-    var transfer: [64 * 1024]u8 = undefined;
-    const reader = response.reader(&transfer);
-    if (response.head.status != .ok) {
-        var detail = reader.allocRemaining(alloc, .limited(64 * 1024)) catch |err| switch (err) {
-            error.StreamTooLong => try alloc.dupe(u8, "Provider error response exceeded the local limit"),
-            else => return err,
-        };
-        errdefer alloc.free(detail);
-        if (token) |value| {
-            const redacted = try codec.redact_error_detail(alloc, detail, value);
-            alloc.free(detail);
-            detail = redacted;
-        }
-
-        return .{ .failed = .{ .kind = switch (response.head.status) {
-            .bad_request => .invalid_request,
-            .unauthorized => .unauthorized,
-            .forbidden => .forbidden,
-            .payload_too_large => .request_too_large,
-            .too_many_requests => .rate_limited,
-            .internal_server_error => .server_error,
-            .bad_gateway => .bad_gateway,
-            .service_unavailable => .unavailable,
-            .gateway_timeout => .gateway_timeout,
-            else => .provider_error,
-        }, .detail = detail, .retry_after_seconds = retry_after, .ownership = .owned } };
-    }
-    var limits: codec.Limits = .{};
-    if (request.content_capture_limit) |limit| limits.content_bytes = @min(limit, limits.content_bytes);
-    return codec.consume_stream(alloc, reader, request.data(), limits, request.events, request.cancel_flag);
+    return @import("legacy_model_provider.zig").chat(alloc, definition, request, payload);
 }
 
 /// The returned entry borrows its strings; fetch_catalog replaces them with owned copies.

@@ -315,7 +315,7 @@ pub fn run(
             .gateway_chat_url = config.tool_context.gateway_chat_url,
             .advertised_tool_names = child_tool_names,
             .advertised_functions = child_functions,
-            .provider_capabilities = config.provider_set.select(admission.provider).capabilities,
+            .provider_capabilities = config.provider_set.select(admission.provider).agentFeatures(),
             .custom_tool_guidance = config.custom_tool_guidance,
             .agent_step_limit = config.tool_context.agent_step_limit,
             .max_tool_result_bytes = config.tool_context.max_tool_result_bytes,

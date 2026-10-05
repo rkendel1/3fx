@@ -1260,9 +1260,9 @@ pub fn Runtime(comptime App: type) type {
                 .advertised_tool_names = tool_projection.advertised_names,
                 .advertised_functions = tool_projection.advertised_functions,
                 .provider_capabilities = if (comptime @hasDecl(App, "providerSet"))
-                    app.providerSet().select(job.provider).capabilities
+                    app.providerSet().select(job.provider).agentFeatures()
                 else if (job.provider == .gateway)
-                    .{ .fx_search = true, .vision_fallback = true }
+                    .{ .native_search = true, .vision_fallback = true }
                 else
                     .{},
                 .custom_tool_guidance = tool_projection.custom_guidance,

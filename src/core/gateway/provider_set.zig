@@ -38,6 +38,15 @@ pub const Bundle = struct {
     credits: ?gateway_provider.CreditsProvider = null,
     fx_search: ?web_search_provider.Provider = null,
 
+    /// Compatibility projection at the composition edge, not an agent dependency.
+    pub fn agentFeatures(self: Bundle) @import("../agent/model_provider.zig").ModelFeatures {
+        return .{
+            .prompt_caching = self.capabilities.gateway_prompt_caching,
+            .native_search = self.capabilities.fx_search,
+            .vision_fallback = self.capabilities.vision_fallback,
+        };
+    }
+
     pub fn agent_stream_or_unavailable(self: Bundle) stream_provider.Provider {
         return self.agent_stream orelse stream_provider.unavailable_provider;
     }
