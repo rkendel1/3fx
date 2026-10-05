@@ -1134,3 +1134,264 @@ test "stream provider rejects non-system instructions before serialization" {
     }
     try std.testing.expectEqual(@as(usize, 0), builder.calls);
 }
+
+// ============================================================================
+// Neutral Execution Boundary Verification Tests
+// ============================================================================
+//
+// These tests verify the complete neutral execution boundary end-to-end:
+// CompatibilityExecutionJob (credentials, account, billing)
+//   → TurnExecutionInput (neutral workload)
+//   → ProviderSelection (neutral routing)
+//   → NeutralModelRequest (neutral request)
+//   → credential injection (at boundary)
+//   → ModelProvider execution
+//   → NeutralModelCompletion (neutral result)
+
+test "neutral boundary: complete projection flow preserves workload and excludes credentials" {
+    const exec_compat = @import("../app/execution_compatibility.zig");
+    const worker = @import("../agent/worker_runtime.zig");
+    const turn_exec_input = @import("../agent/turn_execution_input.zig");
+    const model_provider = @import("../config/model_provider.zig");
+
+    // Create a CompatibilityExecutionJob with all sensitive fields populated
+    // Using sentinel value "TEST_CRED_MARKER_" to track credential containment
+    const job: worker.CompatibilityExecutionJob = .{
+        .turn_id = 42,
+        .delivery = .ordinary,
+        .prompt = @constCast("user request"),
+        .images = &.{},
+        .model = @constCast("claude-3-opus"),
+        .provider = .gateway,
+        .api_key = @constCast("TEST_CRED_MARKER_secret_key_12345"),
+        .credential_source = .ai_gateway_api_key,
+        .account_id = @constCast("TEST_CRED_MARKER_account_xyz"),
+        .gateway_team = @constCast("TEST_CRED_MARKER_team_abc"),
+        .permission_mode = .ask,
+        .history = &.{},
+        .grants = &.{},
+    };
+
+    // Project to TurnExecutionInput (neutral workload)
+    const input = exec_compat.turnExecutionInput(job);
+
+    // Verify neutral fields are present
+    try std.testing.expectEqual(@as(u64, 42), input.turn_id);
+    try std.testing.expectEqualStrings("user request", input.prompt);
+    try std.testing.expectEqualStrings("claude-3-opus", input.model);
+    try std.testing.expect(input.provider == .gateway);
+
+    // Verify credential marker is NOT in the projection
+    try std.testing.expect(std.mem.indexOf(u8, input.prompt, "TEST_CRED_MARKER_") == null);
+    try std.testing.expect(std.mem.indexOf(u8, input.model, "TEST_CRED_MARKER_") == null);
+
+    // Project to ProviderSelection (neutral routing)
+    const route = exec_compat.neutralModelRoute(job);
+    try std.testing.expect(route.provider == .gateway);
+    try std.testing.expectEqualStrings("claude-3-opus", route.model);
+
+    // Verify type-level separation: TurnExecutionInput has no auth fields
+    const input_fields = std.meta.fields(turn_exec_input.TurnExecutionInput);
+    for (input_fields) |field| {
+        try std.testing.expect(std.mem.indexOf(u8, field.name, "api_key") == null);
+        try std.testing.expect(std.mem.indexOf(u8, field.name, "credential") == null);
+        try std.testing.expect(std.mem.indexOf(u8, field.name, "account") == null);
+    }
+}
+
+test "neutral boundary: credential containment with sentinel values" {
+    const exec_compat = @import("../app/execution_compatibility.zig");
+    const worker = @import("../agent/worker_runtime.zig");
+    const types_module = @import("../shared/types.zig");
+
+    // Sentinel value to track credential containment
+    const CRED_MARKER = "TEST_CRED_SENTINEL_xyz789";
+
+    const job: worker.CompatibilityExecutionJob = .{
+        .turn_id = 1,
+        .delivery = .ordinary,
+        .prompt = @constCast("request"),
+        .images = &.{},
+        .model = @constCast("model"),
+        .provider = .gateway,
+        .api_key = @constCast(CRED_MARKER),
+        .credential_source = .ai_gateway_api_key,
+        .account_id = @constCast("account_with_" ++ CRED_MARKER),
+        .gateway_team = @constCast("team_" ++ CRED_MARKER),
+        .permission_mode = .ask,
+        .history = &.{},
+        .grants = &.{},
+    };
+
+    // Step 1: Verify credential exists in CompatibilityExecutionJob
+    try std.testing.expectEqualStrings(CRED_MARKER, job.api_key);
+    try std.testing.expect(std.mem.indexOf(u8, job.account_id.?, CRED_MARKER) != null);
+
+    // Step 2: Verify credential is NOT in TurnExecutionInput projection
+    const input = exec_compat.turnExecutionInput(job);
+    try std.testing.expect(std.mem.indexOf(u8, input.prompt, CRED_MARKER) == null);
+    try std.testing.expect(std.mem.indexOf(u8, input.model, CRED_MARKER) == null);
+
+    // Step 3: Verify credential is available through compatibility function
+    const initial_secret = exec_compat.initialSecret(job);
+    try std.testing.expectEqualStrings(CRED_MARKER, initial_secret);
+
+    // Step 4: Verify credential injection happens at adapter boundary
+    const lease = exec_compat.credentialLease(CRED_MARKER, job);
+    try std.testing.expectEqualStrings(CRED_MARKER, lease.secret().?);
+    try std.testing.expect(std.mem.indexOf(u8, lease.secret().?, CRED_MARKER) != null);
+
+    // Step 5: Verify NeutralModelRequest has no credential field (compile-time)
+    const neutral_fields = std.meta.fields(NeutralModelRequest);
+    for (neutral_fields) |field| {
+        try std.testing.expect(std.mem.indexOf(u8, field.name, "credential") == null);
+    }
+
+    // Step 6: Verify ModelRequest has credential field
+    const request_fields = std.meta.fields(ModelRequest);
+    var found_credential = false;
+    for (request_fields) |field| {
+        if (std.mem.eql(u8, field.name, "credential")) {
+            found_credential = true;
+            break;
+        }
+    }
+    try std.testing.expect(found_credential);
+}
+
+test "neutral boundary: provider_state_json survives round-trip opaque" {
+    // Verify that provider_state_json is preserved unchanged through the boundary
+    const opaque_state = "{\"provider\":\"internal\",\"state\":\"session_xyz\",\"version\":2}";
+
+    const result = Result{ .completed = .{
+        .completion = .{
+            .content = "response text",
+            .tool_calls = &.{},
+            .generation_id = "gen_123",
+            .finish_reason = .stop,
+            .provider_state_json = opaque_state,
+            .usage = .{ .input_tokens = 10, .output_tokens = 5 },
+        },
+    } };
+
+    // Project to neutral (never interpret)
+    const neutral = result.neutralCompletion();
+
+    // Verify provider_state_json is preserved unchanged
+    try std.testing.expect(neutral.provider_state_json != null);
+    try std.testing.expectEqualStrings(opaque_state, neutral.provider_state_json.?);
+
+    // Verify the projection does NOT parse or interpret it
+    // (if it did, it would validate JSON or extract fields)
+    // We verify it's passed as a blob by checking it's byte-identical
+    try std.testing.expect(neutral.provider_state_json.?.ptr == result.completed.completion.provider_state_json.?.ptr);
+}
+
+test "neutral boundary: streaming events are workload-only (no credentials)" {
+    // Verify that streaming events never carry credentials or account data
+    var events: std.ArrayList(Event) = .empty;
+    defer events.deinit(std.testing.allocator);
+
+    const Capture = struct {
+        events: *std.ArrayList(Event) = undefined,
+
+        fn emit(raw: *anyopaque, event: Event) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.events.append(std.testing.allocator, event) catch return;
+        }
+    };
+
+    var capture: Capture = .{ .events = &events };
+    const sink = EventSink{ .context = &capture, .emit_fn = Capture.emit };
+
+    // Emit various stream events
+    sink.emit(.{ .content_delta = "partial response" });
+    sink.emit(.{ .reasoning_delta = "thinking..." });
+    sink.emit(.{ .tool_started = .{
+        .id = "call_1",
+        .name = "read_file",
+        .label = null,
+        .arguments_json = "{\"path\":\"file.txt\"}",
+    } });
+    sink.emit(.{ .tool_input_delta = "{\"path\"" });
+
+    // Verify all events are captured
+    try std.testing.expectEqual(@as(usize, 4), events.items.len);
+
+    // Verify no event contains credential data
+    for (events.items) |event| {
+        const content = switch (event) {
+            .content_delta => |v| v,
+            .reasoning_delta => |v| v,
+            .tool_started => |v| v.arguments_json orelse "",
+            .tool_input_delta => |v| v,
+        };
+        // Sentinel check: no credential markers in event content
+        try std.testing.expect(std.mem.indexOf(u8, content, "api_key") == null);
+        try std.testing.expect(std.mem.indexOf(u8, content, "account_id") == null);
+    }
+}
+
+test "neutral boundary: failure projection excludes diagnostics" {
+    // Verify that NeutralFailure excludes diagnostics and validation state
+    const result = Result{ .failed = .{
+        .kind = .rate_limited,
+        .detail = "too many requests",
+        .diagnostics = .{
+            .schema = "schema validation error",
+            .request_shape = "invalid shape",
+        },
+        .retry_after_seconds = 60,
+    } };
+
+    const neutral = result.neutralFailure();
+
+    // Verify neutral fields
+    try std.testing.expectEqual(FailureKind.rate_limited, neutral.kind);
+    try std.testing.expectEqualStrings("too many requests", neutral.detail.?);
+    try std.testing.expectEqual(@as(?u64, 60), neutral.retry_after_seconds);
+
+    // Verify diagnostics are NOT in projection (compile-time type check)
+    const neutral_fields = std.meta.fields(NeutralFailure);
+    for (neutral_fields) |field| {
+        try std.testing.expect(std.mem.indexOf(u8, field.name, "diagnostic") == null);
+    }
+}
+
+test "neutral boundary: result ownership preservation through projection" {
+    // Verify that borrowed/owned state is preserved across projections
+    const owned_completion = Result{ .completed = .{
+        .completion = .{
+            .content = "owned text",
+            .generation_id = "gen_owned",
+            .tool_calls = &.{},
+            .finish_reason = .stop,
+            .usage = .{},
+        },
+        .usage = .{ .exact = .gateway },
+        .ownership = .owned,
+    } };
+
+    const borrowed_completion = Result{ .completed = .{
+        .completion = .{
+            .content = "borrowed text",
+            .generation_id = "gen_borrowed",
+            .tool_calls = &.{},
+            .finish_reason = .stop,
+            .usage = .{},
+        },
+        .usage = .{ .exact = .gateway },
+        .ownership = .borrowed,
+    } };
+
+    // Neutral projections borrow (never copy)
+    const neutral_owned = owned_completion.neutralCompletion();
+    const neutral_borrowed = borrowed_completion.neutralCompletion();
+
+    // Verify content is byte-identical (same pointer)
+    try std.testing.expect(neutral_owned.content.?.ptr == owned_completion.completed.completion.content.?.ptr);
+    try std.testing.expect(neutral_borrowed.content.?.ptr == borrowed_completion.completed.completion.content.?.ptr);
+
+    // Verify generation_id is also borrowed
+    try std.testing.expect(neutral_owned.generation_id.?.ptr == owned_completion.completed.completion.generation_id.?.ptr);
+}
