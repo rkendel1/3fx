@@ -5029,13 +5029,6 @@ fn restorePromptAfterTerminalFailure(
 // resume would auto-continue a turn the user explicitly stopped. Covers the
 // model-response cancel paths, including a cancel during an episode's first
 // retry wait; no-ops when no checkpoint exists.
-fn clearRecoveryCheckpointOnUserCancel(deps: *const AgentRuntimeDeps) void {
-    const effect = deps.recovery_checkpoint orelse return;
-    effect.clear(deps.ctx) catch |err| {
-        debug_trace.logf("agent", "recovery checkpoint clear on cancel failed err={s}", .{@errorName(err)});
-    };
-}
-
 fn defaultRecoveryDiagnostic(cause: model_response_recovery.FailureCause) types.ModelFailureDiagnostic {
     if (cause == .content_filter) return types.ModelFailureDiagnostic.init("content_filter");
     return types.ModelFailureDiagnostic.forCause(checkpointCause(cause));
@@ -6637,7 +6630,7 @@ fn processQueuedPromptLoop(
                 "",
             )) continue :agent_steps_loop;
             runtime_telemetry.traceCancelObserved(step_ctx, false);
-            clearRecoveryCheckpointOnUserCancel(deps);
+            runtime_interruption.clearRecoveryCheckpointOnUserCancel(deps);
             try runtime_interruption.persistInterruptedTurnOnce(deps, finalization, job, null, null, completed_tool_names.items, &interrupted_persisted, step_ctx, within_turn_suffix.items, stop_state.retained_candidate, &stop_state.terminal_materializing);
             finish_trace.finish("interrupted");
             return;
@@ -7549,7 +7542,7 @@ fn processQueuedPromptLoop(
                         }
                         continue :agent_steps_loop;
                     }
-                    clearRecoveryCheckpointOnUserCancel(deps);
+                    runtime_interruption.clearRecoveryCheckpointOnUserCancel(deps);
                     try runtime_interruption.persistInterruptedTurnOnce(deps, finalization, job, interruption_source, null, completed_tool_names.items, &interrupted_persisted, step_ctx, within_turn_suffix.items, stop_state.retained_candidate, &stop_state.terminal_materializing);
                     finish_trace.finish("interrupted");
                     return;
@@ -8123,7 +8116,7 @@ fn processQueuedPromptLoop(
                             }
                             continue :agent_steps_loop;
                         }
-                        clearRecoveryCheckpointOnUserCancel(deps);
+                        runtime_interruption.clearRecoveryCheckpointOnUserCancel(deps);
                         try runtime_interruption.persistInterruptedTurnOnce(deps, finalization, job, interruption_source, null, completed_tool_names.items, &interrupted_persisted, step_ctx, within_turn_suffix.items, stop_state.retained_candidate, &stop_state.terminal_materializing);
                         finish_trace.finish("interrupted");
                         return;
@@ -8177,7 +8170,7 @@ fn processQueuedPromptLoop(
                     }
                     continue :agent_steps_loop;
                 }
-                clearRecoveryCheckpointOnUserCancel(deps);
+                runtime_interruption.clearRecoveryCheckpointOnUserCancel(deps);
                 try runtime_interruption.persistInterruptedTurnOnce(deps, finalization, job, interruption_source, null, completed_tool_names.items, &interrupted_persisted, step_ctx, within_turn_suffix.items, stop_state.retained_candidate, &stop_state.terminal_materializing);
                 finish_trace.finish("interrupted");
                 return;
@@ -8498,7 +8491,7 @@ fn processQueuedPromptLoop(
                             }
                             continue :agent_steps_loop;
                         }
-                        clearRecoveryCheckpointOnUserCancel(deps);
+                        runtime_interruption.clearRecoveryCheckpointOnUserCancel(deps);
                         try runtime_interruption.persistInterruptedTurnOnce(deps, finalization, job, partial_assistant, null, completed_tool_names.items, &interrupted_persisted, step_ctx, within_turn_suffix.items, stop_state.retained_candidate, &stop_state.terminal_materializing);
                         finish_trace.finish("interrupted");
                         return;
