@@ -472,3 +472,24 @@ test "turn coordinator projection preserves identity delivery and borrowed state
     try std.testing.expectEqual(@as(usize, 0), projected.attempt);
     try std.testing.expectEqual(@as(usize, 0), projected.step);
 }
+
+/// Borrow the already-projected neutral coordinator; no captured host data is
+/// read or retained by loop control and no additional allocation is performed.
+pub fn loopControl(coordinator_state: *@import("../agent/turn_coordinator.zig").TurnCoordinator) @import("../agent/loop_control.zig").LoopControl {
+    return .{ .coordinator = coordinator_state };
+}
+
+test "loop control projection preserves coordinator identity and initial index" {
+    var state: @import("../agent/turn_state.zig").TurnState = .{};
+    var cancel: std.atomic.Value(bool) = .init(false);
+    var turn: @import("../agent/turn_coordinator.zig").TurnCoordinator = .{
+        .turn_id = 7,
+        .delivery = .ordinary,
+        .turn_state = &state,
+        .cancel_flag = &cancel,
+        .step_limit = 3,
+    };
+    const control = loopControl(&turn);
+    try std.testing.expect(control.coordinator == &turn);
+    try std.testing.expectEqual(@as(usize, 0), control.current_step_index);
+}
