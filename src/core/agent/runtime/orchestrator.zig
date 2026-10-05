@@ -21,10 +21,7 @@ const text_utils = @import("../../shared/text_utils.zig");
 const file_mutation_contract = @import("../../tooling/file_mutation_contract.zig");
 const io_mod = @import("../../shared/io.zig");
 const host_target = @import("../../hosts/target.zig");
-const secret = @import("../../auth/secret.zig");
-const auth_transition = @import("../../auth/auth_transition.zig");
-const credentials = @import("../../auth/credentials.zig");
-const credential_authority = @import("../../auth/credential_authority.zig");
+const execution_compatibility = @import("../../app/execution_compatibility.zig");
 const tool_dispatch = @import("../../tooling/tool_dispatch.zig");
 const model_tool_schema = @import("../../tooling/model_tool_schema.zig");
 const command_result_mapping = @import("../../tooling/command_result_mapping.zig");
@@ -76,7 +73,6 @@ const ToolCall = types.ToolCall;
 const CompatibilityExecutionJob = worker_runtime.CompatibilityExecutionJob;
 const TraceContext = debug_trace.TraceContext;
 const AgentRuntimeDeps = runtime_deps.AgentRuntimeDeps;
-const CredentialRefreshMode = runtime_deps.CredentialRefreshMode;
 
 const http_error_detail_max_bytes: usize = 4096;
 const assistant_prefill_recovery_prompt =
@@ -3744,106 +3740,6 @@ fn recoverySelectionChanged(
         checkpoint.requested_ultrafast_mode != selected_ultrafast_mode;
 }
 
-fn recoveryCredentialAuthorityMatches(
-    checkpoint: session_codec.RecoveryCheckpoint,
-    source: ?types.CredentialSource,
-    account_id: ?[]const u8,
-) bool {
-    const expected_source = checkpoint.authority.credential_source orelse return false;
-    const expected_identity = checkpoint.authority.credential_identity orelse return false;
-    const current_source = source orelse return false;
-    if (current_source != expected_source) return false;
-    const current_identity = credential_authority.derive(
-        current_source,
-        account_id,
-    ) orelse return false;
-    return expected_identity.eql(current_identity);
-}
-
-fn shouldRejectRecoveryAuthority(
-    checkpoint: session_codec.RecoveryCheckpoint,
-    source: ?types.CredentialSource,
-    account_id: ?[]const u8,
-) bool {
-    if (checkpoint.disposition == .history_only) return true;
-    const provider_may_have_received_request = checkpoint.outstanding_reservation or
-        checkpoint.consumed_provider_attempts > 0;
-    return provider_may_have_received_request and !recoveryCredentialAuthorityMatches(
-        checkpoint,
-        source,
-        account_id,
-    );
-}
-
-test "potentially sent recovery rejects missing or changed credential authority" {
-    const identity = credential_authority.derive(
-        .chatgpt_subscription,
-        "acct_1",
-    ).?;
-    const checkpoint = session_codec.RecoveryCheckpoint{
-        .turn_id = 1,
-        .user = .{ .text = @constCast("continue") },
-        .assistant_source = @constCast("partial"),
-        .cause = .response_interrupted,
-        .action = .continuing_response,
-        .authority = .{
-            .provider = .codex,
-            .model = @constCast("gpt-5.4"),
-            .credential_source = .chatgpt_subscription,
-            .credential_identity = identity,
-        },
-        .requested_fast_mode = false,
-        .fast_mode = false,
-        .max_provider_attempts = 3,
-        .consumed_provider_attempts = 1,
-    };
-    try std.testing.expect(!shouldRejectRecoveryAuthority(
-        checkpoint,
-        .chatgpt_subscription,
-        "acct_1",
-    ));
-    try std.testing.expect(shouldRejectRecoveryAuthority(
-        checkpoint,
-        .chatgpt_subscription,
-        "acct_2",
-    ));
-
-    var legacy = checkpoint;
-    legacy.authority.credential_source = null;
-    legacy.authority.credential_identity = null;
-    try std.testing.expect(shouldRejectRecoveryAuthority(
-        legacy,
-        .chatgpt_subscription,
-        "acct_1",
-    ));
-    legacy.authority.credential_source = .ai_gateway_api_key;
-    legacy.authority.credential_identity = credential_authority.derive(
-        .ai_gateway_api_key,
-        null,
-    );
-    try std.testing.expect(!shouldRejectRecoveryAuthority(
-        legacy,
-        .ai_gateway_api_key,
-        null,
-    ));
-    try std.testing.expect(shouldRejectRecoveryAuthority(
-        legacy,
-        .stored_key,
-        null,
-    ));
-    legacy.authority.credential_source = null;
-    legacy.authority.credential_identity = null;
-    legacy.consumed_provider_attempts = 0;
-    try std.testing.expect(!shouldRejectRecoveryAuthority(
-        legacy,
-        .chatgpt_subscription,
-        "acct_1",
-    ));
-    legacy.disposition = .history_only;
-    try std.testing.expect(shouldRejectRecoveryAuthority(legacy, .chatgpt_subscription, "acct_1"));
-    try std.testing.expect(shouldRejectRecoveryAuthority(legacy, null, null));
-}
-
 fn checkpointCause(
     cause: model_response_recovery.FailureCause,
 ) types.ModelRecoveryCause {
@@ -3978,18 +3874,7 @@ fn persistRecoveryCheckpoint(
         .cause = checkpointCause(cause),
         .action = checkpointAction(strategy),
         .tool_state = checkpointToolState(tool_evidence),
-        .authority = .{
-            .provider = job.provider,
-            .model = @constCast(route_model),
-            .credential_source = job.credential_source,
-            .credential_identity = if (job.credential_source) |source|
-                credential_authority.derive(
-                    source,
-                    job.account_id,
-                )
-            else
-                null,
-        },
+        .authority = execution_compatibility.recoveryAuthority(job, route_model),
         .requested_fast_mode = requested_fast_mode,
         .fast_mode = fast_mode,
         .requested_ultrafast_mode = job.agent_settings.ultrafast_mode,
@@ -4047,12 +3932,7 @@ const CompactionSource = struct {
             .cause = .compaction_prepared,
             .action = if (self.tool_evidence == .confirmed) .continuing_after_tool else .retrying_request,
             .tool_state = checkpointToolState(self.tool_evidence),
-            .authority = .{
-                .provider = job.provider,
-                .model = @constCast(self.route_model),
-                .credential_source = job.credential_source,
-                .credential_identity = if (job.credential_source) |source| credential_authority.derive(source, job.account_id) else null,
-            },
+            .authority = execution_compatibility.recoveryAuthority(job, self.route_model),
             .requested_fast_mode = self.requested_fast_mode,
             .fast_mode = self.fast_mode,
             .max_provider_attempts = self.attempt_limit,
@@ -4897,57 +4777,6 @@ fn unsafeNoRetryReason(
         .assistant_output;
 }
 
-fn refreshGatewayCredentialForJob(
-    deps: *const AgentRuntimeDeps,
-    alloc: Allocator,
-    job: CompatibilityExecutionJob,
-    mode: CredentialRefreshMode,
-    active_api_key: *[]const u8,
-    owned_api_key: *?[]u8,
-    trace_ctx: TraceContext,
-) !bool {
-    const source = job.credential_source orelse return false;
-    if (!credentials.sourceRefreshable(source)) return false;
-    const refresh = deps.refresh_gateway_credential orelse return false;
-
-    const refreshed = refresh(deps.ctx, alloc, source, mode, job.account_id) catch |err| {
-        if (err == error.OutOfMemory) return err;
-        debug_trace.eventf(
-            "gateway",
-            "credential_refresh_failed",
-            trace_ctx,
-            "source={s} mode={s} err={s}",
-            .{ @tagName(source), @tagName(mode), @errorName(err) },
-        );
-        return false;
-    } orelse return false;
-    const previous_api_key = active_api_key.*;
-    if (comptime !host_target.is_wasm) {
-        if (deps.usage) |usage| {
-            if (source == .chatgpt_subscription or source == .grok_subscription) {
-                usage.clearReconciliationCredential();
-            } else {
-                usage.refreshReconciliationCredential(
-                    deps.usage_allocator,
-                    previous_api_key,
-                    refreshed,
-                );
-            }
-        }
-    }
-    if (owned_api_key.*) |old| secret.zeroAndFree(alloc, old);
-    owned_api_key.* = refreshed;
-    active_api_key.* = refreshed;
-    debug_trace.eventf(
-        "gateway",
-        "credential_refreshed",
-        trace_ctx,
-        "source={s} mode={s}",
-        .{ @tagName(source), @tagName(mode) },
-    );
-    return true;
-}
-
 fn auto_retry_status(
     failed_attempt: usize,
     attempt_limit: usize,
@@ -5469,15 +5298,7 @@ fn processQueuedPromptInner(
     var arena_state = std.heap.ArenaAllocator.init(std.heap.c_allocator);
     defer mem_utils.deinit_arena(arena_state);
     const arena = arena_state.allocator();
-    var job = borrowed_job;
-    job.account_id = if (borrowed_job.account_id) |account_id|
-        try arena.dupe(u8, account_id)
-    else
-        null;
-    job.gateway_team = if (borrowed_job.gateway_team) |gateway_team|
-        try arena.dupe(u8, gateway_team)
-    else
-        null;
+    const job = try execution_compatibility.copyAuthorityForTurn(arena, borrowed_job);
 
     var summary_accumulator = runtime_telemetry.TurnSummaryAccumulator.init(
         io_mod.milliTimestamp(),
@@ -5853,34 +5674,6 @@ fn containsImageId(image_ids: []const usize, candidate: usize) bool {
     return false;
 }
 
-fn buildReviewTurnContext(
-    config: Config,
-    model: []const u8,
-    root_user_intent_context: []const u8,
-    current_turn_messages: []const ChatMessage,
-    pending_assistant: ChatMessage,
-    credential: types.CredentialLease,
-    target_call_id: []const u8,
-    review_attempt_available: bool,
-) permission_auto_classifier.ReviewTurnContext {
-    const trusted_root_context = auto_classifier_context.rootUserRequestContext(
-        root_user_intent_context,
-    ) orelse "";
-    return .{
-        .model = model,
-        .pending_assistant = pending_assistant,
-        .credential = credential,
-        .target_call_id = target_call_id,
-        .review_attempt_available = review_attempt_available,
-        .origin = switch (config.origin) {
-            .root => .root,
-            .subagent => .subagent,
-        },
-        .trusted_root_context = trusted_root_context,
-        .current_turn_untrusted_messages = current_turn_messages,
-    };
-}
-
 fn permissionDeniedModelOutput(
     alloc: Allocator,
     tool_name: []const u8,
@@ -5901,19 +5694,6 @@ fn permissionDeniedModelOutput(
             reason,
         ),
     };
-}
-
-fn activeCredentialLease(
-    secret_value: []const u8,
-    job: CompatibilityExecutionJob,
-) types.CredentialLease {
-    if (job.credential_source == .host_managed) return .host_managed;
-    return .{ .direct = .{
-        .secret_bytes = secret_value,
-        .source = job.credential_source,
-        .account_id = job.account_id,
-        .tenant_context = job.gateway_team,
-    } };
 }
 
 fn reviewFeedbackMemory(reason: types.ToolPermissionDenialReason, output: []const u8) ?types.ToolResultMemory {
@@ -6766,9 +6546,9 @@ fn processQueuedPromptLoop(
                 job.history,
             ),
     };
-    var active_api_key: []const u8 = job.api_key;
+    var active_api_key: []const u8 = execution_compatibility.initialSecret(job);
     var owned_refreshed_api_key: ?[]u8 = null;
-    defer if (owned_refreshed_api_key) |key| secret.zeroAndFree(std.heap.c_allocator, key);
+    defer if (owned_refreshed_api_key) |key| execution_compatibility.releaseSecret(std.heap.c_allocator, key);
     var summary_accumulator = summary_accumulator_ptr.*;
     defer summary_accumulator_ptr.* = summary_accumulator;
     var finish_trace = finish_trace_ptr.*;
@@ -6813,13 +6593,7 @@ fn processQueuedPromptLoop(
     else
         false;
     if (job.recovery_checkpoint) |checkpoint| {
-        if (shouldRejectRecoveryAuthority(
-            checkpoint,
-            job.credential_source,
-            job.account_id,
-        )) {
-            return error.RecoveryCredentialAuthorityChanged;
-        }
+        try execution_compatibility.validateRecovery(job, checkpoint);
     }
     const restored_budget_exhausted = if (job.recovery_checkpoint) |checkpoint|
         !selection_changed and restored_attempts >= checkpoint.max_provider_attempts
@@ -7063,7 +6837,7 @@ fn processQueuedPromptLoop(
             if (skip_next_preflight_refresh) {
                 skip_next_preflight_refresh = false;
             } else {
-                _ = try refreshGatewayCredentialForJob(
+                _ = try execution_compatibility.refreshCredential(
                     deps,
                     std.heap.c_allocator,
                     job,
@@ -7376,9 +7150,6 @@ fn processQueuedPromptLoop(
                         .provider = job.provider,
                         .model = gateway_model,
                         .api_key = active_api_key,
-                        .credential_source = job.credential_source,
-                        .account_id = job.account_id,
-                        .gateway_team = job.gateway_team,
                         .session_id = lifecycle.scope.session_id,
                         .retry_count = config.gateway_retry_count,
                         .provider_options = request_data.provider_options,
@@ -7392,6 +7163,7 @@ fn processQueuedPromptLoop(
                         // After an overflow it no longer fits.
                         .conversation = if (overflow_pending) null else request_data,
                     };
+                    execution_compatibility.configureSideCall(&summary_model, job);
                     var compaction_failure: ?compaction_activity.ErrorProvenance = null;
                     const compacted = compactContext(arena, deps, .{
                         .activity_origin = if (overflow_pending) .provider_overflow else .automatic,
@@ -7531,15 +7303,7 @@ fn processQueuedPromptLoop(
                 .pending_status = &pending_auto_retry_status,
             };
             var model_request = agent_stream_provider.ModelRequest{
-                .credential = if (job.credential_source == .host_managed)
-                    .host_managed
-                else
-                    .{ .direct = .{
-                        .secret_bytes = active_api_key,
-                        .source = job.credential_source orelse .ai_gateway_api_key,
-                        .account_id = job.account_id,
-                        .tenant_context = job.gateway_team,
-                    } },
+                .credential = execution_compatibility.modelRequestLease(active_api_key, job),
                 .session_id = lifecycle.scope.session_id,
                 .model = gateway_model,
                 .retry_count = config.gateway_retry_count,
@@ -7965,16 +7729,15 @@ fn processQueuedPromptLoop(
             stream_result_set = true;
             pushNetworkRecord(deps, job.provider, gateway_model, gateway_wait_started_ms, &stream_result);
             const first_failure = streamFailure(stream_result);
-            const auth_replay = auth_transition.decideAuthReplay(.{
+            const auth_replay = execution_compatibility.replayDecision(job, .{
                 .authentication_rejected = first_failure != null and first_failure.?.kind == .unauthorized,
-                .refreshable = if (job.credential_source) |source| credentials.sourceRefreshable(source) else false,
                 .delivery_safe = stream_ctx.interruption_source_or("").len == 0 and
                     !stream_ctx.saw_tool_start and
                     streamCompletion(stream_result).tool_calls.len == 0,
                 .already_replayed = auth_retry_used,
             });
             if (auth_replay == .refresh_and_replay) {
-                if (try refreshGatewayCredentialForJob(
+                if (try execution_compatibility.refreshCredential(
                     deps,
                     std.heap.c_allocator,
                     job,
@@ -7986,7 +7749,7 @@ fn processQueuedPromptLoop(
                     auth_retry_used = true;
                     var replay_delivery = runtime_gateway_step.DeliveryCertainty.init();
                     var replay_evidence: runtime_gateway_step.AttemptEvidence = .{};
-                    model_request.credential.direct.secret_bytes = active_api_key;
+                    execution_compatibility.replaceLeaseSecret(&model_request.credential, active_api_key);
                     model_request.delivery = &replay_delivery;
                     model_request.attempt_evidence = &replay_evidence;
                     const replay_wait_started_ms = io_mod.milliTimestamp();
@@ -8942,7 +8705,7 @@ fn processQueuedPromptLoop(
                 job.model,
                 request_capabilities,
             );
-            try deps.push_http_error(deps.ctx, failureHttpStatus(failure.kind), http_detail, job.credential_source);
+            try execution_compatibility.publishHttpError(deps, job, failureHttpStatus(failure.kind), http_detail);
             if (stop_state.retained_candidate != null) {
                 stop_state.terminal_materializing = true;
                 const assistant_text = try runtime_finalization.stopTerminalText(
@@ -10037,13 +9800,13 @@ fn processQueuedPromptLoop(
                         null;
                     const parallel_review_attempt_available = root_action_permission_mode != .auto or
                         turn_review_cache.reviewAttemptAvailable(parallel_call);
-                    const parallel_review_context = buildReviewTurnContext(
+                    const parallel_review_context = execution_compatibility.buildReviewTurnContext(
                         config,
                         successful_gateway_model,
                         root_user_intent_context,
                         within_turn_suffix.items,
                         pending_assistant,
-                        activeCredentialLease(active_api_key, job),
+                        execution_compatibility.credentialLease(active_api_key, job),
                         parallel_call.id,
                         parallel_review_attempt_available,
                     );
@@ -11035,13 +10798,13 @@ fn processQueuedPromptLoop(
                 tool_call;
             const review_attempt_available = action_permission_mode != .auto or
                 turn_review_cache.reviewAttemptAvailable(execution_call);
-            const review_context = buildReviewTurnContext(
+            const review_context = execution_compatibility.buildReviewTurnContext(
                 config,
                 successful_gateway_model,
                 root_user_intent_context,
                 within_turn_suffix.items,
                 pending_assistant,
-                activeCredentialLease(active_api_key, job),
+                execution_compatibility.credentialLease(active_api_key, job),
                 execution_call.id,
                 review_attempt_available,
             );
@@ -11569,7 +11332,7 @@ fn processQueuedPromptLoop(
                 .result_allocator = arena,
                 .call = execution_call,
                 .authority = execution_authority,
-                .credential = activeCredentialLease(active_api_key, job),
+                .credential = execution_compatibility.credentialLease(active_api_key, job),
                 .permission_mode = action_permission_mode,
                 .root_user_intent_context = tool_execution_root_user_context,
                 .root_user_messages = &.{},
