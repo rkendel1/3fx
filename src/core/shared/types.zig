@@ -815,12 +815,7 @@ pub const ChatRole = enum {
     tool,
 };
 
-pub const FinalToolIdentity = enum {
-    valid,
-    absent,
-    empty,
-    wrong_type,
-};
+const FinalToolIdentity = @import("../agent/final_tool_identity.zig").FinalToolIdentity;
 
 pub const ToolExecutionProvenance = enum {
     fx_local,
@@ -3704,4 +3699,8 @@ test "ToolCall integrity field uses the canonical neutral type" {
     const call: ToolCall = .{ .id = "call", .name = "tool", .arguments_json = "{}" };
     try std.testing.expect(@TypeOf(call.argument_integrity) == @import("../agent/tool_argument_integrity.zig").ToolArgumentIntegrity);
     try std.testing.expect(call.argument_integrity == .valid);
+}
+
+test "ToolCall uses the canonical final tool identity" {
+    try std.testing.expect(@FieldType(ToolCall, "final_identity") == @import("../agent/final_tool_identity.zig").FinalToolIdentity);
 }
