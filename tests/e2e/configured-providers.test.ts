@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { execFileSync } from "node:child_process";
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { FX_BIN, runFx } from "../evals/eval-helpers";
@@ -769,4 +770,20 @@ describe("standalone agent", () => {
       expect(f.requests).toHaveLength(7);
     } finally { f.close(); }
   }, 60000);
+});
+
+
+describe("neutral model contract architecture", () => {
+  test("canonical contract and invocation step have a vendor-free dependency closure", () => {
+    const output = execFileSync("python3", ["scripts/check-model-provider-boundary.py"], {
+      cwd: join(import.meta.dirname, "../.."), encoding: "utf8",
+    });
+    expect(output).toContain("model-provider boundary passed");
+  });
+
+  test("boundary guard rejects direct and transitive legacy dependency regressions", () => {
+    execFileSync("python3", ["-B", "-m", "unittest", "scripts.tests.test_model_provider_boundary"], {
+      cwd: join(import.meta.dirname, "../.."), encoding: "utf8", stdio: "pipe",
+    });
+  });
 });

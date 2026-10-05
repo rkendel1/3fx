@@ -4812,6 +4812,7 @@ test {
     _ = @import("core/output/diff.zig");
     _ = @import("core/shared/display_width.zig");
     _ = @import("core/cli/doctor_runtime.zig");
+    _ = @import("gateway/openai_compatible_model_provider.zig");
     _ = @import("core/auth/login_flow.zig");
     _ = @import("core/auth/chatgpt_oauth.zig");
     _ = @import("core/auth/provider_catalog.zig");

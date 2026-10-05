@@ -7245,7 +7245,7 @@ fn processQueuedPromptLoop(
             }
             last_gateway_message_count = gateway_instructions.items.len + request_messages.len;
             var provider_opts = try model_capabilities.resolveUltrafastProviderOptions(request_capabilities, job.provider, gateway_model, config.effort, route_fast_mode, config.ultrafast_mode);
-            provider_opts.prompt_caching = config.provider_capabilities.gateway_prompt_caching;
+            provider_opts.prompt_caching = config.provider_capabilities.prompt_caching;
             provider_opts.provider_order = config.provider_order;
             provider_opts.provider_strict = config.provider_strict;
             runtime_telemetry.traceGatewayProviderOptions(step_ctx, gateway_model, route_fast_mode, config.effort, provider_opts);

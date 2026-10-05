@@ -1232,7 +1232,7 @@ fn buildAgentConfig(
         .advertised_tool_names = sections.advertised_tool_names,
         .advertised_functions = sections.advertised_functions,
         .initial_dynamic_tools = sections.initial_dynamic_tools orelse state.host_tools.dynamic_tools,
-        .provider_capabilities = state.cfg.provider_set.select(session.provider).capabilities,
+        .provider_capabilities = state.cfg.provider_set.select(session.provider).agentFeatures(),
         .custom_tool_guidance = sections.custom_tool_guidance,
         .agent_step_limit = session.agent_step_limit,
         .max_tool_result_bytes = session.max_tool_result_bytes,
