@@ -7267,11 +7267,9 @@ fn processQueuedPromptLoop(
                 .stream = &stream_ctx,
                 .pending_status = &pending_auto_retry_status,
             };
-            var model_request = agent_stream_provider.ModelRequest{
-                .credential = execution_compatibility.modelRequestLease(active_api_key, job),
+            var neutral_request = agent_stream_provider.NeutralModelRequest{
                 .session_id = lifecycle.scope.session_id,
                 .model = gateway_model,
-                .retry_count = config.gateway_retry_count,
                 .instructions = request_data.instructions,
                 .messages = request_data.messages,
                 .tools = request_data.tools,
@@ -7291,10 +7289,12 @@ fn processQueuedPromptLoop(
                 .cancel_flag = control.coordinator.cancel_flag,
                 .provider_attempt_owner = .agent,
             };
-            stream_result = runtime_gateway_step.streamModelCompletion(
+            const credential_lease = execution_compatibility.modelRequestLease(active_api_key, job);
+            stream_result = runtime_gateway_step.streamNeutralModelCompletion(
                 deps.agent_stream_provider,
                 arena,
-                model_request,
+                neutral_request,
+                credential_lease,
                 deps.usage,
                 deps.usage_allocator,
             ) catch |err| {
@@ -7714,14 +7714,16 @@ fn processQueuedPromptLoop(
                     auth_retry_used = true;
                     var replay_delivery = runtime_gateway_step.DeliveryCertainty.init();
                     var replay_evidence: runtime_gateway_step.AttemptEvidence = .{};
-                    execution_compatibility.replaceLeaseSecret(&model_request.credential, active_api_key);
-                    model_request.delivery = &replay_delivery;
-                    model_request.attempt_evidence = &replay_evidence;
+                    const replay_credential_lease = execution_compatibility.modelRequestLease(active_api_key, job);
+                    var replay_neutral_request = neutral_request;
+                    replay_neutral_request.delivery = &replay_delivery;
+                    replay_neutral_request.attempt_evidence = &replay_evidence;
                     const replay_wait_started_ms = io_mod.milliTimestamp();
-                    stream_result = try runtime_gateway_step.streamModelCompletion(
+                    stream_result = try runtime_gateway_step.streamNeutralModelCompletion(
                         deps.agent_stream_provider,
                         arena,
-                        model_request,
+                        replay_neutral_request,
+                        replay_credential_lease,
                         deps.usage,
                         deps.usage_allocator,
                     );
