@@ -5166,7 +5166,11 @@ pub fn processAgentPrompt(
     );
     defer finalization.deinit();
 
-    processQueuedPromptInner(deps, semantic_presentation, effective_lifecycle, effective_config, effective_job, &finalization, agent) catch |err| {
+    // Project the neutral turn execution boundary early. The compatibility job
+    // retains all auth/credential/account state; this projection contains only
+    // the workload and configuration data the turn loop requires.
+    const neutral_input = execution_compatibility.turnExecutionInput(effective_job);
+    processQueuedPromptInner(deps, semantic_presentation, effective_lifecycle, effective_config, effective_job, neutral_input, &finalization, agent) catch |err| {
         if (finalization.state == .open) {
             finalization.finish(.failed, null, null) catch |finalization_err| {
                 if (deps.compaction_failure) |out| out.* = null;
@@ -5286,6 +5290,7 @@ fn processQueuedPromptInner(
     lifecycle: LifecycleContext,
     config: Config,
     borrowed_job: CompatibilityExecutionJob,
+    neutral_input: @import("../turn_execution_input.zig").TurnExecutionInput,
     finalization: *TurnFinalizationGuard,
     agent: *runtime_agent.Agent,
 ) !void {

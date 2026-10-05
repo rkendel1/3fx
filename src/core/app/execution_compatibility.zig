@@ -19,6 +19,7 @@ const TraceContext = debug_trace.TraceContext;
 
 const worker = @import("../agent/worker_runtime.zig");
 const submission = @import("../agent/submission.zig");
+const turn_execution_input = @import("../agent/turn_execution_input.zig");
 
 /// Transfers the captured host snapshot into the legacy execution shape.
 /// No allocations, current-configuration reads, refreshes, or ownership copies.
@@ -492,4 +493,73 @@ test "loop control projection preserves coordinator identity and initial index" 
     const control = loopControl(&turn);
     try std.testing.expect(control.coordinator == &turn);
     try std.testing.expectEqual(@as(usize, 0), control.current_step_index);
+}
+
+/// Project the neutral execution boundary from the compatibility job.
+/// Borrows all slices from the job; no allocations are performed.
+/// The compatibility job retains all credential, account, and billing state;
+/// this projection contains only the workload and configuration data the turn
+/// orchestration loop requires.
+pub fn turnExecutionInput(job: CompatibilityExecutionJob) turn_execution_input.TurnExecutionInput {
+    return .{
+        .turn_id = job.turn_id,
+        .delivery = job.delivery,
+        .prompt = job.prompt,
+        .images = job.images,
+        .authorized_image_catalog = job.authorized_image_catalog,
+        .model = job.model,
+        .provider = job.provider,
+        .history = job.history,
+        .unversioned_history_count = job.unversioned_history_count,
+        .grants = job.grants,
+        .root_user_intent_context = job.root_user_intent_context,
+        .context_snapshot = job.context_snapshot,
+        .agent_settings = job.agent_settings,
+        .skill_bindings = job.skill_bindings,
+        .skill_display_spans = job.skill_display_spans,
+        .snapshot_file_ownerships = job.snapshot_file_ownerships,
+        .recovery_checkpoint = job.recovery_checkpoint,
+        .recovery_source_already_presented = job.recovery_source_already_presented,
+        .user_prompt_already_presented = job.user_prompt_already_presented,
+        .steering_receipt = job.steering_receipt,
+    };
+}
+
+test "turn execution input projection excludes all auth and account state" {
+    const job: CompatibilityExecutionJob = .{
+        .turn_id = 99,
+        .delivery = .continuation,
+        .prompt = @constCast("test"),
+        .images = &.{},
+        .model = @constCast("gpt-4"),
+        .api_key = @constCast("secret-key"),
+        .credential_source = .chatgpt_subscription,
+        .account_id = @constCast("acct_123"),
+        .gateway_team = @constCast("team_456"),
+        .permission_mode = .ask,
+        .history = &.{},
+        .grants = &.{},
+    };
+
+    const input = turnExecutionInput(job);
+
+    // Verify neutral fields are present
+    try std.testing.expectEqual(@as(u64, 99), input.turn_id);
+    try std.testing.expect(input.delivery.isContinuation());
+    try std.testing.expectEqualStrings("test", input.prompt);
+    try std.testing.expectEqualStrings("gpt-4", input.model);
+
+    // Verify auth/account fields are not present by checking the type
+    const fields = std.meta.fields(turn_execution_input.TurnExecutionInput);
+    for (fields) |field| {
+        try std.testing.expect(
+            std.mem.indexOf(u8, field.name, "credential") == null,
+        );
+        try std.testing.expect(
+            std.mem.indexOf(u8, field.name, "account") == null,
+        );
+        try std.testing.expect(
+            std.mem.indexOf(u8, field.name, "api_key") == null,
+        );
+    }
 }
