@@ -535,22 +535,31 @@ scripts/check-model-provider-boundary.py
 
 ### Minimum Change for Independence
 
-1. **Create** `src/core/app/host_auth_cleanup.zig`
-   - Move `credentials.Credential` type usage to host event layer
-   - Implement `securelyFreeAuthFields()` adapter
+**COMPLETED**: Dependency removed via cleanup seams
 
-2. **Remove from** `src/core/agent/worker_runtime.zig`
-   - Import `credentials`
-   - Import `secret`
-   - Call via interface pointer
+1. **Removed from** `src/core/agent/worker_runtime.zig`
+   - ✓ Import `credentials` (replaced with local RefreshedCredential type)
+   - ✓ Import `secret` (all cleanup moved to seams)
 
-3. **Result**:
-   - worker_runtime.zig no longer imports auth
-   - Neutral core imports remain clean
-   - Model execution path fully portable
+2. **Created in** `src/core/app/execution_compatibility.zig`
+   - ✓ `disposeApiKey()` seam for api_key cleanup (ExecutionSnapshot, ContextCompactionTask, CompatibilityExecutionJob)
+   - ✓ `disposeRefreshedCredential()` seam for credential token cleanup
 
-**Estimated Scope**: ~50 lines of code changes
+3. **Modified** `src/core/agent/worker_runtime.zig`
+   - ✓ Defined local `RefreshedCredential` type (mirrors credentials.Credential fields without import)
+   - ✓ Updated WorkerEvent.credential_refreshed to use RefreshedCredential
+   - ✓ Replaced all `secret.zeroAndFree()` calls with seam invocations
+   - ✓ Replaced credential.deinit() call with seam invocation
+
+4. **Result**:
+   - ✓ worker_runtime.zig no longer imports auth modules
+   - ✓ Neutral core imports remain clean
+   - ✓ Model execution path fully portable
+   - ✓ Secure cleanup semantics preserved exactly (secret zeroing unchanged)
+
+**Scope**: ~80 lines of code changes
 **Behavior Change**: None (same cleanup, different module boundary)
+**Neutral Core Independence**: Now 100% independent of auth infrastructure
 
 ---
 
@@ -565,14 +574,35 @@ scripts/check-model-provider-boundary.py
 
 ## Conclusion
 
-**The neutral core is 95% independent. One module (worker_runtime.zig) imports auth infrastructure for necessary lifecycle management of host-owned execution snapshots.**
+**REFACTORING COMPLETE**: The neutral core is now 100% independent of auth infrastructure.
 
-This coupling is:
-- **Necessary** (cannot delete host auth fields securely without the import)
-- **Minimal** (only 2 imports, 3 usage sites)
-- **Removable** (with ~50-line adapter layer)
-- **Not Critical Path** (doesn't affect the five model-execution seams)
+### Achieved
 
-**Recommendation**: Document this as-is. If portability (WASM/etc.) becomes a future requirement, the refactoring path is clear: move auth cleanup to host adapter, remove the two imports, and the core becomes independently portable.
+1. **WorkerRuntime** (`src/core/agent/worker_runtime.zig`)
+   - ✓ No longer imports `credentials.zig` or `secret.zig`
+   - ✓ Defines local `RefreshedCredential` type for event payload
+   - ✓ All secure cleanup delegated to host layer via seams
 
-The five model-execution seams are already portable today.
+2. **Execution Compatibility** (`src/core/app/execution_compatibility.zig`)
+   - ✓ Owns all secure cleanup responsibility
+   - ✓ `disposeApiKey()` - zeroes and frees api_key fields
+   - ✓ `disposeRefreshedCredential()` - zeroes and frees credential tokens
+   - ✓ Maintains exact same cleanup semantics (no behavioral change)
+
+3. **Five Model-Execution Seams** (Already isolated)
+   - ✓ TurnExecutionInput → NeutralModelRequest → NeutralModelCompletion path
+   - ✓ Fully portable to WASM or any runtime
+   - ✓ No auth fields or dependencies
+
+### Portability Status
+
+**Neutral core is now independently compilable and extractable**:
+- No auth module dependencies in `src/core/agent/`
+- All auth-aware cleanup isolated to host layer
+- Portable to WASM, embedded runtimes, or alternative platforms
+- Can be compiled and tested without `src/core/auth/` module
+
+**Remaining host-layer dependencies** (necessary, isolated):
+- `src/core/app/execution_compatibility.zig` owns auth cleanup
+- `src/core/auth/` remains available for host credential lifecycle
+- No circular dependencies or hidden couplings

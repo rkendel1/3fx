@@ -264,6 +264,33 @@ pub fn releaseSecret(alloc: Allocator, value: []u8) void {
     secret.zeroAndFree(alloc, value);
 }
 
+/// Dispose of a value's secure api_key resource. The value itself is not freed;
+/// the caller manages its container. Works with any type that has an api_key field.
+pub fn disposeApiKey(alloc: Allocator, value: anytype) void {
+    secret.zeroAndFree(alloc, value.api_key);
+}
+
+/// Convert a host-owned Credential to the worker's RefreshedCredential event payload.
+/// No allocation; references remain owned by the credential.
+pub fn projectedRefreshedCredential(cred: credentials.Credential) worker.RefreshedCredential {
+    return .{
+        .token = cred.token,
+        .source = cred.source,
+        .account_id = cred.account_id,
+        .team_id = cred.team_id,
+        .team_slug = cred.team_slug,
+        .refresh_after_ms = cred.refresh_after_ms,
+    };
+}
+
+/// Dispose of a refreshed credential with secure zeroing of token.
+pub fn disposeRefreshedCredential(alloc: Allocator, credential: worker.RefreshedCredential) void {
+    secret.zeroAndFree(alloc, credential.token);
+    if (credential.account_id) |value| alloc.free(value);
+    if (credential.team_id) |value| alloc.free(value);
+    if (credential.team_slug) |value| alloc.free(value);
+}
+
 pub fn recoveryAuthority(job: CompatibilityExecutionJob, model: []const u8) session_codec.TurnAuthority {
     return .{ .provider = job.provider, .model = @constCast(model), .credential_source = job.credential_source, .credential_identity = recoveryIdentity(job) };
 }
