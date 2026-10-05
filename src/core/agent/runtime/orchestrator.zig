@@ -73,7 +73,7 @@ const ChatMessage = types.ChatMessage;
 const HistoryTurn = types.HistoryTurn;
 const PermissionGrant = types.PermissionGrant;
 const ToolCall = types.ToolCall;
-const QueuedPrompt = worker_runtime.QueuedPrompt;
+const CompatibilityExecutionJob = worker_runtime.CompatibilityExecutionJob;
 const TraceContext = debug_trace.TraceContext;
 const AgentRuntimeDeps = runtime_deps.AgentRuntimeDeps;
 const CredentialRefreshMode = runtime_deps.CredentialRefreshMode;
@@ -118,7 +118,7 @@ fn take_steering_boundary(
 fn finish_steering_handoff(
     deps: *const AgentRuntimeDeps,
     finalization: *TurnFinalizationGuard,
-    job: QueuedPrompt,
+    job: CompatibilityExecutionJob,
     completed_tool_names: [][]u8,
     interrupted_persisted: *bool,
     step_ctx: TraceContext,
@@ -3916,7 +3916,7 @@ noinline fn pausedRequiredAction(
 fn appendRunningToolCalls(
     deps: *const AgentRuntimeDeps,
     finalization: *const TurnFinalizationGuard,
-    job: QueuedPrompt,
+    job: CompatibilityExecutionJob,
     current_turn_messages: []const ChatMessage,
     calls: []const types.ToolCall,
 ) !void {
@@ -3941,7 +3941,7 @@ fn appendRunningToolCalls(
 fn persistRecoveryCheckpoint(
     deps: *const AgentRuntimeDeps,
     finalization: *const TurnFinalizationGuard,
-    job: QueuedPrompt,
+    job: CompatibilityExecutionJob,
     current_turn_messages: []const ChatMessage,
     assistant_source: []const u8,
     route_model: []const u8,
@@ -4019,7 +4019,7 @@ const CompactionSource = struct {
     deps: *const AgentRuntimeDeps,
     finalization: *const TurnFinalizationGuard,
     arena: Allocator,
-    job: QueuedPrompt,
+    job: CompatibilityExecutionJob,
     current_turn_messages: []const ChatMessage,
     route_model: []const u8,
     requested_fast_mode: bool,
@@ -4900,7 +4900,7 @@ fn unsafeNoRetryReason(
 fn refreshGatewayCredentialForJob(
     deps: *const AgentRuntimeDeps,
     alloc: Allocator,
-    job: QueuedPrompt,
+    job: CompatibilityExecutionJob,
     mode: CredentialRefreshMode,
     active_api_key: *[]const u8,
     owned_api_key: *?[]u8,
@@ -5182,7 +5182,7 @@ test "recoveryElapsedNs clamps backward wall-clock steps" {
 /// jobs and subagent turns keep their own state.
 fn restorePromptAfterTerminalFailure(
     deps: *const AgentRuntimeDeps,
-    job: QueuedPrompt,
+    job: CompatibilityExecutionJob,
     config: Config,
 ) void {
     if (config.origin != .root) return;
@@ -5317,7 +5317,7 @@ pub fn processAgentPrompt(
     semantic_presentation: ?runtime_assistant_stream.SemanticPresentationSink,
     lifecycle: LifecycleContext,
     config: Config,
-    job: QueuedPrompt,
+    job: CompatibilityExecutionJob,
 ) !void {
     if (deps.compaction_failure) |out| out.* = null;
     var effective_job = job;
@@ -5462,7 +5462,7 @@ fn processQueuedPromptInner(
     semantic_presentation: ?runtime_assistant_stream.SemanticPresentationSink,
     lifecycle: LifecycleContext,
     config: Config,
-    borrowed_job: QueuedPrompt,
+    borrowed_job: CompatibilityExecutionJob,
     finalization: *TurnFinalizationGuard,
     agent: *runtime_agent.Agent,
 ) !void {
@@ -5905,7 +5905,7 @@ fn permissionDeniedModelOutput(
 
 fn activeCredentialLease(
     secret_value: []const u8,
-    job: QueuedPrompt,
+    job: CompatibilityExecutionJob,
 ) types.CredentialLease {
     if (job.credential_source == .host_managed) return .host_managed;
     return .{ .direct = .{
@@ -6103,7 +6103,7 @@ fn reconstructProjectContext(
     alloc: Allocator,
     deps: *const AgentRuntimeDeps,
     config: Config,
-    job: QueuedPrompt,
+    job: CompatibilityExecutionJob,
 ) !?context_contract.GatheredContextSnapshot {
     if (!deps.context_enabled) return null;
     var retained = try tool_preparation.retainedContextTargets(
@@ -6680,7 +6680,7 @@ fn processQueuedPromptLoop(
     semantic_presentation: ?runtime_assistant_stream.SemanticPresentationSink,
     lifecycle: LifecycleContext,
     config: Config,
-    job: QueuedPrompt,
+    job: CompatibilityExecutionJob,
     skills: PreparedSkills,
     initial_request_capabilities: model_capabilities.Capabilities,
     base_nested_terminal_advertised: bool,
@@ -12267,7 +12267,7 @@ fn finishFailedTurnWithNotice(
     deps: *const AgentRuntimeDeps,
     finalization: *TurnFinalizationGuard,
     arena: Allocator,
-    job: QueuedPrompt,
+    job: CompatibilityExecutionJob,
     current_turn_messages: []const ChatMessage,
     summary_accumulator: *runtime_telemetry.TurnSummaryAccumulator,
     stop_state: *CommonStopState,
@@ -12323,7 +12323,7 @@ pub fn finishCommonAssistantTerminal(
     deps: *const AgentRuntimeDeps,
     finalization: *TurnFinalizationGuard,
     arena: Allocator,
-    job: QueuedPrompt,
+    job: CompatibilityExecutionJob,
     current_turn_messages: []const ChatMessage,
     summary_accumulator: *runtime_telemetry.TurnSummaryAccumulator,
     assistant_text: runtime_finalization.TerminalText,
@@ -12369,7 +12369,7 @@ pub fn finishCommonAssistantTerminal(
 fn finishCommonAssistantTerminalWithExecution(
     deps: *const AgentRuntimeDeps,
     finalization: *TurnFinalizationGuard,
-    job: QueuedPrompt,
+    job: CompatibilityExecutionJob,
     execution_memory: types.ExecutionMemory,
     summary_accumulator: *runtime_telemetry.TurnSummaryAccumulator,
     assistant_text: []const u8,

@@ -911,7 +911,7 @@ pub fn handlePrompt(
         try session.session_rt.snapshotImageCatalog(alloc, current_images);
     defer if (recovery_checkpoint == null) types.freeImageAttachmentSlice(alloc, authorized_image_catalog);
 
-    const job: worker_runtime.QueuedPrompt = .{
+    const job: worker_runtime.CompatibilityExecutionJob = .{
         .turn_id = if (recovery_checkpoint) |checkpoint| checkpoint.turn_id else 0,
         .prompt = @constCast(owned_prompt),
         .images = @constCast(current_images),

@@ -50,7 +50,7 @@ const PermissionGrant = types.PermissionGrant;
 const PermissionMode = types.PermissionMode;
 const ToolCall = types.ToolCall;
 const ToolPermissionDecision = types.ToolPermissionDecision;
-const QueuedPrompt = worker_runtime.QueuedPrompt;
+const CompatibilityExecutionJob = worker_runtime.CompatibilityExecutionJob;
 const WorkerEvent = worker_runtime.WorkerEvent;
 const AgentRuntimeDeps = runtime_deps.AgentRuntimeDeps;
 const Config = runtime_config.Config;
@@ -1867,7 +1867,7 @@ pub const PromptFixture = struct {
     cancel_flag: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     workspace_root: []const u8 = "/tmp/workspace",
 
-    pub fn job(self: *PromptFixture) QueuedPrompt {
+    pub fn job(self: *PromptFixture) CompatibilityExecutionJob {
         return .{
             .prompt = @constCast("user prompt"),
             .images = self.images[0..],
@@ -2035,7 +2035,7 @@ pub fn testLifecycleContext(
     };
 }
 
-pub fn runFakePrompt(gateway: *FakeGateway, hooks: *FakeAgentRuntimeDeps, config: Config, job: QueuedPrompt) !void {
+pub fn runFakePrompt(gateway: *FakeGateway, hooks: *FakeAgentRuntimeDeps, config: Config, job: CompatibilityExecutionJob) !void {
     return runFakePromptWithLifecycle(
         gateway,
         hooks,
@@ -2053,7 +2053,7 @@ pub fn runFakePromptWithLifecycle(
     gateway: *FakeGateway,
     hooks: *FakeAgentRuntimeDeps,
     config: Config,
-    job: QueuedPrompt,
+    job: CompatibilityExecutionJob,
     lifecycle: runtime_lifecycle.LifecycleContext,
 ) !void {
     hooks.workspace_root = config.workspace_root;

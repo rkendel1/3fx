@@ -333,7 +333,7 @@ const TestWorkerApp = struct {
     }
 };
 
-fn makeQueuedPrompt(alloc: std.mem.Allocator, text: []const u8) !worker_runtime.QueuedPrompt {
+fn makeQueuedPrompt(alloc: std.mem.Allocator, text: []const u8) !worker_runtime.CompatibilityExecutionJob {
     return .{
         .prompt = try alloc.dupe(u8, text),
         .images = &.{},
@@ -347,7 +347,7 @@ fn makeQueuedPrompt(alloc: std.mem.Allocator, text: []const u8) !worker_runtime.
 
 fn queuePrompt(app: *TestWorkerApp, text: []const u8) !void {
     const prompt = try makeQueuedPrompt(std.heap.c_allocator, text);
-    errdefer worker_runtime.freeQueuedPrompt(std.heap.c_allocator, prompt);
+    errdefer worker_runtime.freeCompatibilityExecutionJob(std.heap.c_allocator, prompt);
     try app.worker.enqueuePrompt(std.heap.c_allocator, prompt);
 }
 

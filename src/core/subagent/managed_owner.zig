@@ -149,7 +149,7 @@ pub const Owner = struct {
         const item = try Feedback.create(self.alloc, child_id, operation_id, fingerprint);
         var accepted = false;
         defer if (!accepted) item.deinit(self.alloc);
-        const prompt = worker_runtime.QueuedPrompt{
+        const prompt = worker_runtime.CompatibilityExecutionJob{
             .prompt = try self.alloc.dupe(u8, text),
             .images = &.{},
             .model = &.{},
@@ -161,7 +161,7 @@ pub const Owner = struct {
         };
         defer if (!accepted) {
             item.receipt.state.store(.not_applied, .seq_cst);
-            worker_runtime.freeQueuedPrompt(self.alloc, prompt);
+            worker_runtime.freeCompatibilityExecutionJob(self.alloc, prompt);
         };
         accepted = try worker.admitActiveSteering(self.alloc, prompt);
         if (!accepted) return .waiting;

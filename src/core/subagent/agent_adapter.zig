@@ -228,7 +228,7 @@ pub fn run(
         return error.ProviderFailed;
     };
     const history = turn.sessionRuntime().snapshotHistory(arena) catch return error.OutOfMemory;
-    const prompt = worker_runtime.QueuedPrompt{
+    const prompt = worker_runtime.CompatibilityExecutionJob{
         .turn_id = trace_context.turn_id,
         .prompt = arena.dupe(u8, message.content) catch return error.OutOfMemory,
         .images = &.{},
