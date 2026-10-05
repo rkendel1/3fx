@@ -226,6 +226,42 @@ pub fn buildProviderPrompt(
     };
 }
 
+pub fn buildProviderPromptForCompactionWindow(
+    alloc: Allocator,
+    stable_prefix: []const ChatMessage,
+    ephemeral_overlay: []const ChatMessage,
+    durable_history: []const ChatMessage,
+    current_user_message: ChatMessage,
+    within_turn_suffix: []const ChatMessage,
+    handoff: ?[]const u8,
+    retained_history_tail: []const ChatMessage,
+    compacted_suffix_len: usize,
+) !ProviderPrompt {
+    if (handoff == null) return buildProviderPrompt(
+        alloc,
+        stable_prefix,
+        ephemeral_overlay,
+        durable_history,
+        current_user_message,
+        within_turn_suffix,
+    );
+    var compacted_history: std.ArrayList(ChatMessage) = .empty;
+    defer compacted_history.deinit(alloc);
+    try compacted_history.append(alloc, .{
+        .role = .user,
+        .content = handoff.?,
+    });
+    try compacted_history.appendSlice(alloc, retained_history_tail);
+    return buildProviderPrompt(
+        alloc,
+        stable_prefix,
+        ephemeral_overlay,
+        compacted_history.items,
+        current_user_message,
+        within_turn_suffix[@min(compacted_suffix_len, within_turn_suffix.len)..],
+    );
+}
+
 test "buildProviderPrompt separates instructions from chronological messages" {
     const alloc = std.testing.allocator;
     const stable_prefix = [_]ChatMessage{
@@ -592,5 +628,54 @@ test "provider request image accounting handles allocation and malformed input f
         "{\"prompt\":[{\"role\":\"user\",\"content\":[{\"type\":\"file\",\"mediaType\":\"image/png\",\"data\":{\"type\":\"data\",\"data\":\"escaped\\nimage\"}}]}]}",
     }) |body| {
         try std.testing.expectError(error.InvalidRequestMeasurement, measureProviderRequest(std.testing.allocator, body, measurement_test_request(true)));
+    }
+}
+
+fn checkCompactionPromptProjection(alloc: Allocator, handoff: ?[]const u8, offset: usize) !void {
+    const stable = [_]ChatMessage{.{ .role = .system, .content = "stable" }};
+    const overlay = [_]ChatMessage{.{ .role = .system, .content = "overlay" }};
+    const history = [_]ChatMessage{.{ .role = .assistant, .content = "history" }};
+    const tail = [_]ChatMessage{.{ .role = .assistant, .content = "tail" }};
+    const suffix = [_]ChatMessage{
+        .{ .role = .assistant, .content = "old" },
+        .{ .role = .assistant, .content = "new" },
+    };
+    const current: ChatMessage = .{ .role = .user, .content = "current" };
+    var prompt = try buildProviderPromptForCompactionWindow(alloc, &stable, &overlay, &history, current, &suffix, handoff, &tail, offset);
+    defer prompt.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 2), prompt.instructions.items.len);
+    try std.testing.expect(prompt.instructions.items[0].content.?.ptr == stable[0].content.?.ptr);
+    try std.testing.expect(prompt.instructions.items[1].content.?.ptr == overlay[0].content.?.ptr);
+    if (handoff) |text| {
+        const retained = suffix[@min(offset, suffix.len)..];
+        try std.testing.expectEqual(3 + retained.len, prompt.messages.items.len);
+        try std.testing.expectEqual(types.ChatRole.user, prompt.messages.items[0].role);
+        try std.testing.expect(prompt.messages.items[0].content.?.ptr == text.ptr);
+        try std.testing.expect(prompt.messages.items[1].content.?.ptr == tail[0].content.?.ptr);
+        try std.testing.expect(prompt.messages.items[2].content.?.ptr == current.content.?.ptr);
+        for (retained, prompt.messages.items[3..]) |source, projected| {
+            try std.testing.expect(source.content.?.ptr == projected.content.?.ptr);
+        }
+    } else {
+        try std.testing.expectEqual(@as(usize, 4), prompt.messages.items.len);
+        try std.testing.expect(prompt.messages.items[0].content.?.ptr == history[0].content.?.ptr);
+        try std.testing.expect(prompt.messages.items[1].content.?.ptr == current.content.?.ptr);
+        for (suffix, prompt.messages.items[2..]) |source, projected| {
+            try std.testing.expect(source.content.?.ptr == projected.content.?.ptr);
+        }
+    }
+}
+
+test "compaction prompt projection preserves borrowed messages and bounded suffix" {
+    try checkCompactionPromptProjection(std.testing.allocator, null, 99);
+    for ([_]usize{ 0, 1, 2, 99 }) |offset| {
+        try checkCompactionPromptProjection(std.testing.allocator, "handoff", offset);
+    }
+}
+
+test "compaction prompt projection cleans every failed list allocation" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, checkCompactionPromptProjection, .{ @as(?[]const u8, null), @as(usize, 99) });
+    for ([_]usize{ 0, 1, 2, 99 }) |offset| {
+        try std.testing.checkAllAllocationFailures(std.testing.allocator, checkCompactionPromptProjection, .{ @as(?[]const u8, "handoff"), offset });
     }
 }

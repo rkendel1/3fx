@@ -3563,7 +3563,7 @@ fn build_provider_prompt_with_response_language_control(
         };
         break :blk projected;
     } else ephemeral_overlay;
-    var prompt = try buildProviderPromptForCompactionWindow(
+    var prompt = try runtime_prompt_context.buildProviderPromptForCompactionWindow(
         alloc,
         stable_prefix,
         effective_overlay,
@@ -5831,42 +5831,6 @@ test "vision policy keeps image route and tool visibility coherent" {
             }
         }
     }
-}
-
-fn buildProviderPromptForCompactionWindow(
-    alloc: Allocator,
-    stable_prefix: []const ChatMessage,
-    ephemeral_overlay: []const ChatMessage,
-    durable_history: []const ChatMessage,
-    current_user_message: ChatMessage,
-    within_turn_suffix: []const ChatMessage,
-    handoff: ?[]const u8,
-    retained_history_tail: []const ChatMessage,
-    compacted_suffix_len: usize,
-) !runtime_prompt_context.ProviderPrompt {
-    if (handoff == null) return runtime_prompt_context.buildProviderPrompt(
-        alloc,
-        stable_prefix,
-        ephemeral_overlay,
-        durable_history,
-        current_user_message,
-        within_turn_suffix,
-    );
-    var compacted_history: std.ArrayList(ChatMessage) = .empty;
-    defer compacted_history.deinit(alloc);
-    try compacted_history.append(alloc, .{
-        .role = .user,
-        .content = handoff.?,
-    });
-    try compacted_history.appendSlice(alloc, retained_history_tail);
-    return runtime_prompt_context.buildProviderPrompt(
-        alloc,
-        stable_prefix,
-        ephemeral_overlay,
-        compacted_history.items,
-        current_user_message,
-        within_turn_suffix[@min(compacted_suffix_len, within_turn_suffix.len)..],
-    );
 }
 
 fn commitContextCompaction(
