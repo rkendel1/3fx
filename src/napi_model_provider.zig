@@ -3,7 +3,7 @@
 // Does not expose native Zig types directly to JavaScript
 
 const std = @import("std");
-const model_provider = @import("core/agent/model_provider.zig");
+pub const model_provider = @import("core/agent/model_provider.zig");
 const openai_provider = @import("gateway/openai_compatible_model_provider.zig");
 const io_mod = @import("core/shared/io.zig");
 
