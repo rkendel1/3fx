@@ -9,6 +9,23 @@ const io_mod = @import("core/shared/io.zig");
 
 const Allocator = std.mem.Allocator;
 
+/// NAPI-managed model provider handle with owned string storage
+pub const NapiModelHandle = struct {
+    id: []u8,
+    base_url: []u8,
+    model: []u8,
+    api_key_env: ?[]u8,
+    openai: openai_provider.OpenAICompatibleModelProvider,
+    allocator: Allocator,
+
+    pub fn deinit(self: *NapiModelHandle) void {
+        self.allocator.free(self.id);
+        self.allocator.free(self.base_url);
+        self.allocator.free(self.model);
+        if (self.api_key_env) |env| self.allocator.free(env);
+    }
+};
+
 pub const ModelProviderHandle = struct {
     id: []const u8,
     openai: openai_provider.OpenAICompatibleModelProvider,
@@ -117,6 +134,39 @@ pub fn createModelProvider(
     errdefer alloc.free(handle.id);
 
     handle.openai = try openai_provider.OpenAICompatibleModelProvider.init(id, base_url, model, api_key_env);
+    handle.allocator = alloc;
+
+    return handle;
+}
+
+/// Create a NAPI-managed model provider handle with owned string storage
+pub fn createNapiModelHandle(
+    alloc: Allocator,
+    id: []const u8,
+    base_url: []const u8,
+    model: []const u8,
+    api_key_env: ?[]const u8,
+) !*NapiModelHandle {
+    const handle = try alloc.create(NapiModelHandle);
+    errdefer alloc.destroy(handle);
+
+    handle.id = try alloc.dupe(u8, id);
+    errdefer alloc.free(handle.id);
+
+    handle.base_url = try alloc.dupe(u8, base_url);
+    errdefer alloc.free(handle.base_url);
+
+    handle.model = try alloc.dupe(u8, model);
+    errdefer alloc.free(handle.model);
+
+    if (api_key_env) |env| {
+        handle.api_key_env = try alloc.dupe(u8, env);
+        errdefer alloc.free(handle.api_key_env.?);
+    } else {
+        handle.api_key_env = null;
+    }
+
+    handle.openai = try openai_provider.OpenAICompatibleModelProvider.init(handle.id, handle.base_url, handle.model, handle.api_key_env);
     handle.allocator = alloc;
 
     return handle;

@@ -95,26 +95,40 @@ Model
 ## Implementation Plan
 
 ### Phase 6B-1: Design finalized ✓
-### Phase 6B-2: NAPI extensions (in progress)
-- Add `createModel()` to napi_core_main.zig
-- Add `modelChat()` to native ABI
-- Implement request/response serialization
 
-### Phase 6B-3: JavaScript binding
-- Export `createFxModel()` from sdk/node.js
-- Add conversion layer between JS and NAPI
+- FFI-safe types defined
+- NAPI registration pattern identified
+- Memory ownership documented
 
-### Phase 6B-4: Tests
-- Deterministic OpenAI-compatible mock
+### Phase 6B-2: NAPI extensions ✓
+
+- `createModel()` NAPI callback: parses config object, creates NapiModelHandle, returns external value
+- `modelChat()` NAPI callback: extracts model handle, converts request, executes provider, returns result object
+- `modelHandleFinalize()`: cleanup hook for model handles
+- `parseModelRequest()`: converts JavaScript request object to FxChatRequest
+- `resultToJavaScript()`: converts ChatStream result back to JS object
+- Memory ownership: NAPI allocator owns all strings, model handle owns config with finalizer
+
+### Phase 6B-3: JavaScript binding ✓
+
+- `createFxModel(config)`: factory function accepting {baseUrl, model, id?, apiKeyEnv?}
+- Returns model object with `chat(request)` method
+- Proper error handling and fallback to WASM
+
+### Phase 6B-4: Tests (next)
+
+- Deterministic OpenAI-compatible mock server
 - Request/response mapping tests
 - End-to-end execution test
+- Provider failure tests
 
-### Phase 6B-5: Verification
-- No Vercel dependency
+### Phase 6B-5: Verification (next)
+
+- No Vercel/Chip/Compute dependency
 - No agent loop invoked
-- Streaming works (if exposed)
-- Cancellation works (if exposed)
-- Package exports correct
+- Streaming behavior documented (not yet implemented)
+- Cancellation documented (not yet implemented)
+- Package exports verified
 
 ## Key Invariants
 

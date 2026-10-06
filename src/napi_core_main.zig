@@ -1332,17 +1332,221 @@ fn exportFunction(env: c.napi_env, exports: c.napi_value, name: [*:0]const u8, c
 
 // Model API NAPI functions
 fn createModel(env: c.napi_env, info: c.napi_callback_info) callconv(.c) c.napi_value {
-    _ = env;
-    _ = info;
-    // Stub: real implementation deferred to Phase 6B-2
-    return null;
+    var argv: [1]c.napi_value = undefined;
+    if (!callbackArgs(env, info, &argv)) return null;
+
+    // Extract config object properties
+    const id_str = getNamedString(env, argv[0], "id", std.heap.c_allocator, max_model_bytes) catch
+        return throw(env, "LIBFX_INVALID_ARGUMENT", "invalid model id");
+    defer std.heap.c_allocator.free(id_str);
+
+    const base_url = getNamedString(env, argv[0], "baseUrl", std.heap.c_allocator, max_url_bytes) catch
+        return throw(env, "LIBFX_INVALID_ARGUMENT", "invalid baseUrl");
+    defer std.heap.c_allocator.free(base_url);
+
+    const model = getNamedString(env, argv[0], "model", std.heap.c_allocator, max_model_bytes) catch
+        return throw(env, "LIBFX_INVALID_ARGUMENT", "invalid model");
+    defer std.heap.c_allocator.free(model);
+
+    var api_key_env: ?[]const u8 = null;
+    if (getNamedString(env, argv[0], "apiKeyEnv", std.heap.c_allocator, max_model_bytes)) |env_str| {
+        api_key_env = env_str;
+    } else |_| {
+        api_key_env = null;
+    }
+    if (api_key_env) |e| defer std.heap.c_allocator.free(e);
+
+    // Create the native handle
+    const handle = napi_model.createNapiModelHandle(std.heap.c_allocator, id_str, base_url, model, api_key_env) catch
+        return throw(env, "LIBFX_NATIVE", "could not create model provider");
+
+    // Wrap in external value
+    var external: c.napi_value = undefined;
+    if (c.napi_create_external(env, handle, modelHandleFinalize, null, &external) != c.napi_ok)
+        return throw(env, "LIBFX_NATIVE", "could not create external");
+
+    return external;
 }
 
 fn modelChat(env: c.napi_env, info: c.napi_callback_info) callconv(.c) c.napi_value {
+    var argv: [2]c.napi_value = undefined;
+    if (!callbackArgs(env, info, &argv)) return null;
+
+    // Extract the model handle from external
+    var handle: *napi_model.NapiModelHandle = undefined;
+    if (c.napi_unwrap(env, argv[0], @ptrCast(&handle)) != c.napi_ok)
+        return throw(env, "LIBFX_INVALID_ARGUMENT", "invalid model handle");
+
+    // Extract request object
+    const fx_request = parseModelRequest(env, argv[1]) catch
+        return throw(env, "LIBFX_INVALID_ARGUMENT", "invalid chat request");
+    defer {
+        std.heap.c_allocator.free(fx_request.messages);
+        std.heap.c_allocator.free(fx_request.tools);
+    }
+
+    // Execute the chat
+    var cancelled = std.atomic.Value(bool).init(false);
+    var delivery = napi_model.model_provider.Delivery{};
+
+    const chat_request: napi_model.model_provider.ChatRequest = .{
+        .messages = fx_request.messages,
+        .tools = fx_request.tools,
+        .tool_choice = fx_request.tool_choice,
+        .max_output_tokens = fx_request.max_output_tokens,
+        .events = null,
+        .cancel_flag = &cancelled,
+        .deadline = null,
+        .delivery = &delivery,
+    };
+
+    const provider = handle.openai.provider();
+    const result = provider.chat(std.heap.c_allocator, chat_request) catch |err|
+        return throw(env, "LIBFX_PROVIDER_ERROR", @errorName(err));
+
+    // Convert result to JavaScript
+    const js_result = resultToJavaScript(env, result) catch
+        return throw(env, "LIBFX_NATIVE", "could not convert result");
+
+    return js_result;
+}
+
+fn modelHandleFinalize(env: c.napi_env, data: ?*anyopaque, hint: ?*anyopaque) callconv(.c) void {
     _ = env;
-    _ = info;
-    // Stub: real implementation deferred to Phase 6B-2
-    return null;
+    _ = hint;
+    if (data) |ptr| {
+        const handle: *napi_model.NapiModelHandle = @ptrCast(@alignCast(ptr));
+        handle.deinit();
+        std.heap.c_allocator.destroy(handle);
+    }
+}
+
+fn parseModelRequest(env: c.napi_env, request_obj: c.napi_value) !napi_model.FxChatRequest {
+    var messages_arr: c.napi_value = undefined;
+    if (c.napi_get_named_property(env, request_obj, "messages", &messages_arr) != c.napi_ok)
+        return error.InvalidArgument;
+
+    var msg_len: u32 = 0;
+    if (c.napi_get_array_length(env, messages_arr, &msg_len) != c.napi_ok)
+        return error.InvalidArgument;
+
+    const messages = try std.heap.c_allocator.alloc(napi_model.FxChatMessage, msg_len);
+    for (0..msg_len) |i| {
+        var msg_val: c.napi_value = undefined;
+        if (c.napi_get_element(env, messages_arr, @intCast(i), &msg_val) != c.napi_ok)
+            return error.InvalidArgument;
+
+        var role_str: c.napi_value = undefined;
+        if (c.napi_get_named_property(env, msg_val, "role", &role_str) != c.napi_ok)
+            return error.InvalidArgument;
+
+        var role_len: usize = 0;
+        var role_buf: [16]u8 = undefined;
+        if (c.napi_get_value_string_utf8(env, role_str, &role_buf, role_buf.len, &role_len) != c.napi_ok)
+            return error.InvalidArgument;
+
+        const role_str_val = role_buf[0..role_len];
+        messages[i].role = if (std.mem.eql(u8, role_str_val, "system"))
+            .system
+        else if (std.mem.eql(u8, role_str_val, "user"))
+            .user
+        else if (std.mem.eql(u8, role_str_val, "assistant"))
+            .assistant
+        else if (std.mem.eql(u8, role_str_val, "tool"))
+            .tool
+        else
+            return error.InvalidArgument;
+
+        var content: c.napi_value = undefined;
+        if (c.napi_get_named_property(env, msg_val, "content", &content) == c.napi_ok) {
+            var content_len: usize = 0;
+            if (c.napi_get_value_string_utf8(env, content, null, 0, &content_len) == c.napi_ok and content_len > 0) {
+                const buf = try std.heap.c_allocator.alloc(u8, content_len + 1);
+                var written: usize = 0;
+                _ = c.napi_get_value_string_utf8(env, content, buf.ptr, buf.len, &written);
+                messages[i].content = buf[0..written];
+            }
+        }
+        messages[i].tool_calls = &.{};
+    }
+
+    var model_str: c.napi_value = undefined;
+    if (c.napi_get_named_property(env, request_obj, "model", &model_str) != c.napi_ok)
+        return error.InvalidArgument;
+
+    var model_len: usize = 0;
+    var model_buf: [256]u8 = undefined;
+    if (c.napi_get_value_string_utf8(env, model_str, &model_buf, model_buf.len, &model_len) != c.napi_ok)
+        return error.InvalidArgument;
+
+    const model = try std.heap.c_allocator.dupe(u8, model_buf[0..model_len]);
+
+    return .{
+        .messages = messages,
+        .model = model,
+        .tools = &.{},
+        .tool_choice = .auto,
+        .max_output_tokens = null,
+    };
+}
+
+fn resultToJavaScript(env: c.napi_env, result: napi_model.model_provider.ChatStream) !c.napi_value {
+    var result_obj: c.napi_value = undefined;
+    if (c.napi_create_object(env, &result_obj) != c.napi_ok)
+        return error.CreateObjectFailed;
+
+    switch (result) {
+        .completed => |completion| {
+            var completed_obj: c.napi_value = undefined;
+            if (c.napi_create_object(env, &completed_obj) != c.napi_ok)
+                return error.CreateObjectFailed;
+
+            if (completion.content) |content| {
+                var content_val: c.napi_value = undefined;
+                if (c.napi_create_string_utf8(env, content.ptr, content.len, &content_val) == c.napi_ok)
+                    _ = c.napi_set_named_property(env, completed_obj, "content", content_val);
+            }
+
+            if (completion.usage.input_tokens) |tokens| {
+                var tokens_val: c.napi_value = undefined;
+                if (c.napi_create_uint64(env, tokens, &tokens_val) == c.napi_ok) {
+                    var usage_obj: c.napi_value = undefined;
+                    if (c.napi_create_object(env, &usage_obj) != c.napi_ok)
+                        return error.CreateObjectFailed;
+                    _ = c.napi_set_named_property(env, usage_obj, "input_tokens", tokens_val);
+
+                    if (completion.usage.output_tokens) |out_tokens| {
+                        var out_val: c.napi_value = undefined;
+                        if (c.napi_create_uint64(env, out_tokens, &out_val) == c.napi_ok)
+                            _ = c.napi_set_named_property(env, usage_obj, "output_tokens", out_val);
+                    }
+                    _ = c.napi_set_named_property(env, completed_obj, "usage", usage_obj);
+                }
+            }
+
+            _ = c.napi_set_named_property(env, result_obj, "completed", completed_obj);
+        },
+        .failed => |failure| {
+            var failed_obj: c.napi_value = undefined;
+            if (c.napi_create_object(env, &failed_obj) != c.napi_ok)
+                return error.CreateObjectFailed;
+
+            const kind_str = @tagName(failure.kind);
+            var kind_val: c.napi_value = undefined;
+            if (c.napi_create_string_utf8(env, kind_str.ptr, kind_str.len, &kind_val) == c.napi_ok)
+                _ = c.napi_set_named_property(env, failed_obj, "kind", kind_val);
+
+            if (failure.detail) |detail| {
+                var detail_val: c.napi_value = undefined;
+                if (c.napi_create_string_utf8(env, detail.ptr, detail.len, &detail_val) == c.napi_ok)
+                    _ = c.napi_set_named_property(env, failed_obj, "detail", detail_val);
+            }
+
+            _ = c.napi_set_named_property(env, result_obj, "failed", failed_obj);
+        },
+    }
+
+    return result_obj;
 }
 
 export fn napi_register_module_v1(env: c.napi_env, exports: c.napi_value) callconv(.c) c.napi_value {

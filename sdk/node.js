@@ -587,21 +587,19 @@ export async function createFxModel(config) {
   if (!nativeBackend || !nativeBackend.createModel) {
     throw new Error("FX model API requires native backend (Node.js with native addon)");
   }
-  const modelHandle = nativeBackend.createModel(
-    config.id ?? "openai-compatible",
-    config.baseUrl,
-    config.model,
-    config.apiKeyEnv ?? "OPENAI_API_KEY",
-  );
+  const modelHandle = nativeBackend.createModel({
+    id: config.id ?? "openai-compatible",
+    baseUrl: config.baseUrl,
+    model: config.model,
+    apiKeyEnv: config.apiKeyEnv ?? "OPENAI_API_KEY",
+  });
+  if (!modelHandle) {
+    throw new Error("Failed to create model provider");
+  }
   return {
-    async chat(request, options = {}) {
+    async chat(request) {
       if (!modelHandle) throw new Error("Model handle destroyed");
-      const result = nativeBackend.modelChat(modelHandle, request);
-      if (options.onChunk) {
-        // Streaming support: invoke callback for each chunk if implemented
-        // For now, single response pattern
-      }
-      return result;
+      return nativeBackend.modelChat(modelHandle, request);
     },
   };
 }
