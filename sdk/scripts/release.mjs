@@ -55,7 +55,8 @@ if (major < 24) throw new Error(`Releasing requires Node.js 24 or newer; running
 
 const { name, version } = JSON.parse(await readFile(join(repoRoot, "sdk", "package.json"), "utf8"));
 const published = spawnSync("npm", ["view", `${name}@${version}`, "version"], { encoding: "utf8" });
-if (published.status === 0 && published.stdout.trim() === version) {
+const alreadyPublished = published.status === 0 && published.stdout.trim() === version;
+if (alreadyPublished && !args.has("--dry-run")) {
   console.log(`${name}@${version} is already on npm; bump sdk/package.json to release.`);
   process.exit(0);
 }
@@ -112,6 +113,11 @@ run("npm", ["pack", "--pack-destination", outputRoot], { cwd: packageDir });
 const tarball = (await readdir(outputRoot)).find((entry) => entry.endsWith(`-${version}.tgz`));
 if (tarball === undefined) throw new Error(`Expected a packed ${name}@${version} tarball in ${outputRoot}.`);
 
+// npm rejects a dry run of a published version, so a rehearsal stops after packing.
+if (alreadyPublished) {
+  console.log(`Dry run: ${name}@${version} is already on npm; built and verified ${tarball}.`);
+  process.exit(0);
+}
 run("npm", [
   "publish",
   join(outputRoot, tarball),
