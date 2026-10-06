@@ -61,6 +61,11 @@ if (alreadyPublished && !args.has("--dry-run")) {
   process.exit(0);
 }
 
+// package-libfx.mjs builds the CommonJS entry with `bun build`.
+if (findTool(["bun"], []) === undefined) {
+  throw new Error("bun is required to build the package's CommonJS entry; install it from https://bun.sh.");
+}
+
 const nodeInclude = resolve(dirname(process.execPath), "..", "include", "node");
 if (!existsSync(join(nodeInclude, "node_api.h"))) {
   throw new Error(`node_api.h not found under ${nodeInclude}; use a Node.js install that ships headers.`);
