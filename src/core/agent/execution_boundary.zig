@@ -1,7 +1,45 @@
 const std = @import("std");
+const Allocator = std.mem.Allocator;
 const types = @import("../shared/types.zig");
 const model_provider = @import("./model_provider.zig");
 const stream_provider = @import("./stream_provider.zig");
+const agent_runtime = @import("./agent_runtime.zig");
+const worker_runtime = @import("./worker_runtime.zig");
+
+// Caller-facing request type for agent turn execution.
+// External control planes provide execution inputs without credentials.
+// Host projection injects host-owned credentials at the boundary.
+pub const AgentTurnRequest = struct {
+    prompt: []const u8,
+    model: []const u8,
+    history: []types.HistoryTurn,
+    images: []types.ImageAttachment,
+    grants: []types.PermissionGrant,
+    permission_mode: types.PermissionMode,
+    agent_settings: worker_runtime.AgentTurnSettings = .{},
+};
+
+// Projects caller request + host-owned credentials into the runtime job.
+// The caller provides execution inputs; the host provides credentials.
+pub fn projectAgentTurnRequest(
+    alloc: Allocator,
+    request: AgentTurnRequest,
+    api_key: []const u8,
+    credential_source: types.CredentialSource,
+) !worker_runtime.CompatibilityExecutionJob {
+    return .{
+        .prompt = try alloc.dupe(u8, request.prompt),
+        .model = try alloc.dupe(u8, request.model),
+        .history = request.history,
+        .images = request.images,
+        .grants = request.grants,
+        .permission_mode = request.permission_mode,
+        .agent_settings = request.agent_settings,
+        .api_key = try alloc.dupe(u8, api_key),
+        .credential_source = credential_source,
+        .provider = .gateway,
+    };
+}
 
 // Prove that credentials are separable at the provider request boundary.
 // The existing stream_provider.ModelRequest contains credentials via the
@@ -109,4 +147,143 @@ test "credential injection happens at stream_provider.ModelRequest construction 
     };
 
     try std.testing.expectEqual(request.credential, .host_managed);
+}
+
+test "external caller can construct CompatibilityExecutionJob with host-owned credentials" {
+    const alloc = std.testing.allocator;
+
+    // External caller constructs the job with host-owned credentials.
+    // This simulates an external control plane providing the execution input.
+    const prompt = try alloc.dupe(u8, "test prompt");
+    defer alloc.free(prompt);
+    const model = try alloc.dupe(u8, "gpt-4");
+    defer alloc.free(model);
+    const api_key = try alloc.dupe(u8, "sk-test-key-from-host");
+    defer alloc.free(api_key);
+    const account_id = try alloc.dupe(u8, "account-123");
+    defer alloc.free(account_id);
+
+    const job: worker_runtime.CompatibilityExecutionJob = .{
+        .prompt = prompt,
+        .model = model,
+        .api_key = api_key,
+        .account_id = account_id,
+        .credential_source = .host_managed,
+        .permission_mode = .auto,
+        .provider = .gateway,
+        .images = &.{},
+        .history = &.{},
+        .grants = &.{},
+    };
+
+    // Verify the job contains credentials and execution inputs
+    try std.testing.expectEqualStrings("test prompt", job.prompt);
+    try std.testing.expectEqualStrings("gpt-4", job.model);
+    try std.testing.expectEqualStrings("sk-test-key-from-host", job.api_key);
+    try std.testing.expectEqualStrings("account-123", job.account_id.?);
+
+    // Credentials are host-owned input to the execution boundary,
+    // not produced by it. The boundary receives them and uses them at
+    // the provider injection point, then discards them from results.
+    try std.testing.expectEqual(job.credential_source, .host_managed);
+
+    // The interface allows external callers to provide all required inputs:
+    // - execution data (prompt, model, history)
+    // - host-owned credentials (api_key, account_id, credential_source)
+    // - permission configuration (permission_mode, grants)
+    // - settings (agent_settings)
+
+    // Importantly, the return path (via AgentRuntimeDeps callbacks) contains
+    // no credentials, only execution results (tool execution, text output, etc.)
+}
+
+test "AgentTurnRequest contains only caller-facing execution inputs, no credentials" {
+    // Caller constructs request with only execution inputs
+    const request: AgentTurnRequest = .{
+        .prompt = "analyze this code",
+        .model = "gpt-4",
+        .history = &.{},
+        .images = &.{},
+        .grants = &.{},
+        .permission_mode = .auto,
+    };
+
+    // Verify request contains execution semantics
+    try std.testing.expectEqualStrings("analyze this code", request.prompt);
+    try std.testing.expectEqualStrings("gpt-4", request.model);
+    try std.testing.expectEqual(request.permission_mode, .auto);
+
+    // Request intentionally has no credential fields
+    // - no api_key
+    // - no credential_source
+    // - no account_id
+    // - no gateway_team
+    // The request is purely for describing what to execute.
+}
+
+test "AgentTurnRequest projects to CompatibilityExecutionJob with host credentials injected" {
+    const alloc = std.testing.allocator;
+
+    // Caller provides execution request
+    const request: AgentTurnRequest = .{
+        .prompt = try alloc.dupe(u8, "write a test"),
+        .model = try alloc.dupe(u8, "claude-3"),
+        .history = &.{},
+        .images = &.{},
+        .grants = &.{},
+        .permission_mode = .auto,
+    };
+    defer alloc.free(request.prompt);
+    defer alloc.free(request.model);
+
+    // Host provides credentials and calls projection
+    const job = try projectAgentTurnRequest(
+        alloc,
+        request,
+        "sk-host-managed-key",
+        .host_managed,
+    );
+    defer alloc.free(job.prompt);
+    defer alloc.free(job.model);
+    defer alloc.free(job.api_key);
+
+    // Verify job contains both caller inputs and host credentials
+    try std.testing.expectEqualStrings("write a test", job.prompt);
+    try std.testing.expectEqualStrings("claude-3", job.model);
+    try std.testing.expectEqualStrings("sk-host-managed-key", job.api_key);
+    try std.testing.expectEqual(job.credential_source, .host_managed);
+    try std.testing.expectEqual(job.permission_mode, .auto);
+
+    // Job is ready for processAgentPrompt()
+}
+
+test "AgentTurnRequest boundary preserves execution settings" {
+    const alloc = std.testing.allocator;
+
+    // Caller can specify agent settings
+    const request: AgentTurnRequest = .{
+        .prompt = "fast execution",
+        .model = "gpt-4",
+        .history = &.{},
+        .images = &.{},
+        .grants = &.{},
+        .permission_mode = .auto,
+        .agent_settings = .{
+            .fast_mode = true,
+        },
+    };
+
+    // Host projects with credentials
+    const job = try projectAgentTurnRequest(
+        alloc,
+        request,
+        "test-key",
+        .host_managed,
+    );
+    defer alloc.free(job.prompt);
+    defer alloc.free(job.model);
+    defer alloc.free(job.api_key);
+
+    // Settings are preserved
+    try std.testing.expectEqual(job.agent_settings.fast_mode, true);
 }

@@ -1335,80 +1335,168 @@ fn createModel(env: c.napi_env, info: c.napi_callback_info) callconv(.c) c.napi_
     var argv: [1]c.napi_value = undefined;
     if (!callbackArgs(env, info, &argv)) return null;
 
-    // Extract config object properties
+    // Extract config object properties - all owned by handle
     const id_str = getNamedString(env, argv[0], "id", std.heap.c_allocator, max_model_bytes) catch
         return throw(env, "LIBFX_INVALID_ARGUMENT", "invalid model id");
-    defer std.heap.c_allocator.free(id_str);
 
-    const base_url = getNamedString(env, argv[0], "baseUrl", std.heap.c_allocator, max_url_bytes) catch
+    const base_url = getNamedString(env, argv[0], "baseUrl", std.heap.c_allocator, max_url_bytes) catch {
+        std.heap.c_allocator.free(id_str);
         return throw(env, "LIBFX_INVALID_ARGUMENT", "invalid baseUrl");
-    defer std.heap.c_allocator.free(base_url);
+    };
 
-    const model = getNamedString(env, argv[0], "model", std.heap.c_allocator, max_model_bytes) catch
+    const model = getNamedString(env, argv[0], "model", std.heap.c_allocator, max_model_bytes) catch {
+        std.heap.c_allocator.free(id_str);
+        std.heap.c_allocator.free(base_url);
         return throw(env, "LIBFX_INVALID_ARGUMENT", "invalid model");
-    defer std.heap.c_allocator.free(model);
+    };
 
-    var api_key_env: ?[]const u8 = null;
+    var api_key_env: ?[]u8 = null;
     if (getNamedString(env, argv[0], "apiKeyEnv", std.heap.c_allocator, max_model_bytes)) |env_str| {
         api_key_env = env_str;
     } else |_| {
-        api_key_env = null;
+        // api_key_env is optional
     }
-    if (api_key_env) |e| defer std.heap.c_allocator.free(e);
 
-    // Create the native handle
-    const handle = napi_model.createNapiModelHandle(std.heap.c_allocator, id_str, base_url, model, api_key_env) catch
+    // Create the native handle - it owns all strings
+    const handle = napi_model.createNapiModelHandle(std.heap.c_allocator, id_str, base_url, model, api_key_env) catch {
+        std.heap.c_allocator.free(id_str);
+        std.heap.c_allocator.free(base_url);
+        std.heap.c_allocator.free(model);
+        if (api_key_env) |e| std.heap.c_allocator.free(e);
         return throw(env, "LIBFX_NATIVE", "could not create model provider");
+    };
 
-    // Wrap in external value
+    // Wrap in external value with finalizer for cleanup
     var external: c.napi_value = undefined;
-    if (c.napi_create_external(env, handle, modelHandleFinalize, null, &external) != c.napi_ok)
+    if (c.napi_create_external(env, handle, modelHandleFinalize, null, &external) != c.napi_ok) {
+        handle.deinit();
+        std.heap.c_allocator.destroy(handle);
         return throw(env, "LIBFX_NATIVE", "could not create external");
+    }
 
     return external;
 }
+
+// Async work context for model chat execution
+const ModelChatWork = struct {
+    handle: *napi_model.NapiModelHandle,
+    fx_request: napi_model.FxChatRequest,
+    result: ?napi_model.model_provider.ChatStream = null,
+    error_msg: ?[]const u8 = null,
+    deferred: c.napi_deferred = undefined,
+    env: c.napi_env = undefined,
+
+    fn execute(raw: ?*anyopaque) callconv(.c) void {
+        const self: *ModelChatWork = @ptrCast(@alignCast(raw orelse return));
+        var cancelled = std.atomic.Value(bool).init(false);
+        var delivery = napi_model.model_provider.Delivery{};
+
+        const chat_request: napi_model.model_provider.ChatRequest = .{
+            .messages = self.fx_request.messages,
+            .tools = self.fx_request.tools,
+            .tool_choice = self.fx_request.tool_choice,
+            .max_output_tokens = self.fx_request.max_output_tokens,
+            .events = null,
+            .cancel_flag = &cancelled,
+            .deadline = null,
+            .delivery = &delivery,
+        };
+
+        const provider = self.handle.openai.provider();
+        self.result = provider.chat(std.heap.c_allocator, chat_request) catch |err| {
+            self.error_msg = std.heap.c_allocator.dupe(u8, @errorName(err)) catch return;
+            return;
+        };
+    }
+
+    fn complete(env: c.napi_env, status: c.napi_status, raw: ?*anyopaque) callconv(.c) void {
+        const self: *ModelChatWork = @ptrCast(@alignCast(raw orelse return));
+        defer {
+            std.heap.c_allocator.free(self.fx_request.messages);
+            std.heap.c_allocator.free(self.fx_request.tools);
+            if (self.error_msg) |msg| std.heap.c_allocator.free(msg);
+            std.heap.c_allocator.destroy(self);
+        }
+
+        if (status != c.napi_ok) {
+            var err_val: c.napi_value = undefined;
+            _ = c.napi_create_string_utf8(env, "model chat work failed", @sizeOf("model chat work failed") - 1, &err_val);
+            _ = c.napi_reject_deferred(env, self.deferred, err_val);
+            return;
+        }
+
+        if (self.error_msg) |msg| {
+            var err_val: c.napi_value = undefined;
+            _ = c.napi_create_string_utf8(env, msg.ptr, msg.len, &err_val);
+            _ = c.napi_reject_deferred(env, self.deferred, err_val);
+            return;
+        }
+
+        if (self.result) |result| {
+            const js_result = resultToJavaScript(env, result) catch {
+                var err_val: c.napi_value = undefined;
+                _ = c.napi_create_string_utf8(env, "could not convert result", @sizeOf("could not convert result") - 1, &err_val);
+                _ = c.napi_reject_deferred(env, self.deferred, err_val);
+                return;
+            };
+            _ = c.napi_resolve_deferred(env, self.deferred, js_result);
+        }
+    }
+};
 
 fn modelChat(env: c.napi_env, info: c.napi_callback_info) callconv(.c) c.napi_value {
     var argv: [2]c.napi_value = undefined;
     if (!callbackArgs(env, info, &argv)) return null;
 
-    // Extract the model handle from external
+    // Extract the model handle from external value
     var handle: *napi_model.NapiModelHandle = undefined;
-    if (c.napi_unwrap(env, argv[0], @ptrCast(&handle)) != c.napi_ok)
+    if (c.napi_get_value_external(env, argv[0], @ptrCast(&handle)) != c.napi_ok)
         return throw(env, "LIBFX_INVALID_ARGUMENT", "invalid model handle");
 
-    // Extract request object
+    // Parse request
     const fx_request = parseModelRequest(env, argv[1]) catch
         return throw(env, "LIBFX_INVALID_ARGUMENT", "invalid chat request");
-    defer {
+
+    // Create promise
+    var deferred: c.napi_deferred = undefined;
+    var promise: c.napi_value = undefined;
+    if (c.napi_create_promise(env, &deferred, &promise) != c.napi_ok) {
         std.heap.c_allocator.free(fx_request.messages);
         std.heap.c_allocator.free(fx_request.tools);
+        return throw(env, "LIBFX_ASYNC_FAILED", "could not create promise");
     }
 
-    // Execute the chat
-    var cancelled = std.atomic.Value(bool).init(false);
-    var delivery = napi_model.model_provider.Delivery{};
-
-    const chat_request: napi_model.model_provider.ChatRequest = .{
-        .messages = fx_request.messages,
-        .tools = fx_request.tools,
-        .tool_choice = fx_request.tool_choice,
-        .max_output_tokens = fx_request.max_output_tokens,
-        .events = null,
-        .cancel_flag = &cancelled,
-        .deadline = null,
-        .delivery = &delivery,
+    // Create async work
+    const work = std.heap.c_allocator.create(ModelChatWork) catch {
+        std.heap.c_allocator.free(fx_request.messages);
+        std.heap.c_allocator.free(fx_request.tools);
+        return throw(env, "LIBFX_OOM", "could not allocate work");
     };
 
-    const provider = handle.openai.provider();
-    const result = provider.chat(std.heap.c_allocator, chat_request) catch |err|
-        return throw(env, "LIBFX_PROVIDER_ERROR", @errorName(err));
+    work.* = .{
+        .handle = handle,
+        .fx_request = fx_request,
+        .deferred = deferred,
+        .env = env,
+    };
 
-    // Convert result to JavaScript
-    const js_result = resultToJavaScript(env, result) catch
-        return throw(env, "LIBFX_NATIVE", "could not convert result");
+    var async_work: c.napi_async_work = undefined;
+    if (c.napi_create_async_work(env, null, null, ModelChatWork.execute, ModelChatWork.complete, work, &async_work) != c.napi_ok) {
+        std.heap.c_allocator.free(fx_request.messages);
+        std.heap.c_allocator.free(fx_request.tools);
+        std.heap.c_allocator.destroy(work);
+        return throw(env, "LIBFX_ASYNC_FAILED", "could not create async work");
+    }
 
-    return js_result;
+    if (c.napi_queue_async_work(env, async_work) != c.napi_ok) {
+        _ = c.napi_delete_async_work(env, async_work);
+        std.heap.c_allocator.free(fx_request.messages);
+        std.heap.c_allocator.free(fx_request.tools);
+        std.heap.c_allocator.destroy(work);
+        return throw(env, "LIBFX_ASYNC_FAILED", "could not queue async work");
+    }
+
+    return promise;
 }
 
 fn modelHandleFinalize(env: c.napi_env, data: ?*anyopaque, hint: ?*anyopaque) callconv(.c) void {

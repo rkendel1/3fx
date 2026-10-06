@@ -106,14 +106,133 @@ ModelProvider.chat() (credential-free interface)
 stream_provider.Result (neutral execution outcome)
 ```
 
-## What Remains Unfinished
+## Reusable Agent-Turn Boundary
 
-Phase 3 will formalize this boundary by:
+The existing runtime already exposes a callable seam suitable for external control planes (Attn, Cline, OpenDots, etc.):
 
-1. Creating canonical `TurnExecutionInput` type (extracted from CompatibilityExecutionJob, no credentials)
-2. Creating canonical `ProviderSelection` type (routing only)
-3. Introducing optional neutral request/completion types for clarity
-4. Adding dependency guard to prevent credentials leaking into neutral code paths
-5. Creating standalone neutral-core verification
+**Location:** `src/core/agent/runtime/orchestrator.zig:5137`
 
-For now, this document proves the boundary is architecturally sound and requires only formalization, not redesign.
+```zig
+pub fn processAgentPrompt(
+    agent: *runtime_agent.Agent,
+    deps: *const AgentRuntimeDeps,
+    semantic_presentation: ?runtime_assistant_stream.SemanticPresentationSink,
+    lifecycle: LifecycleContext,
+    config: Config,
+    job: CompatibilityExecutionJob,
+) !void
+```
+
+### Phase 3: Callable Seam Discovered
+
+Phase 3 documented that `processAgentPrompt` is already the canonical agent-turn boundary.
+
+Current callers: App layer, CLI, ACP, subagents, external tests.
+
+### Phase 4: Caller-Facing Request Boundary
+
+Phase 4 introduces a minimal caller-facing request type to decouple external callers from `CompatibilityExecutionJob`:
+
+**New Type:** `src/core/agent/execution_boundary.zig`
+
+```zig
+pub const AgentTurnRequest = struct {
+    prompt: []const u8,
+    model: []const u8,
+    history: []types.HistoryTurn,
+    images: []types.ImageAttachment,
+    grants: []types.PermissionGrant,
+    permission_mode: types.PermissionMode,
+    agent_settings: worker_runtime.AgentTurnSettings = .{},
+};
+
+pub fn projectAgentTurnRequest(
+    alloc: Allocator,
+    request: AgentTurnRequest,
+    api_key: []const u8,
+    credential_source: types.CredentialSource,
+) !worker_runtime.CompatibilityExecutionJob
+```
+
+### External Caller Path (Phase 4)
+
+An external control plane now:
+1. Constructs `AgentTurnRequest` with only execution inputs (no credentials)
+2. Calls `projectAgentTurnRequest()` with host-owned credentials
+3. Receives `CompatibilityExecutionJob` ready for `processAgentPrompt()`
+4. Implements the `AgentRuntimeDeps` callbacks as before
+
+Flow:
+```
+External control plane
+        ↓
+AgentTurnRequest (execution inputs only, no credentials)
+        ↓
+projectAgentTurnRequest()
+        ↓
+CompatibilityExecutionJob (with host credentials injected)
+        ↓
+processAgentPrompt()
+        ↓
+existing fx runtime
+```
+
+### Credential Boundary (Preserved)
+
+- Caller request contains NO credentials or account state
+- Host projection injects credentials at boundary via `projectAgentTurnRequest()`
+- Credentials flow into `CompatibilityExecutionJob`
+- Single injection point in orchestrator remains unchanged
+- Results contain only execution outcomes (no credentials returned)
+
+### Phase 5: First Real Caller
+
+Phase 5 demonstrates a real caller using `AgentTurnRequest` end-to-end:
+
+**Example: Test harness in `src/core/agent/runtime/tests/support.zig`**
+
+```zig
+pub fn turnRequest(self: *PromptFixture) AgentTurnRequest {
+    return .{
+        .prompt = "user prompt",
+        .model = "anthropic/claude-opus-4.6",
+        .images = self.images[0..],
+        .history = self.history[0..],
+        .grants = self.grants[0..],
+        .permission_mode = .ask,
+    };
+}
+```
+
+**Integration test path:**
+```zig
+// External caller constructs AgentTurnRequest
+const request = fixture.turnRequest();
+
+// Host projects request + credentials
+const job = try projectAgentTurnRequest(
+    alloc,
+    request,
+    "test-api-key",
+    .ai_gateway_api_key,
+);
+
+// Execute through real processAgentPrompt
+try runFakePrompt(&gateway, &hooks, fixture.config(), job);
+```
+
+Real execution proves:
+- `AgentTurnRequest` → `projectAgentTurnRequest()` → `processAgentPrompt()`
+- Credentials injected at boundary
+- Existing provider/streaming/tool execution unchanged
+- Complete integration working end-to-end
+
+### Phase 3/4/5 Summary
+
+1. Phase 3: Discovered existing `processAgentPrompt()` as callable boundary
+2. Phase 4: Introduced `AgentTurnRequest` to decouple external callers from `CompatibilityExecutionJob`
+3. Phase 5: First real caller (`test harness`) uses the new boundary successfully
+4. Tests proving end-to-end execution
+5. Proof that credentials remain host-owned throughout
+6. No new runtime, frameworks, or abstractions
+7. Existing `processAgentPrompt()` unchanged

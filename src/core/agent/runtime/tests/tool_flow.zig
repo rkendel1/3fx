@@ -6793,3 +6793,45 @@ test "child live authority allow to ask requires current approval before effect"
         hooks.successful_effect_count.load(.seq_cst),
     );
 }
+
+test "AgentTurnRequest with projection executes through real processAgentPrompt path" {
+    const alloc = std.testing.allocator;
+
+    // External caller constructs AgentTurnRequest
+    var fixture = PromptFixture{};
+    const request = fixture.turnRequest();
+
+    // Host projects request + credentials to CompatibilityExecutionJob
+    const agent_runtime = @import("../../agent_runtime.zig");
+    const job = try agent_runtime.projectAgentTurnRequest(
+        alloc,
+        request,
+        "test-api-key",
+        .ai_gateway_api_key,
+    );
+    defer alloc.free(job.prompt);
+    defer alloc.free(job.model);
+    defer alloc.free(job.api_key);
+
+    // Verify job has both caller inputs and host credentials
+    try std.testing.expectEqualStrings("user prompt", job.prompt);
+    try std.testing.expectEqualStrings("anthropic/claude-opus-4.6", job.model);
+    try std.testing.expectEqualStrings("test-api-key", job.api_key);
+    try std.testing.expectEqual(job.credential_source, .ai_gateway_api_key);
+    try std.testing.expectEqual(job.permission_mode, .ask);
+
+    // Job is ready for processAgentPrompt with real infrastructure
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+
+    var gateway = FakeGateway.init(alloc, &.{
+        .{ .content = "response" },
+    });
+    defer gateway.deinit();
+
+    // Execute through real processAgentPrompt using the projected job
+    try runFakePrompt(&gateway, &hooks, fixture.config(), job);
+
+    // Verify execution completed successfully
+    try std.testing.expectEqual(@as(usize, 1), gateway.admitted_requests);
+}

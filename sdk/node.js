@@ -599,7 +599,9 @@ export async function createFxModel(config) {
   return {
     async chat(request) {
       if (!modelHandle) throw new Error("Model handle destroyed");
-      return nativeBackend.modelChat(modelHandle, request);
+      // NAPI modelChat returns a Promise now for non-blocking execution
+      const result = await nativeBackend.modelChat(modelHandle, request);
+      return result;
     },
   };
 }

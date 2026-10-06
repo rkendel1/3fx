@@ -1880,6 +1880,17 @@ pub const PromptFixture = struct {
         };
     }
 
+    pub fn turnRequest(self: *PromptFixture) @import("../../execution_boundary.zig").AgentTurnRequest {
+        return .{
+            .prompt = "user prompt",
+            .model = "anthropic/claude-opus-4.6",
+            .images = self.images[0..],
+            .history = self.history[0..],
+            .grants = self.grants[0..],
+            .permission_mode = .ask,
+        };
+    }
+
     pub fn config(self: *PromptFixture) Config {
         return .{
             .system_prompt = "system",
