@@ -79,6 +79,14 @@ pub const FxTokenUsage = struct {
     reasoning_tokens: ?u64 = null,
 };
 
+/// Streaming events from provider
+pub const FxStreamEvent = union(enum) {
+    text_delta: []const u8,
+    tool_call_delta: struct { id: []const u8, name: []const u8, arguments_delta: []const u8 },
+    completion: struct { content: ?[]const u8, tool_calls: []const FxToolCall, finish_reason: ?[]const u8, usage: FxTokenUsage },
+    failure: struct { kind: []const u8, detail: ?[]const u8 },
+};
+
 pub const FxFailureKind = enum {
     invalid_request,
     unauthorized,

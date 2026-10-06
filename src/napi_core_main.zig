@@ -1377,12 +1377,31 @@ fn createModel(env: c.napi_env, info: c.napi_callback_info) callconv(.c) c.napi_
     return external;
 }
 
+// Event queue for streaming
+const EventQueue = struct {
+    events: std.ArrayList([]const u8) = undefined,
+    allocator: Allocator = undefined,
+
+    fn emit(ctx: *anyopaque, event: napi_model.model_provider.Event) void {
+        const self: *EventQueue = @ptrCast(@alignCast(ctx));
+        // Capture event text as owned string
+        const text = switch (event) {
+            .content_delta => |delta| delta,
+            .reasoning_delta => |delta| delta,
+        };
+        if (self.allocator.dupe(u8, text)) |copy| {
+            self.events.append(copy) catch {};
+        } else |_| {}
+    }
+};
+
 // Async work context for model chat execution
 const ModelChatWork = struct {
     handle: *napi_model.NapiModelHandle,
     fx_request: napi_model.FxChatRequest,
     result: ?napi_model.model_provider.ChatStream = null,
     error_msg: ?[]const u8 = null,
+    event_queue: EventQueue = undefined,
     deferred: c.napi_deferred = undefined,
     env: c.napi_env = undefined,
 
@@ -1391,12 +1410,21 @@ const ModelChatWork = struct {
         var cancelled = std.atomic.Value(bool).init(false);
         var delivery = napi_model.model_provider.Delivery{};
 
+        // Initialize event queue for streaming
+        self.event_queue.allocator = std.heap.c_allocator;
+        self.event_queue.events = std.ArrayList([]const u8).init(std.heap.c_allocator);
+
+        var event_sink: napi_model.model_provider.EventSink = .{
+            .context = &self.event_queue,
+            .emit_fn = EventQueue.emit,
+        };
+
         const chat_request: napi_model.model_provider.ChatRequest = .{
             .messages = self.fx_request.messages,
             .tools = self.fx_request.tools,
             .tool_choice = self.fx_request.tool_choice,
             .max_output_tokens = self.fx_request.max_output_tokens,
-            .events = null,
+            .events = event_sink,
             .cancel_flag = &cancelled,
             .deadline = null,
             .delivery = &delivery,
@@ -1405,6 +1433,7 @@ const ModelChatWork = struct {
         const provider = self.handle.openai.provider();
         self.result = provider.chat(std.heap.c_allocator, chat_request) catch |err| {
             self.error_msg = std.heap.c_allocator.dupe(u8, @errorName(err)) catch return;
+            self.event_queue.events.deinit();
             return;
         };
     }
@@ -1415,6 +1444,10 @@ const ModelChatWork = struct {
             std.heap.c_allocator.free(self.fx_request.messages);
             std.heap.c_allocator.free(self.fx_request.tools);
             if (self.error_msg) |msg| std.heap.c_allocator.free(msg);
+            for (self.event_queue.events.items) |event| {
+                std.heap.c_allocator.free(event);
+            }
+            self.event_queue.events.deinit();
             std.heap.c_allocator.destroy(self);
         }
 
