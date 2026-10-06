@@ -108,7 +108,7 @@ stream_provider.Result (neutral execution outcome)
 
 ## Reusable Agent-Turn Boundary
 
-The existing runtime already exposes a callable seam suitable for external control planes (Attn, Cline, OpenDots, etc.):
+The existing runtime already exposes a callable seam suitable for external control planes:
 
 **Location:** `src/core/agent/runtime/orchestrator.zig:5137`
 
