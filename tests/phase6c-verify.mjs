@@ -3,7 +3,22 @@
 // Demonstrates non-blocking execution
 
 import { createServer } from "node:http";
+import { dirname, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import { createFxModel } from "../sdk/node.js";
+
+const nativeAddon = resolve(process.argv[2] || resolve(dirname(fileURLToPath(import.meta.url)), "../zig-out/lib/libfx.node"));
+
+// The provider requests an OpenAI-compatible SSE stream from <baseUrl>/chat/completions.
+function sendStream(res, content, usage) {
+  const chunk = (choices, extra = {}) =>
+    res.write(`data: ${JSON.stringify({ id: "test-1", object: "chat.completion.chunk", created: 0, model: "test", choices, ...extra })}\n\n`);
+  res.writeHead(200, { "Content-Type": "text/event-stream" });
+  chunk([{ index: 0, delta: { role: "assistant", content }, finish_reason: null }]);
+  chunk([{ index: 0, delta: {}, finish_reason: "stop" }]);
+  chunk([], { usage });
+  res.end("data: [DONE]\n\n");
+}
 
 let passed = 0;
 let failed = 0;
@@ -23,58 +38,18 @@ async function test(name, fn) {
 async function startMockServer() {
   return new Promise((resolve) => {
     const server = createServer((req, res) => {
-      if (req.url === "/v1/chat/completions") {
-        let body = "";
-        req.on("data", (chunk) => {
-          body += chunk;
-        });
-        req.on("end", () => {
-          const request = JSON.parse(body);
-          const response = {
-            id: "test-1",
-            object: "chat.completion",
-            created: Date.now(),
-            model: request.model,
-            choices: [
-              {
-                index: 0,
-                message: { role: "assistant", content: "Test response" },
-                finish_reason: "stop",
-              },
-            ],
-            usage: {
-              prompt_tokens: 10,
-              completion_tokens: 5,
-              total_tokens: 15,
-            },
-          };
-          res.writeHead(200, { "Content-Type": "application/json" });
-          res.end(JSON.stringify(response));
-        });
-      } else if (req.url === "/v1/slow") {
-        // Delayed endpoint for testing non-blocking behavior
-        setTimeout(() => {
-          const response = {
-            id: "test-slow",
-            object: "chat.completion",
-            created: Date.now(),
-            model: "test",
-            choices: [
-              {
-                index: 0,
-                message: { role: "assistant", content: "Delayed response" },
-                finish_reason: "stop",
-              },
-            ],
-            usage: { prompt_tokens: 5, completion_tokens: 3 },
-          };
-          res.writeHead(200, { "Content-Type": "application/json" });
-          res.end(JSON.stringify(response));
-        }, 500);
-      } else {
-        res.writeHead(404);
-        res.end("Not found");
-      }
+      req.resume();
+      req.on("end", () => {
+        if (req.url === "/v1/chat/completions") {
+          sendStream(res, "Test response", { prompt_tokens: 10, completion_tokens: 5, total_tokens: 15 });
+        } else if (req.url === "/slow/v1/chat/completions") {
+          // Delayed endpoint for testing non-blocking behavior
+          setTimeout(() => sendStream(res, "Delayed response", { prompt_tokens: 5, completion_tokens: 3 }), 500);
+        } else {
+          res.writeHead(404);
+          res.end("Not found");
+        }
+      });
     });
 
     server.listen(0, "127.0.0.1", () => {
@@ -92,9 +67,10 @@ async function runTests() {
   // Test 1: Model creation
   await test("Model creation succeeds", async () => {
     const model = await createFxModel({
-      baseUrl: `http://127.0.0.1:${port}`,
+      baseUrl: `http://127.0.0.1:${port}/v1`,
       model: "test-model",
       apiKeyEnv: "FX_TEST_KEY",
+      nativeAddon,
     });
     if (!model || !model.chat) throw new Error("Model creation failed");
   });
@@ -102,9 +78,10 @@ async function runTests() {
   // Test 2: Basic async completion
   await test("Async chat returns Promise", async () => {
     const model = await createFxModel({
-      baseUrl: `http://127.0.0.1:${port}`,
+      baseUrl: `http://127.0.0.1:${port}/v1`,
       model: "test-model",
       apiKeyEnv: "FX_TEST_KEY",
+      nativeAddon,
     });
     const chatPromise = model.chat({ messages: [{ role: "user", content: "Hi" }] });
     if (!(chatPromise instanceof Promise)) {
@@ -117,9 +94,10 @@ async function runTests() {
   // Test 3: Non-blocking behavior
   await test("Node event loop remains responsive during async operation", async () => {
     const model = await createFxModel({
-      baseUrl: `http://127.0.0.1:${port}/v1/slow`,
+      baseUrl: `http://127.0.0.1:${port}/slow/v1`,
       model: "test-model",
       apiKeyEnv: "FX_TEST_KEY",
+      nativeAddon,
     });
 
     let otherOperationCompleted = false;
@@ -143,9 +121,10 @@ async function runTests() {
   // Test 4: Result content preserved
   await test("Response content preserved through async boundary", async () => {
     const model = await createFxModel({
-      baseUrl: `http://127.0.0.1:${port}`,
+      baseUrl: `http://127.0.0.1:${port}/v1`,
       model: "test-model",
       apiKeyEnv: "FX_TEST_KEY",
+      nativeAddon,
     });
     const result = await model.chat({
       messages: [{ role: "user", content: "Test" }],
@@ -158,9 +137,10 @@ async function runTests() {
   // Test 5: Usage preserved
   await test("Token usage preserved through async boundary", async () => {
     const model = await createFxModel({
-      baseUrl: `http://127.0.0.1:${port}`,
+      baseUrl: `http://127.0.0.1:${port}/v1`,
       model: "test-model",
       apiKeyEnv: "FX_TEST_KEY",
+      nativeAddon,
     });
     const result = await model.chat({
       messages: [{ role: "user", content: "Test" }],
@@ -173,14 +153,16 @@ async function runTests() {
   // Test 6: Multiple concurrent requests
   await test("Multiple concurrent model requests execute in parallel", async () => {
     const model1 = await createFxModel({
-      baseUrl: `http://127.0.0.1:${port}`,
+      baseUrl: `http://127.0.0.1:${port}/v1`,
       model: "model-1",
       apiKeyEnv: "FX_TEST_KEY",
+      nativeAddon,
     });
     const model2 = await createFxModel({
-      baseUrl: `http://127.0.0.1:${port}`,
+      baseUrl: `http://127.0.0.1:${port}/v1`,
       model: "model-2",
       apiKeyEnv: "FX_TEST_KEY",
+      nativeAddon,
     });
 
     const start = Date.now();

@@ -1,150 +1,96 @@
-# Phase 6B — FX Public Model API Design
+# Phase 6: public model API
 
-## API Shape
+`createFxModel()` exposes the existing `ModelProvider` contract to Node.js
+hosts without the agent loop. Phase 6D recovery made it compile, run, stream,
+and cancel; earlier Phase 6 reports described behavior that did not exist on
+`main`.
 
-The FX public model API exposes the existing `ModelProvider.chat()` contract through FFI-safe JavaScript bindings.
+The public usage reference is the "Direct model calls" section of
+[`sdk/README.md`](../sdk/README.md). The native lifecycle is described in
+[`sdk/NAPI.md`](../sdk/NAPI.md).
 
-```typescript
-// Request type (FFI-safe serialization of ChatRequest)
-interface FxChatMessage {
-  role: "system" | "user" | "assistant" | "tool";
-  content?: string;
-  tool_calls?: Array<{
-    id: string;
-    name: string;
-    arguments_json: string;  // raw JSON string
-  }>;
-  tool_call_id?: string;
-}
+## Call path
 
-interface FxChatRequest {
-  messages: FxChatMessage[];
-  model: string;
-  tools?: Array<{
-    name: string;
-    description: string;
-    input_schema: any;  // raw JSON object
-  }>;
-  tool_choice?: "auto" | "none" | "required";
-  max_output_tokens?: number;
-}
-
-// Result type (FFI-safe serialization of ChatStream)
-interface FxChatCompletion {
-  content?: string;
-  tool_calls?: Array<{
-    id: string;
-    name: string;
-    arguments_json: string;
-  }>;
-  usage?: {
-    input_tokens?: number;
-    output_tokens?: number;
-    cache_read_tokens?: number;
-    cache_write_tokens?: number;
-    reasoning_tokens?: number;
-  };
-}
-
-interface FxChatFailure {
-  kind: "invalid_request" | "unauthorized" | "forbidden" | 
-        "request_too_large" | "rate_limited" | "server_error" | 
-        "bad_gateway" | "unavailable" | "gateway_timeout" | "provider_error";
-  detail?: string;
-  retry_after_seconds?: number;
-}
-
-interface FxChatResult {
-  completed?: FxChatCompletion;
-  failed?: FxChatFailure;
-}
-
-// Public model interface
-interface FxModel {
-  chat(request: FxChatRequest, options?: {
-    signal?: AbortSignal;
-    onChunk?: (chunk: {delta?: string}) => void;
-  }): Promise<FxChatResult>;
-}
-
-// Factory function
-export async function createFxModel(config: {
-  id?: string;           // provider ID (defaults to "openai-compatible")
-  baseUrl: string;       // OpenAI-compatible endpoint (e.g., "http://localhost:8000")
-  model: string;         // model name
-  apiKeyEnv?: string;    // environment variable name for API key (defaults to "OPENAI_API_KEY")
-}): Promise<FxModel>
+```text
+createFxModel() / model.chat() / model.stream()      sdk/node.js
+        |  validated, normalized request
+        v
+createModel / modelChat / modelStream                src/napi_core_main.zig
+        |  request copied into a per-call arena
+        v
+ModelHandle.run on a dedicated native thread         src/napi_model_provider.zig
+        |  ChatRequest { messages, tools, tool_choice, max_output_tokens,
+        |                events, cancel_flag }
+        v
+ModelProvider.chat                                   src/core/agent/model_provider.zig
+        v
+OpenAICompatibleModelProvider (SSE over HTTP)        src/gateway/openai_compatible_model_provider.zig
 ```
 
-## Mapping to Internal Contract
+Events and the terminal result return through a Node-API thread-safe function
+in provider order.
 
-```
-JavaScript FxChatRequest
-    ↓ (JSON serialization)
-NAPI boundary
-    ↓ (native conversion)
-ChatRequest (ModelProvider.zig)
-    ↓
-ModelProvider.chat()
-    ↓
-OpenAICompatibleModelProvider
-    ↓
-Model
-```
+## Implemented
 
-## Implementation Plan
+- Model creation from `baseUrl`, `model`, optional `apiKeyEnv`, optional
+  `toolChoiceMode`, and optional `id`. The handle owns copies of every string
+  and is reference counted, so a collected JavaScript handle stays valid for
+  its in-flight calls.
+- Request conversion from JavaScript objects into `model_provider.Message` and
+  `model_provider.Tool`, with no intermediate message type. Roles, content,
+  assistant `tool_calls`, `tool_call_id`, tools with JSON Schema, `tool_choice`,
+  and `max_output_tokens` reach the provider request.
+- Completion results with content, tool calls (`id`, `name`,
+  `arguments_json`), `finish_reason`, `response_id`, and all five token usage
+  fields. Unreported values are `null`.
+- Provider failures as `{ failed: { kind, detail, retry_after_seconds } }`,
+  mirroring `ChatStream.failed`. Errors with no provider response reject with
+  a coded Error: `LIBFX_MODEL_CANCELLED`, `LIBFX_MODEL_TIMEOUT`,
+  `LIBFX_MODEL_CREDENTIAL_MISSING`, `LIBFX_MODEL_CREDENTIAL_INVALID`, or
+  `LIBFX_MODEL_REQUEST_FAILED`.
+- Streaming through the provider's `EventSink`. Each `text_delta` and
+  `reasoning_delta` reaches JavaScript as the provider emits it, followed by
+  one `completion` or `failure` event.
+- Cancellation from an `AbortSignal`, or by leaving a stream loop, through
+  `cancelModelCall` to the call's `cancel_flag`. The provider closes the active
+  connection.
+- Concurrent, non-blocking execution on dedicated native threads, capped at
+  256 calls per process. Model calls do not occupy the libuv thread pool, and
+  terminating a worker cancels its calls.
+- ESM and CommonJS consumers of the packaged `libfx` load the API through the
+  default platform addon.
 
-### Phase 6B-1: Design finalized ✓
+## Not implemented
 
-- FFI-safe types defined
-- NAPI registration pattern identified
-- Memory ownership documented
+- Incremental tool-call events. The chat-completions stream reducer emits only
+  content and reasoning deltas, so tool calls arrive complete in the
+  `completion` event. Adding them requires the reducer to emit tool deltas and
+  the neutral `model_provider.Event` to carry them.
+- A per-call deadline. `ChatRequest.deadline` is not exposed; the provider's
+  own connect and response-header phase limits still apply, and an
+  `AbortSignal` can bound a call.
+- Providers other than OpenAI-compatible chat completions.
+- A browser or Wasm model API. `createFxModel()` requires the native addon.
+- An AI SDK `LanguageModel` adapter. The API carries what such an adapter needs
+  for `doGenerate()` and `doStream()`, but fx has no AI SDK dependency.
+- Publishing.
 
-### Phase 6B-2: NAPI extensions ✓
+## Verification
 
-- `createModel()` NAPI callback: parses config object, creates NapiModelHandle, returns external value
-- `modelChat()` NAPI callback: extracts model handle, converts request, executes provider, returns result object
-- `modelHandleFinalize()`: cleanup hook for model handles
-- `parseModelRequest()`: converts JavaScript request object to FxChatRequest
-- `resultToJavaScript()`: converts ChatStream result back to JS object
-- Memory ownership: NAPI allocator owns all strings, model handle owns config with finalizer
+| Check | Command |
+| --- | --- |
+| Native addon build | `zig build -Dnapi-surface=core` |
+| Model runtime unit tests | `zig build test` (includes `src/napi_model_provider.zig`) |
+| Public API against a local server | `node --expose-gc sdk/tests/test-native-model.mjs` |
+| Phase 6C async checks | `node tests/phase6c-verify.mjs` |
+| Full native SDK lane | `npm run --prefix sdk test:node-napi` |
+| Neutral contract boundary | `python3 scripts/check-model-provider-boundary.py` |
 
-### Phase 6B-3: JavaScript binding ✓
+`sdk/tests/test-native-model.mjs` uses gates in its local server. A stream that
+buffers deltas, a runtime that serializes calls, and a call that blocks the
+event loop each deadlock and fail on a timeout.
 
-- `createFxModel(config)`: factory function accepting {baseUrl, model, id?, apiKeyEnv?}
-- Returns model object with `chat(request)` method
-- Proper error handling and fallback to WASM
-
-### Phase 6B-3: Verification ✓
-
-- Deterministic OpenAI-compatible mock HTTP server
-- Integration test: public API reaches real native provider
-- Request mapping: user/system/assistant messages, model, usage
-- Response mapping: completed content, usage tokens, error handling
-- Provider failure test: failed results propagate correctly
-- Memory/lifetime review: ownership verified, no leaks detected
-- Boundary checker: model-provider passes, whole-agent passes
-- Package export: createFxModel exported from sdk/node.js
-- Documentation: implementation vs. deferred capabilities clarified
-
-### Phase 6B-4: Deferred
-
-- Public streaming API (currently synchronous)
-- Browser/WASM model API support
-- Chip integration (next phase)
-- Additional error types/diagnostics
-
-## Key Invariants
-
-✓ No duplicate provider abstraction
-✓ Credentials from environment (not persistent)
-✓ ModelProvider unchanged
-✓ Agent API unchanged (createFxAgent still works)
-✓ Phases 2-5 fully preserved
-✓ No Chip/Compute/Attn references
-✓ No CLI invocation
-✓ FFI-safe types only
-✓ Boundary checker passes (model-provider and whole-agent)
-✓ Public API exported from sdk/node.js
-✓ Real provider execution through OpenAICompatibleModelProvider
-✓ Deterministic test coverage with localhost mock
+`scripts/check-model-provider-boundary.py --whole-agent` reports 1,512 findings
+both before and after this work. The model API adds none; 1,509 predate
+Phase 6, and 3 come from the Phase 4 `AgentTurnRequest` projection in
+`src/core/agent/execution_boundary.zig`.

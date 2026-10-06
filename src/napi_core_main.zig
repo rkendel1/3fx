@@ -1331,311 +1331,622 @@ fn exportFunction(env: c.napi_env, exports: c.napi_value, name: [*:0]const u8, c
     return statusOk(env, c.napi_set_named_property(env, exports, name, function), "could not export addon function");
 }
 
-// Model API NAPI functions
-fn createModel(env: c.napi_env, info: c.napi_callback_info) callconv(.c) c.napi_value {
-    var argv: [1]c.napi_value = undefined;
-    if (!callbackArgs(env, info, &argv)) return null;
+// Model API: a provider-neutral model call surface. Requests are parsed into
+// arena-owned native values, run on the libuv pool, and delivered back either
+// as one settled promise (modelChat) or as ordered stream events (modelStream).
+const model_handle_type_tag = c.napi_type_tag{
+    .lower = 0x4c494246584d4f44,
+    .upper = 0x9b3e51d27a0c46f8,
+};
+const model_call_type_tag = c.napi_type_tag{
+    .lower = 0x4c494246584d434c,
+    .upper = 0x24c8e09f61b73d5a,
+};
+const max_model_messages = 4096;
+const max_model_tools = 512;
+const max_model_tool_calls = 512;
+const max_model_role_bytes = 32;
+const max_model_text_bytes = max_input_bytes;
+const model_delivery_queue_size = 64;
+const max_active_model_calls = 256;
+var active_model_calls: std.atomic.Value(u32) = .init(0);
 
-    // Extract config object properties - all owned by handle
-    const id_str = getNamedString(env, argv[0], "id", std.heap.c_allocator, max_model_bytes) catch
-        return throw(env, "LIBFX_INVALID_ARGUMENT", "invalid model id");
+const ModelValueError = error{ JavaScriptException, InvalidArgument, ArgumentTooLong, OutOfMemory };
 
-    const base_url = getNamedString(env, argv[0], "baseUrl", std.heap.c_allocator, max_url_bytes) catch {
-        std.heap.c_allocator.free(id_str);
-        return throw(env, "LIBFX_INVALID_ARGUMENT", "invalid baseUrl");
-    };
-
-    const model = getNamedString(env, argv[0], "model", std.heap.c_allocator, max_model_bytes) catch {
-        std.heap.c_allocator.free(id_str);
-        std.heap.c_allocator.free(base_url);
-        return throw(env, "LIBFX_INVALID_ARGUMENT", "invalid model");
-    };
-
-    var api_key_env_str: ?[]u8 = null;
-    if (getNamedString(env, argv[0], "apiKeyEnv", std.heap.c_allocator, max_model_bytes)) |env_str| {
-        api_key_env_str = env_str;
-    } else |_| {
-        // api_key_env is optional
-    }
-
-    // Create the native handle - it owns all strings
-    const handle = napi_model.createNapiModelHandle(std.heap.c_allocator, id_str, base_url, model, api_key_env_str) catch {
-        std.heap.c_allocator.free(id_str);
-        std.heap.c_allocator.free(base_url);
-        std.heap.c_allocator.free(model);
-        if (api_key_env_str) |e| std.heap.c_allocator.free(e);
-        return throw(env, "LIBFX_NATIVE", "could not create model provider");
-    };
-
-    // Wrap in external value with finalizer for cleanup
-    var external: c.napi_value = undefined;
-    if (c.napi_create_external(env, handle, modelHandleFinalize, null, &external) != c.napi_ok) {
-        handle.deinit();
-        std.heap.c_allocator.destroy(handle);
-        return throw(env, "LIBFX_NATIVE", "could not create external");
-    }
-
-    return external;
+fn propertyError(env: c.napi_env) ModelValueError {
+    return if (exceptionPending(env)) error.JavaScriptException else error.InvalidArgument;
 }
 
-// Async work context for model chat execution
-const ModelChatWork = struct {
-    handle: *napi_model.NapiModelHandle,
-    fx_request: napi_model.FxChatRequest,
-    result: ?model_provider.ChatStream = null,
-    error_msg: ?[]const u8 = null,
-    deferred: c.napi_deferred = undefined,
-    env: c.napi_env = undefined,
+fn objectValue(env: c.napi_env, value: c.napi_value) ModelValueError!c.napi_value {
+    var value_type: c.napi_valuetype = undefined;
+    if (c.napi_typeof(env, value, &value_type) != c.napi_ok or value_type != c.napi_object) return error.InvalidArgument;
+    return value;
+}
 
-    fn execute(raw: ?*anyopaque) callconv(.c) void {
-        const self: *ModelChatWork = @ptrCast(@alignCast(raw orelse return));
-        var cancelled = std.atomic.Value(bool).init(false);
-        var delivery = model_provider.Delivery{};
+/// Absent, undefined, and null properties are all reported as null.
+fn optionalProperty(env: c.napi_env, object: c.napi_value, name: [*:0]const u8) ModelValueError!?c.napi_value {
+    var present = false;
+    if (c.napi_has_named_property(env, object, name, &present) != c.napi_ok) return propertyError(env);
+    if (!present) return null;
+    var value: c.napi_value = undefined;
+    if (c.napi_get_named_property(env, object, name, &value) != c.napi_ok) return propertyError(env);
+    var value_type: c.napi_valuetype = undefined;
+    if (c.napi_typeof(env, value, &value_type) != c.napi_ok) return error.InvalidArgument;
+    if (value_type == c.napi_undefined or value_type == c.napi_null) return null;
+    return value;
+}
 
-        const chat_request: model_provider.ChatRequest = .{
-            .messages = self.fx_request.messages,
-            .tools = self.fx_request.tools,
-            .tool_choice = self.fx_request.tool_choice,
-            .max_output_tokens = self.fx_request.max_output_tokens,
-            .events = null,
-            .cancel_flag = &cancelled,
-            .deadline = null,
-            .delivery = &delivery,
-        };
+fn optionalStringProperty(env: c.napi_env, object: c.napi_value, name: [*:0]const u8, alloc: Allocator, max_len: usize) ModelValueError!?[]u8 {
+    const value = try optionalProperty(env, object, name) orelse return null;
+    var value_type: c.napi_valuetype = undefined;
+    if (c.napi_typeof(env, value, &value_type) != c.napi_ok or value_type != c.napi_string) return error.InvalidArgument;
+    return stringArg(env, value, alloc, max_len) catch |err| switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        error.ArgumentTooLong => error.ArgumentTooLong,
+        else => error.InvalidArgument,
+    };
+}
 
-        const provider = self.handle.openai.provider();
-        self.result = provider.chat(std.heap.c_allocator, chat_request) catch |err| {
-            self.error_msg = std.heap.c_allocator.dupe(u8, @errorName(err)) catch return;
-            return;
-        };
-    }
+fn requiredStringProperty(env: c.napi_env, object: c.napi_value, name: [*:0]const u8, alloc: Allocator, max_len: usize) ModelValueError![]u8 {
+    return try optionalStringProperty(env, object, name, alloc, max_len) orelse error.InvalidArgument;
+}
 
-    fn complete(env: c.napi_env, status: c.napi_status, raw: ?*anyopaque) callconv(.c) void {
-        const self: *ModelChatWork = @ptrCast(@alignCast(raw orelse return));
-        defer {
-            std.heap.c_allocator.free(self.fx_request.messages);
-            std.heap.c_allocator.free(self.fx_request.tools);
-            if (self.error_msg) |msg| std.heap.c_allocator.free(msg);
-            std.heap.c_allocator.destroy(self);
-        }
+const ModelArray = struct {
+    value: c.napi_value,
+    len: u32,
 
-        if (status != c.napi_ok) {
-            var err_val: c.napi_value = undefined;
-            _ = c.napi_create_string_utf8(env, "model chat work failed", @sizeOf("model chat work failed") - 1, &err_val);
-            _ = c.napi_reject_deferred(env, self.deferred, err_val);
-            return;
-        }
-
-        if (self.error_msg) |msg| {
-            var err_val: c.napi_value = undefined;
-            _ = c.napi_create_string_utf8(env, msg.ptr, msg.len, &err_val);
-            _ = c.napi_reject_deferred(env, self.deferred, err_val);
-            return;
-        }
-
-        if (self.result) |result| {
-            const js_result = resultToJavaScript(env, result) catch {
-                var err_val: c.napi_value = undefined;
-                _ = c.napi_create_string_utf8(env, "could not convert result", @sizeOf("could not convert result") - 1, &err_val);
-                _ = c.napi_reject_deferred(env, self.deferred, err_val);
-                return;
-            };
-            _ = c.napi_resolve_deferred(env, self.deferred, js_result);
-        }
+    fn element(self: ModelArray, env: c.napi_env, index: usize) ModelValueError!c.napi_value {
+        var item: c.napi_value = undefined;
+        if (c.napi_get_element(env, self.value, @intCast(index), &item) != c.napi_ok) return propertyError(env);
+        return objectValue(env, item);
     }
 };
 
-fn modelChat(env: c.napi_env, info: c.napi_callback_info) callconv(.c) c.napi_value {
-    var argv: [2]c.napi_value = undefined;
+fn optionalArrayProperty(env: c.napi_env, object: c.napi_value, name: [*:0]const u8, max_len: u32) ModelValueError!?ModelArray {
+    const value = try optionalProperty(env, object, name) orelse return null;
+    var is_array = false;
+    if (c.napi_is_array(env, value, &is_array) != c.napi_ok or !is_array) return error.InvalidArgument;
+    var len: u32 = 0;
+    if (c.napi_get_array_length(env, value, &len) != c.napi_ok) return error.InvalidArgument;
+    if (len > max_len) return error.ArgumentTooLong;
+    return .{ .value = value, .len = len };
+}
+
+fn parseModelToolCalls(env: c.napi_env, message: c.napi_value, alloc: Allocator) ModelValueError![]const model_provider.ToolCall {
+    const array = try optionalArrayProperty(env, message, "tool_calls", max_model_tool_calls) orelse return &.{};
+    const calls = try alloc.alloc(model_provider.ToolCall, array.len);
+    for (calls, 0..) |*call, index| {
+        const item = try array.element(env, index);
+        call.* = .{
+            .id = try requiredStringProperty(env, item, "id", alloc, max_model_bytes),
+            .name = try requiredStringProperty(env, item, "name", alloc, max_model_bytes),
+            .arguments_json = try requiredStringProperty(env, item, "arguments_json", alloc, max_model_text_bytes),
+        };
+    }
+    return calls;
+}
+
+/// Copies every borrowed JavaScript value into the request arena.
+fn parseModelRequest(env: c.napi_env, value: c.napi_value, request: *napi_model.Request) ModelValueError!void {
+    const alloc = request.arena.allocator();
+    const object = try objectValue(env, value);
+
+    const message_array = try optionalArrayProperty(env, object, "messages", max_model_messages) orelse return error.InvalidArgument;
+    const messages = try alloc.alloc(model_provider.Message, message_array.len);
+    for (messages, 0..) |*message, index| {
+        const item = try message_array.element(env, index);
+        const role = try requiredStringProperty(env, item, "role", alloc, max_model_role_bytes);
+        message.* = .{
+            .role = napi_model.parseRole(role) orelse return error.InvalidArgument,
+            .content = try optionalStringProperty(env, item, "content", alloc, max_model_text_bytes),
+            .tool_call_id = try optionalStringProperty(env, item, "tool_call_id", alloc, max_model_bytes),
+            .tool_calls = try parseModelToolCalls(env, item, alloc),
+        };
+    }
+    request.messages = messages;
+
+    if (try optionalArrayProperty(env, object, "tools", max_model_tools)) |tool_array| {
+        const tools = try alloc.alloc(model_provider.Tool, tool_array.len);
+        for (tools, 0..) |*tool, index| {
+            const item = try tool_array.element(env, index);
+            const schema_json = try requiredStringProperty(env, item, "input_schema_json", alloc, max_model_text_bytes);
+            tool.* = .{
+                .name = try requiredStringProperty(env, item, "name", alloc, max_model_bytes),
+                .description = try optionalStringProperty(env, item, "description", alloc, max_model_text_bytes) orelse "",
+                .input_schema = std.json.parseFromSliceLeaky(std.json.Value, alloc, schema_json, .{}) catch |err| switch (err) {
+                    error.OutOfMemory => return error.OutOfMemory,
+                    else => return error.InvalidArgument,
+                },
+            };
+        }
+        request.tools = tools;
+    }
+
+    if (try optionalStringProperty(env, object, "tool_choice", alloc, max_model_role_bytes)) |choice| {
+        request.tool_choice = napi_model.parseToolChoice(choice) orelse return error.InvalidArgument;
+    }
+
+    if (try optionalProperty(env, object, "max_output_tokens")) |limit| {
+        var number: f64 = 0;
+        if (c.napi_get_value_double(env, limit, &number) != c.napi_ok) return error.InvalidArgument;
+        if (!(number >= 1 and number <= std.math.maxInt(u32)) or @floor(number) != number) return error.InvalidArgument;
+        request.max_output_tokens = @intFromFloat(number);
+    }
+}
+
+fn throwModelArgument(env: c.napi_env, err: ModelValueError, message: [*:0]const u8) c.napi_value {
+    switch (err) {
+        error.JavaScriptException => if (exceptionPending(env)) return null,
+        error.OutOfMemory => return throw(env, "LIBFX_NATIVE_OOM", message),
+        else => {},
+    }
+    _ = c.napi_throw_type_error(env, "LIBFX_INVALID_ARGUMENT", message);
+    return null;
+}
+
+fn wrapModelObject(env: c.napi_env, data: *anyopaque, tag: *const c.napi_type_tag, finalize: c.napi_finalize) ?c.napi_value {
+    var result: c.napi_value = undefined;
+    if (!statusOk(env, c.napi_create_object(env, &result), "could not create model handle")) return null;
+    if (!statusOk(env, c.napi_type_tag_object(env, result, tag), "could not brand model handle")) return null;
+    if (!statusOk(env, c.napi_wrap(env, result, data, finalize, null, null), "could not attach model handle")) return null;
+    return result;
+}
+
+fn unwrapModelObject(comptime T: type, env: c.napi_env, value: c.napi_value, tag: *const c.napi_type_tag, message: [*:0]const u8) ?*T {
+    var value_type: c.napi_valuetype = undefined;
+    var branded = false;
+    if (c.napi_typeof(env, value, &value_type) != c.napi_ok or value_type != c.napi_object or
+        c.napi_check_object_type_tag(env, value, tag, &branded) != c.napi_ok or !branded)
+    {
+        _ = c.napi_throw_type_error(env, "LIBFX_INVALID_ARGUMENT", message);
+        return null;
+    }
+    var context: ?*anyopaque = null;
+    if (!statusOk(env, c.napi_unwrap(env, value, &context), message)) return null;
+    return @ptrCast(@alignCast(context orelse return null));
+}
+
+fn finalizeModelHandle(_: c.napi_env, data: ?*anyopaque, _: ?*anyopaque) callconv(.c) void {
+    const handle: *napi_model.ModelHandle = @ptrCast(@alignCast(data orelse return));
+    handle.release();
+}
+
+fn finalizeModelCall(_: c.napi_env, data: ?*anyopaque, _: ?*anyopaque) callconv(.c) void {
+    const call: *napi_model.Call = @ptrCast(@alignCast(data orelse return));
+    call.release();
+}
+
+fn createModel(env: c.napi_env, info: c.napi_callback_info) callconv(.c) c.napi_value {
+    var argv: [1]c.napi_value = undefined;
     if (!callbackArgs(env, info, &argv)) return null;
+    var scratch = std.heap.ArenaAllocator.init(std.heap.c_allocator);
+    defer scratch.deinit();
+    const alloc = scratch.allocator();
+    const config = objectValue(env, argv[0]) catch |err| return throwModelArgument(env, err, "model configuration must be an object");
+    const id = requiredStringProperty(env, config, "id", alloc, max_model_bytes) catch |err| return throwModelArgument(env, err, "invalid model id");
+    const base_url = requiredStringProperty(env, config, "baseUrl", alloc, max_url_bytes) catch |err| return throwModelArgument(env, err, "invalid model baseUrl");
+    const model = requiredStringProperty(env, config, "model", alloc, max_model_bytes) catch |err| return throwModelArgument(env, err, "invalid model name");
+    const api_key_env = optionalStringProperty(env, config, "apiKeyEnv", alloc, max_model_bytes) catch |err| return throwModelArgument(env, err, "invalid model apiKeyEnv");
+    const mode_name = optionalStringProperty(env, config, "toolChoiceMode", alloc, max_model_role_bytes) catch |err| return throwModelArgument(env, err, "invalid model toolChoiceMode");
+    const tool_choice_mode = if (mode_name) |name|
+        napi_model.parseToolChoiceMode(name) orelse return throwModelArgument(env, error.InvalidArgument, "toolChoiceMode must be omit or send")
+    else
+        .omit;
 
-    // Extract the model handle from external value
-    var handle: *napi_model.NapiModelHandle = undefined;
-    if (c.napi_get_value_external(env, argv[0], @ptrCast(&handle)) != c.napi_ok)
-        return throw(env, "LIBFX_INVALID_ARGUMENT", "invalid model handle");
+    const handle = napi_model.ModelHandle.create(std.heap.c_allocator, id, base_url, model, api_key_env, tool_choice_mode) catch |err| switch (err) {
+        error.OutOfMemory => return throw(env, "LIBFX_NATIVE_OOM", "could not allocate model handle"),
+        else => return throw(env, "LIBFX_INVALID_MODEL_CONFIG", @errorName(err)),
+    };
+    return wrapModelObject(env, handle, &model_handle_type_tag, finalizeModelHandle) orelse {
+        handle.release();
+        return null;
+    };
+}
 
-    // Parse request
-    const fx_request = parseModelRequest(env, argv[1]) catch
-        return throw(env, "LIBFX_INVALID_ARGUMENT", "invalid chat request");
+fn createModelCall(env: c.napi_env, _: c.napi_callback_info) callconv(.c) c.napi_value {
+    const call = napi_model.Call.create(std.heap.c_allocator) catch return throw(env, "LIBFX_NATIVE_OOM", "could not allocate model call");
+    return wrapModelObject(env, call, &model_call_type_tag, finalizeModelCall) orelse {
+        call.release();
+        return null;
+    };
+}
 
-    // Create promise
-    var deferred: c.napi_deferred = undefined;
+fn cancelModelCall(env: c.napi_env, info: c.napi_callback_info) callconv(.c) c.napi_value {
+    var argv: [1]c.napi_value = undefined;
+    if (!callbackArgs(env, info, &argv)) return null;
+    const call = unwrapModelObject(napi_model.Call, env, argv[0], &model_call_type_tag, "invalid model call") orelse return null;
+    call.cancel();
+    return undefinedValue(env);
+}
+
+const ModelResultError = error{NapiFailed};
+
+fn checked(status: c.napi_status) ModelResultError!void {
+    if (status != c.napi_ok) return error.NapiFailed;
+}
+
+fn modelObject(env: c.napi_env) ModelResultError!c.napi_value {
+    var value: c.napi_value = undefined;
+    try checked(c.napi_create_object(env, &value));
+    return value;
+}
+
+fn modelString(env: c.napi_env, text: []const u8) ModelResultError!c.napi_value {
+    var value: c.napi_value = undefined;
+    try checked(c.napi_create_string_utf8(env, text.ptr, text.len, &value));
+    return value;
+}
+
+fn modelNull(env: c.napi_env) ModelResultError!c.napi_value {
+    var value: c.napi_value = undefined;
+    try checked(c.napi_get_null(env, &value));
+    return value;
+}
+
+fn modelOptionalString(env: c.napi_env, text: ?[]const u8) ModelResultError!c.napi_value {
+    return if (text) |value| modelString(env, value) else modelNull(env);
+}
+
+fn modelOptionalNumber(env: c.napi_env, number: ?u64) ModelResultError!c.napi_value {
+    const raw = number orelse return modelNull(env);
+    var value: c.napi_value = undefined;
+    try checked(c.napi_create_double(env, @floatFromInt(raw), &value));
+    return value;
+}
+
+fn modelSet(env: c.napi_env, object: c.napi_value, name: [*:0]const u8, value: c.napi_value) ModelResultError!void {
+    try checked(c.napi_set_named_property(env, object, name, value));
+}
+
+fn modelError(env: c.napi_env, code: []const u8, message: []const u8) ?c.napi_value {
+    const code_value = modelString(env, code) catch return null;
+    const message_value = modelString(env, message) catch return null;
+    var value: c.napi_value = undefined;
+    if (c.napi_create_error(env, code_value, message_value, &value) != c.napi_ok) return null;
+    return value;
+}
+
+/// Transport and runtime errors become JavaScript Errors with a stable code.
+/// Provider-reported failures are values, not errors; see failureValue.
+fn modelErrorValue(env: c.napi_env, err: anyerror) ?c.napi_value {
+    return switch (err) {
+        error.Cancelled => modelError(env, "LIBFX_MODEL_CANCELLED", "model call was cancelled"),
+        error.Timeout => modelError(env, "LIBFX_MODEL_TIMEOUT", "model call timed out"),
+        error.MissingConfiguredProviderCredential => modelError(env, "LIBFX_MODEL_CREDENTIAL_MISSING", "the model apiKeyEnv variable is not set"),
+        error.InvalidConfiguredProviderCredential => modelError(env, "LIBFX_MODEL_CREDENTIAL_INVALID", "the model apiKeyEnv variable holds an invalid credential"),
+        error.OutOfMemory => modelError(env, "LIBFX_NATIVE_OOM", "model call ran out of memory"),
+        else => modelError(env, "LIBFX_MODEL_REQUEST_FAILED", @errorName(err)),
+    };
+}
+
+fn completionValue(env: c.napi_env, completion: model_provider.Completion) ModelResultError!c.napi_value {
+    const object = try modelObject(env);
+    try modelSet(env, object, "content", try modelOptionalString(env, completion.content));
+    var calls: c.napi_value = undefined;
+    try checked(c.napi_create_array_with_length(env, completion.tool_calls.len, &calls));
+    for (completion.tool_calls, 0..) |tool_call, index| {
+        const item = try modelObject(env);
+        try modelSet(env, item, "id", try modelString(env, tool_call.id));
+        try modelSet(env, item, "name", try modelString(env, tool_call.name));
+        try modelSet(env, item, "arguments_json", try modelString(env, tool_call.arguments_json));
+        try checked(c.napi_set_element(env, calls, @intCast(index), item));
+    }
+    try modelSet(env, object, "tool_calls", calls);
+    const finish_reason: ?[]const u8 = if (completion.finish_reason) |reason| @tagName(reason) else null;
+    try modelSet(env, object, "finish_reason", try modelOptionalString(env, finish_reason));
+    try modelSet(env, object, "response_id", try modelOptionalString(env, completion.response_id));
+    const usage = try modelObject(env);
+    try modelSet(env, usage, "input_tokens", try modelOptionalNumber(env, completion.usage.input_tokens));
+    try modelSet(env, usage, "output_tokens", try modelOptionalNumber(env, completion.usage.output_tokens));
+    try modelSet(env, usage, "cache_read_tokens", try modelOptionalNumber(env, completion.usage.cache_read_tokens));
+    try modelSet(env, usage, "cache_write_tokens", try modelOptionalNumber(env, completion.usage.cache_write_tokens));
+    try modelSet(env, usage, "reasoning_tokens", try modelOptionalNumber(env, completion.usage.reasoning_tokens));
+    try modelSet(env, object, "usage", usage);
+    return object;
+}
+
+fn failureValue(env: c.napi_env, failure: model_provider.Failure) ModelResultError!c.napi_value {
+    const object = try modelObject(env);
+    try modelSet(env, object, "kind", try modelString(env, @tagName(failure.kind)));
+    try modelSet(env, object, "detail", try modelOptionalString(env, failure.detail));
+    try modelSet(env, object, "retry_after_seconds", try modelOptionalNumber(env, failure.retry_after_seconds));
+    return object;
+}
+
+fn chatResultValue(env: c.napi_env, stream: model_provider.ChatStream) ModelResultError!c.napi_value {
+    const object = try modelObject(env);
+    switch (stream) {
+        .completed => |completion| try modelSet(env, object, "completed", try completionValue(env, completion)),
+        .failed => |failure| try modelSet(env, object, "failed", try failureValue(env, failure)),
+    }
+    return object;
+}
+
+fn modelConversionError(env: c.napi_env) c.napi_value {
+    var exception: c.napi_value = undefined;
+    if (exceptionPending(env) and c.napi_get_and_clear_last_exception(env, &exception) == c.napi_ok) return exception;
+    return modelError(env, "LIBFX_NATIVE", "could not convert model result") orelse undefinedValue(env);
+}
+
+fn claimModelCallSlot() bool {
+    var current = active_model_calls.load(.acquire);
+    while (current < max_active_model_calls) {
+        if (active_model_calls.cmpxchgWeak(current, current + 1, .acq_rel, .acquire)) |observed| {
+            current = observed;
+        } else return true;
+    }
+    return false;
+}
+
+fn releaseModelCallSlot() void {
+    _ = active_model_calls.fetchSub(1, .acq_rel);
+}
+
+const ModelStreamItem = struct {
+    event: union(enum) {
+        text_delta: []u8,
+        reasoning_delta: []u8,
+        finished: model_provider.ChatStream,
+        failed: anyerror,
+    },
+
+    fn create(event: @FieldType(ModelStreamItem, "event")) !*ModelStreamItem {
+        const self = try std.heap.c_allocator.create(ModelStreamItem);
+        self.* = .{ .event = event };
+        return self;
+    }
+
+    fn destroy(self: *ModelStreamItem) void {
+        switch (self.event) {
+            .text_delta, .reasoning_delta => |text| std.heap.c_allocator.free(text),
+            .finished => |*stream| stream.deinit(std.heap.c_allocator),
+            .failed => {},
+        }
+        std.heap.c_allocator.destroy(self);
+    }
+};
+
+/// One provider call. Model calls run on their own native thread rather than
+/// the libuv pool: a long stream would otherwise starve Node's file system,
+/// DNS, and crypto work, and Node waits for pool work before tearing down a
+/// worker. Results reach JavaScript through a thread-safe function whose
+/// finalizer cancels the call, joins the thread, and frees this work.
+const ModelWork = struct {
+    handle: *napi_model.ModelHandle,
+    call: *napi_model.Call,
+    request: napi_model.Request,
+    streaming: bool,
+    terminal: ?*ModelStreamItem,
+    delivery: c.napi_threadsafe_function = null,
+    deferred: c.napi_deferred = null,
+    thread: ?std.Thread = null,
+    // Worker-thread state: napi_closing already released this thread's reference.
+    delivery_closed: bool = false,
+
+    fn create(handle: *napi_model.ModelHandle, call: *napi_model.Call, streaming: bool) !*ModelWork {
+        const self = try std.heap.c_allocator.create(ModelWork);
+        errdefer std.heap.c_allocator.destroy(self);
+        // The terminal event is allocated up front so every call can always end.
+        const terminal = try ModelStreamItem.create(.{ .failed = error.Cancelled });
+        handle.retain();
+        call.retain();
+        self.* = .{
+            .handle = handle,
+            .call = call,
+            .request = .init(std.heap.c_allocator),
+            .streaming = streaming,
+            .terminal = terminal,
+        };
+        return self;
+    }
+
+    fn destroy(self: *ModelWork) void {
+        if (self.terminal) |item| item.destroy();
+        self.request.deinit();
+        self.call.release();
+        self.handle.release();
+        std.heap.c_allocator.destroy(self);
+    }
+
+    /// Worker thread only. Blocks while the JavaScript queue is full.
+    fn deliver(self: *ModelWork, item: *ModelStreamItem) void {
+        if (!self.delivery_closed) switch (c.napi_call_threadsafe_function(self.delivery, item, c.napi_tsfn_blocking)) {
+            c.napi_ok => return,
+            c.napi_closing => self.delivery_closed = true,
+            else => {},
+        };
+        item.destroy();
+        // A consumer that can no longer receive events must not keep the provider running.
+        self.call.cancel();
+    }
+};
+
+/// Copies each provider delta, because EventSink text is borrowed only for
+/// the synchronous emit, then posts it to JavaScript in provider order.
+const ModelStreamSink = struct {
+    work: *ModelWork,
+
+    fn emit(raw: *anyopaque, event: model_provider.Event) void {
+        const self: *ModelStreamSink = @ptrCast(@alignCast(raw));
+        if (self.work.delivery_closed) return;
+        const item = switch (event) {
+            .content_delta => |text| itemForText(.text_delta, text),
+            .reasoning_delta => |text| itemForText(.reasoning_delta, text),
+        } catch return self.work.call.cancel();
+        self.work.deliver(item);
+    }
+
+    fn itemForText(comptime kind: enum { text_delta, reasoning_delta }, text: []const u8) !*ModelStreamItem {
+        const copy = try std.heap.c_allocator.dupe(u8, text);
+        errdefer std.heap.c_allocator.free(copy);
+        return ModelStreamItem.create(switch (kind) {
+            .text_delta => .{ .text_delta = copy },
+            .reasoning_delta => .{ .reasoning_delta = copy },
+        });
+    }
+};
+
+fn runModelWork(work: *ModelWork) void {
+    var sink: ModelStreamSink = .{ .work = work };
+    const events: ?model_provider.EventSink = if (work.streaming)
+        .{ .context = &sink, .emit_fn = ModelStreamSink.emit }
+    else
+        null;
+    const outcome = work.handle.run(std.heap.c_allocator, &work.request, work.call, events);
+    const terminal = work.terminal.?;
+    work.terminal = null;
+    terminal.event = if (outcome) |stream| .{ .finished = stream } else |err| .{ .failed = err };
+    work.deliver(terminal);
+    if (!work.delivery_closed) _ = c.napi_release_threadsafe_function(work.delivery, c.napi_tsfn_release);
+}
+
+/// Runs on the JavaScript thread after the queue drains, or during environment
+/// teardown while the provider may still be waiting on the network.
+fn finalizeModelWork(_: c.napi_env, data: ?*anyopaque, _: ?*anyopaque) callconv(.c) void {
+    const work: *ModelWork = @ptrCast(@alignCast(data orelse return));
+    work.call.cancel();
+    if (work.thread) |thread| thread.join();
+    work.destroy();
+    releaseModelCallSlot();
+}
+
+fn settleModelChat(env: c.napi_env, deferred: c.napi_deferred, item: *const ModelStreamItem) void {
+    const value = switch (item.event) {
+        .finished => |stream| chatResultValue(env, stream) catch {
+            _ = c.napi_reject_deferred(env, deferred, modelConversionError(env));
+            return;
+        },
+        .failed => |err| {
+            _ = c.napi_reject_deferred(env, deferred, modelErrorValue(env, err) orelse modelConversionError(env));
+            return;
+        },
+        .text_delta, .reasoning_delta => return,
+    };
+    _ = c.napi_resolve_deferred(env, deferred, value);
+}
+
+fn streamEventValue(env: c.napi_env, item: *const ModelStreamItem) ModelResultError!c.napi_value {
+    const object = try modelObject(env);
+    switch (item.event) {
+        .text_delta => |text| {
+            try modelSet(env, object, "type", try modelString(env, "text_delta"));
+            try modelSet(env, object, "text", try modelString(env, text));
+        },
+        .reasoning_delta => |text| {
+            try modelSet(env, object, "type", try modelString(env, "reasoning_delta"));
+            try modelSet(env, object, "text", try modelString(env, text));
+        },
+        .finished => |stream| switch (stream) {
+            .completed => |completion| {
+                try modelSet(env, object, "type", try modelString(env, "completion"));
+                try modelSet(env, object, "completion", try completionValue(env, completion));
+            },
+            .failed => |failure| {
+                try modelSet(env, object, "type", try modelString(env, "failure"));
+                try modelSet(env, object, "failure", try failureValue(env, failure));
+            },
+        },
+        .failed => |err| {
+            try modelSet(env, object, "type", try modelString(env, "error"));
+            try modelSet(env, object, "error", modelErrorValue(env, err) orelse return error.NapiFailed);
+        },
+    }
+    return object;
+}
+
+fn deliverModelEvent(env: c.napi_env, callback: c.napi_value, context: ?*anyopaque, data: ?*anyopaque) callconv(.c) void {
+    const item: *ModelStreamItem = @ptrCast(@alignCast(data orelse return));
+    defer item.destroy();
+    // A null environment means teardown; the work may already be freed.
+    if (env == null) return;
+    const work: *ModelWork = @ptrCast(@alignCast(context orelse return));
+    if (!work.streaming) {
+        if (work.deferred) |deferred| settleModelChat(env, deferred, item);
+        return;
+    }
+    const event = streamEventValue(env, item) catch fallback: {
+        _ = modelConversionError(env);
+        const fallback = modelObject(env) catch return;
+        modelSet(env, fallback, "type", modelString(env, "error") catch return) catch return;
+        modelSet(env, fallback, "error", modelError(env, "LIBFX_NATIVE", "could not convert model event") orelse return) catch return;
+        break :fallback fallback;
+    };
+    var receiver: c.napi_value = undefined;
+    if (c.napi_get_undefined(env, &receiver) != c.napi_ok) return;
+    _ = c.napi_call_function(env, receiver, callback, 1, &event, null);
+}
+
+fn prepareModelWork(env: c.napi_env, model_value: c.napi_value, call_value: c.napi_value, request_value: c.napi_value, streaming: bool) ?*ModelWork {
+    const handle = unwrapModelObject(napi_model.ModelHandle, env, model_value, &model_handle_type_tag, "invalid model handle") orelse return null;
+    const call = unwrapModelObject(napi_model.Call, env, call_value, &model_call_type_tag, "invalid model call") orelse return null;
+    if (!claimModelCallSlot()) {
+        _ = throw(env, "LIBFX_MODEL_CALL_LIMIT", "too many model calls are in flight");
+        return null;
+    }
+    const work = ModelWork.create(handle, call, streaming) catch {
+        releaseModelCallSlot();
+        _ = throw(env, "LIBFX_NATIVE_OOM", "could not allocate model call");
+        return null;
+    };
+    parseModelRequest(env, request_value, &work.request) catch |err| {
+        work.destroy();
+        releaseModelCallSlot();
+        _ = throwModelArgument(env, err, "invalid model request");
+        return null;
+    };
+    return work;
+}
+
+/// Hands the work to its delivery finalizer and starts the provider thread.
+/// On failure the work is released and a JavaScript exception is pending.
+fn startModelWork(env: c.napi_env, work: *ModelWork, callback: c.napi_value) bool {
+    var name: c.napi_value = undefined;
+    if (c.napi_create_string_utf8(env, "libfx.model", c.NAPI_AUTO_LENGTH, &name) != c.napi_ok or
+        c.napi_create_threadsafe_function(env, callback, null, name, model_delivery_queue_size, 1, work, finalizeModelWork, work, deliverModelEvent, &work.delivery) != c.napi_ok)
+    {
+        work.destroy();
+        releaseModelCallSlot();
+        _ = throw(env, "LIBFX_NAPI", "could not create model call");
+        return false;
+    }
+    work.thread = std.Thread.spawn(.{}, runModelWork, .{work}) catch {
+        _ = c.napi_release_threadsafe_function(work.delivery, c.napi_tsfn_release);
+        _ = throw(env, "LIBFX_NATIVE_THREAD", "could not start model call");
+        return false;
+    };
+    return true;
+}
+
+/// modelChat(model, call, request) resolves { completed } or { failed } and
+/// rejects with a coded Error for cancellation and transport failures.
+fn modelChat(env: c.napi_env, info: c.napi_callback_info) callconv(.c) c.napi_value {
+    var argv: [3]c.napi_value = undefined;
+    if (!callbackArgs(env, info, &argv)) return null;
+    const work = prepareModelWork(env, argv[0], argv[1], argv[2], false) orelse return null;
+    if (!startModelWork(env, work, null)) return null;
+    // The result is delivered on this thread, so the deferred is always set first.
     var promise: c.napi_value = undefined;
-    if (c.napi_create_promise(env, &deferred, &promise) != c.napi_ok) {
-        std.heap.c_allocator.free(fx_request.messages);
-        std.heap.c_allocator.free(fx_request.tools);
-        return throw(env, "LIBFX_ASYNC_FAILED", "could not create promise");
+    if (!statusOk(env, c.napi_create_promise(env, &work.deferred, &promise), "could not create model promise")) {
+        work.call.cancel();
+        return null;
     }
-
-    // Create async work
-    const work = std.heap.c_allocator.create(ModelChatWork) catch {
-        std.heap.c_allocator.free(fx_request.messages);
-        std.heap.c_allocator.free(fx_request.tools);
-        return throw(env, "LIBFX_OOM", "could not allocate work");
-    };
-
-    work.* = .{
-        .handle = handle,
-        .fx_request = fx_request,
-        .deferred = deferred,
-        .env = env,
-    };
-
-    var async_work: c.napi_async_work = undefined;
-    if (c.napi_create_async_work(env, null, null, ModelChatWork.execute, ModelChatWork.complete, work, &async_work) != c.napi_ok) {
-        std.heap.c_allocator.free(fx_request.messages);
-        std.heap.c_allocator.free(fx_request.tools);
-        std.heap.c_allocator.destroy(work);
-        return throw(env, "LIBFX_ASYNC_FAILED", "could not create async work");
-    }
-
-    if (c.napi_queue_async_work(env, async_work) != c.napi_ok) {
-        _ = c.napi_delete_async_work(env, async_work);
-        std.heap.c_allocator.free(fx_request.messages);
-        std.heap.c_allocator.free(fx_request.tools);
-        std.heap.c_allocator.destroy(work);
-        return throw(env, "LIBFX_ASYNC_FAILED", "could not queue async work");
-    }
-
     return promise;
 }
 
-fn modelHandleFinalize(env: c.napi_env, data: ?*anyopaque, hint: ?*anyopaque) callconv(.c) void {
-    _ = env;
-    _ = hint;
-    if (data) |ptr| {
-        const handle: *napi_model.NapiModelHandle = @ptrCast(@alignCast(ptr));
-        handle.deinit();
-        std.heap.c_allocator.destroy(handle);
+/// modelStream(model, call, request, onEvent) delivers text_delta and
+/// reasoning_delta events in provider order, then exactly one terminal
+/// completion, failure, or error event.
+fn modelStream(env: c.napi_env, info: c.napi_callback_info) callconv(.c) c.napi_value {
+    var argv: [4]c.napi_value = undefined;
+    if (!callbackArgs(env, info, &argv)) return null;
+    var callback_type: c.napi_valuetype = undefined;
+    if (c.napi_typeof(env, argv[3], &callback_type) != c.napi_ok or callback_type != c.napi_function) {
+        _ = c.napi_throw_type_error(env, "LIBFX_INVALID_ARGUMENT", "model stream requires an event callback");
+        return null;
     }
-}
-
-fn parseModelRequest(env: c.napi_env, request_obj: c.napi_value) !napi_model.FxChatRequest {
-    var messages_arr: c.napi_value = undefined;
-    if (c.napi_get_named_property(env, request_obj, "messages", &messages_arr) != c.napi_ok)
-        return error.InvalidArgument;
-
-    var msg_len: u32 = 0;
-    if (c.napi_get_array_length(env, messages_arr, &msg_len) != c.napi_ok)
-        return error.InvalidArgument;
-
-    const messages = try std.heap.c_allocator.alloc(napi_model.FxChatMessage, msg_len);
-    for (0..msg_len) |i| {
-        var msg_val: c.napi_value = undefined;
-        if (c.napi_get_element(env, messages_arr, @intCast(i), &msg_val) != c.napi_ok)
-            return error.InvalidArgument;
-
-        var role_str: c.napi_value = undefined;
-        if (c.napi_get_named_property(env, msg_val, "role", &role_str) != c.napi_ok)
-            return error.InvalidArgument;
-
-        var role_len: usize = 0;
-        var role_buf: [16]u8 = undefined;
-        if (c.napi_get_value_string_utf8(env, role_str, &role_buf, role_buf.len, &role_len) != c.napi_ok)
-            return error.InvalidArgument;
-
-        const role_str_val = role_buf[0..role_len];
-        messages[i].role = if (std.mem.eql(u8, role_str_val, "system"))
-            .system
-        else if (std.mem.eql(u8, role_str_val, "user"))
-            .user
-        else if (std.mem.eql(u8, role_str_val, "assistant"))
-            .assistant
-        else if (std.mem.eql(u8, role_str_val, "tool"))
-            .tool
-        else
-            return error.InvalidArgument;
-
-        var content: c.napi_value = undefined;
-        if (c.napi_get_named_property(env, msg_val, "content", &content) == c.napi_ok) {
-            var content_len: usize = 0;
-            if (c.napi_get_value_string_utf8(env, content, null, 0, &content_len) == c.napi_ok and content_len > 0) {
-                const buf = try std.heap.c_allocator.alloc(u8, content_len + 1);
-                var written: usize = 0;
-                _ = c.napi_get_value_string_utf8(env, content, buf.ptr, buf.len, &written);
-                messages[i].content = buf[0..written];
-            }
-        }
-        messages[i].tool_calls = &.{};
-    }
-
-    var model_str: c.napi_value = undefined;
-    if (c.napi_get_named_property(env, request_obj, "model", &model_str) != c.napi_ok)
-        return error.InvalidArgument;
-
-    var model_len: usize = 0;
-    var model_buf: [256]u8 = undefined;
-    if (c.napi_get_value_string_utf8(env, model_str, &model_buf, model_buf.len, &model_len) != c.napi_ok)
-        return error.InvalidArgument;
-
-    const model = try std.heap.c_allocator.dupe(u8, model_buf[0..model_len]);
-
-    return .{
-        .messages = messages,
-        .model = model,
-        .tools = &.{},
-        .tool_choice = .auto,
-        .max_output_tokens = null,
-    };
-}
-
-fn resultToJavaScript(env: c.napi_env, result: napi_model.model_provider.ChatStream) !c.napi_value {
-    var result_obj: c.napi_value = undefined;
-    if (c.napi_create_object(env, &result_obj) != c.napi_ok)
-        return error.CreateObjectFailed;
-
-    switch (result) {
-        .completed => |completion| {
-            var completed_obj: c.napi_value = undefined;
-            if (c.napi_create_object(env, &completed_obj) != c.napi_ok)
-                return error.CreateObjectFailed;
-
-            if (completion.content) |content| {
-                var content_val: c.napi_value = undefined;
-                if (c.napi_create_string_utf8(env, content.ptr, content.len, &content_val) == c.napi_ok)
-                    _ = c.napi_set_named_property(env, completed_obj, "content", content_val);
-            }
-
-            if (completion.usage.input_tokens) |tokens| {
-                var tokens_val: c.napi_value = undefined;
-                if (c.napi_create_uint64(env, tokens, &tokens_val) == c.napi_ok) {
-                    var usage_obj: c.napi_value = undefined;
-                    if (c.napi_create_object(env, &usage_obj) != c.napi_ok)
-                        return error.CreateObjectFailed;
-                    _ = c.napi_set_named_property(env, usage_obj, "input_tokens", tokens_val);
-
-                    if (completion.usage.output_tokens) |out_tokens| {
-                        var out_val: c.napi_value = undefined;
-                        if (c.napi_create_uint64(env, out_tokens, &out_val) == c.napi_ok)
-                            _ = c.napi_set_named_property(env, usage_obj, "output_tokens", out_val);
-                    }
-                    _ = c.napi_set_named_property(env, completed_obj, "usage", usage_obj);
-                }
-            }
-
-            _ = c.napi_set_named_property(env, result_obj, "completed", completed_obj);
-        },
-        .failed => |failure| {
-            var failed_obj: c.napi_value = undefined;
-            if (c.napi_create_object(env, &failed_obj) != c.napi_ok)
-                return error.CreateObjectFailed;
-
-            const kind_str = @tagName(failure.kind);
-            var kind_val: c.napi_value = undefined;
-            if (c.napi_create_string_utf8(env, kind_str.ptr, kind_str.len, &kind_val) == c.napi_ok)
-                _ = c.napi_set_named_property(env, failed_obj, "kind", kind_val);
-
-            if (failure.detail) |detail| {
-                var detail_val: c.napi_value = undefined;
-                if (c.napi_create_string_utf8(env, detail.ptr, detail.len, &detail_val) == c.napi_ok)
-                    _ = c.napi_set_named_property(env, failed_obj, "detail", detail_val);
-            }
-
-            _ = c.napi_set_named_property(env, result_obj, "failed", failed_obj);
-        },
-    }
-
-    return result_obj;
+    const work = prepareModelWork(env, argv[0], argv[1], argv[2], true) orelse return null;
+    if (!startModelWork(env, work, argv[3])) return null;
+    return undefinedValue(env);
 }
 
 export fn napi_register_module_v1(env: c.napi_env, exports: c.napi_value) callconv(.c) c.napi_value {
@@ -1664,8 +1975,10 @@ export fn napi_register_module_v1(env: c.napi_env, exports: c.napi_value) callco
     if (!exportFunction(env, exports, "coreExited", coreExited)) return null;
     if (!exportFunction(env, exports, "coreExitCode", coreExitCode)) return null;
     if (!exportFunction(env, exports, "destroyCore", destroyCore)) return null;
-    // Model API exports
     if (!exportFunction(env, exports, "createModel", createModel)) return null;
+    if (!exportFunction(env, exports, "createModelCall", createModelCall)) return null;
+    if (!exportFunction(env, exports, "cancelModelCall", cancelModelCall)) return null;
     if (!exportFunction(env, exports, "modelChat", modelChat)) return null;
+    if (!exportFunction(env, exports, "modelStream", modelStream)) return null;
     return exports;
 }

@@ -325,6 +325,122 @@ const models = await listModels({
 language-model IDs. It accepts the same optional `fetch` override as the Agent
 API.
 
+## Direct model calls
+
+`createFxModel()` sends chat requests to an OpenAI-compatible endpoint through
+the native fx provider without creating an Agent. It runs no agent loop, tool
+execution, or permission review. When the model asks for a tool, the result
+contains the tool call and your code decides what to run. The model API requires
+the native Node addon; it has no Wasm or browser implementation.
+
+```js
+import { createFxModel } from "libfx";
+
+const model = await createFxModel({
+  baseUrl: "http://localhost:11434/v1",
+  model: "qwen3-coder",
+});
+
+const result = await model.chat({
+  messages: [
+    { role: "system", content: "Answer briefly." },
+    { role: "user", content: "What is 2 + 2?" },
+  ],
+});
+
+if (result.completed) console.log(result.completed.content);
+else console.error(result.failed.kind, result.failed.detail);
+```
+
+| Option | Description |
+| --- | --- |
+| `baseUrl` | Endpoint prefix. fx posts to `<baseUrl>/chat/completions`. Plain `http` is accepted only for `localhost`, `127.0.0.1`, and `[::1]`. |
+| `model` | Model ID sent with every request. |
+| `apiKeyEnv` | Optional environment variable name. fx reads the variable on each call and sends its value as a bearer token; the key never passes through JavaScript. Without it, requests carry no `Authorization` header. |
+| `toolChoiceMode` | `"omit"` (default) or `"send"`. With `"omit"`, `tool_choice` is enforced on the response but not sent, because many local servers reject the field. |
+| `id` | Provider identifier. Defaults to `"openai-compatible"`. |
+| `nativeAddon` | Optional explicit addon, with the same meaning as for `createFxAgent()`. |
+
+A request contains `messages` and, optionally, `tools`, `tool_choice`
+(`"auto"`, `"none"`, or `"required"`), and `max_output_tokens`. Each message has
+a `role` of `system`, `user`, `assistant`, or `tool` and string `content`. An
+assistant message that requested tools carries `tool_calls`, and a tool result
+carries the matching `tool_call_id`:
+
+```js
+const result = await model.chat({
+  messages: [
+    { role: "user", content: "Weather in Oslo?" },
+    {
+      role: "assistant",
+      content: null,
+      tool_calls: [{ id: "call_1", name: "weather", arguments_json: '{"city":"Oslo"}' }],
+    },
+    { role: "tool", tool_call_id: "call_1", content: '{"celsius":3}' },
+  ],
+  tools: [{
+    name: "weather",
+    description: "Current weather for a city",
+    input_schema: { type: "object", properties: { city: { type: "string" } }, required: ["city"] },
+  }],
+});
+```
+
+`chat()` resolves to one of two shapes:
+
+- `{ completed }` contains `content`, `tool_calls` (each with `id`, `name`, and
+  `arguments_json`), `finish_reason` (`stop`, `tool_calls`, `length`,
+  `content_filter`, or `null`), `response_id`, and `usage` with
+  `input_tokens`, `output_tokens`, `cache_read_tokens`, `cache_write_tokens`,
+  and `reasoning_tokens`. A field the provider did not report is `null`.
+- `{ failed }` reports an HTTP error from the provider. It contains `kind`
+  (such as `rate_limited` or `server_error`), the response body as `detail`
+  with any credential redacted, and `retry_after_seconds` from a `Retry-After`
+  header or `null`.
+
+`chat()` rejects with an Error whose `code` identifies failures that produced no
+provider response: `LIBFX_MODEL_CANCELLED` (also named `AbortError`),
+`LIBFX_MODEL_TIMEOUT`, `LIBFX_MODEL_CREDENTIAL_MISSING`,
+`LIBFX_MODEL_CREDENTIAL_INVALID`, or `LIBFX_MODEL_REQUEST_FAILED`. The message
+of a `LIBFX_MODEL_REQUEST_FAILED` error names the native cause, such as
+`ConnectionRefused`, or `RequiredToolMissing` when `tool_choice: "required"`
+produced no tool call. `createFxModel()` rejects an unusable `baseUrl` with
+`LIBFX_INVALID_MODEL_CONFIG`.
+
+### Streaming
+
+`stream()` returns an async iterator of events as the provider produces them:
+
+```js
+for await (const event of model.stream(request)) {
+  if (event.type === "text_delta") process.stdout.write(event.text);
+  if (event.type === "completion") console.log(event.completion.finish_reason);
+  if (event.type === "failure") console.error(event.failure.kind);
+}
+```
+
+`text_delta` and `reasoning_delta` events carry `text` in provider order. The
+stream then ends with exactly one `completion` event, whose `completion` has the
+same shape as `chat()`'s `completed`, or one `failure` event. Tool calls arrive
+complete in `completion.tool_calls`, because the OpenAI-compatible stream
+reducer does not emit partial tool-call events. Cancellation and request errors
+are thrown from the iterator with the same codes as `chat()`. Leaving the loop
+early cancels the request.
+
+### Cancellation and concurrency
+
+Both methods accept `{ signal }`. Aborting the signal cancels the active HTTP
+request and closes its connection. `chat()` then rejects, or the stream throws,
+with `LIBFX_MODEL_CANCELLED`. An already-aborted signal fails the call before
+any request is sent.
+
+Each call runs on its own native thread, so the event loop stays responsive and
+calls on one or several models run concurrently without occupying the libuv
+thread pool that Node's file system, DNS, and crypto work share. A process can
+have up to 256 calls in flight; beyond that, a new call fails with
+`LIBFX_MODEL_CALL_LIMIT` until another finishes. Terminating a worker thread
+cancels the calls it started.
+
 ## JavaScript tools and instructions
 
 ```js

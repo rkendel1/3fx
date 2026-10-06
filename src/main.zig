@@ -4724,6 +4724,7 @@ test "semantic code block preserves indentation on wrapped continuation rows" {
 
 test {
     _ = @import("napi_fetch_state.zig");
+    _ = @import("napi_model_provider.zig");
     _ = @import("core/config/model_provider.zig");
     _ = @import("core/config/configured_provider.zig");
     _ = @import("gateway/chat_completions_protocol.zig");

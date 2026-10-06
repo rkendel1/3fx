@@ -94,8 +94,13 @@ The native kernel installs host-stream and host model-catalog providers. It does
 | `coreExited(handle)` | Reports whether the ACP thread has exited. |
 | `coreExitCode(handle)` | Returns the ACP thread's numeric exit status. |
 | `destroyCore(handle)` | Closes input, joins the thread, and releases native memory. |
+| `createModel(config)` | Copies `id`, `baseUrl`, `model`, optional `apiKeyEnv`, and optional `toolChoiceMode` into a reference-counted model handle backed by `OpenAICompatibleModelProvider`. |
+| `createModelCall()` | Allocates the cancellation state for one model call. |
+| `cancelModelCall(call)` | Sets that call's `cancel_flag`. |
+| `modelChat(model, call, request)` | Starts one provider call and returns a promise for `{ completed }` or `{ failed }`. |
+| `modelStream(model, call, request, onEvent)` | Starts one provider call and posts ordered stream events to `onEvent`. |
 
-This ABI is internal. Consumers should use `createFxAgent()` from `sdk/node.js`; exposing the primitive functions keeps the native boundary small and testable.
+This ABI is internal. Consumers should use `createFxAgent()` and `createFxModel()` from `sdk/node.js`; exposing the primitive functions keeps the native boundary small and testable.
 
 The addon ABI version is independent of the public JavaScript API version, which remains `2`. Only low-level core addons must declare version `4`.
 
@@ -134,6 +139,8 @@ The implementation supports:
 - worker termination while a runtime has an active request.
 
 These cases have dedicated tests. Any lifecycle change must preserve all four.
+
+Model calls follow the same thread-per-unit pattern instead of using the libuv pool. A pool-backed call would hold a pool thread for the life of a stream, starving Node's file system, DNS, and crypto work, and Node waits for running pool work before it tears down a worker environment. `modelChat()` and `modelStream()` copy the request into an arena owned by the call, retain the model handle and call state, claim one of 256 process-wide call slots, and spawn one native thread. That thread runs `ModelProvider.chat()` and posts each copied event, then the terminal result, through a thread-safe function in provider order. The function's finalizer runs on the JavaScript thread after the queue drains, or during environment teardown; it sets the call's `cancel_flag`, joins the thread, and frees the work. The provider observes that flag while connecting and while reading the response, so teardown and `AbortSignal` cancellation both close the provider connection.
 
 ## Capability profile
 
@@ -342,7 +349,8 @@ The lane covers:
 - same-environment concurrency and Node worker isolation;
 - finalization of abandoned handles and active worker termination;
 - ACP initialization, sessions, streaming, cancellation, and graceful shutdown;
-- loader selection, API version checks, endpoint validation, and fallback diagnostics.
+- loader selection, API version checks, endpoint validation, and fallback diagnostics;
+- direct model calls: request and tool mapping, incremental streaming, provider failures, cancellation, concurrency, worker termination, and handle collection.
 
 When changing the transport or lifecycle, run the individual failing test directly while iterating, then run the complete N-API lane. Changes to shared JavaScript loading also require the Node plus WebAssembly lane because `sdk/node.js` owns both paths.
 

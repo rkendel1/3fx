@@ -22,6 +22,7 @@ const scripts = [
   "test-native-host-tool-frame-limit.mjs",
   "test-native-core-cancel-before-fetch.mjs",
   "test-native-core-cancel.mjs",
+  "test-native-model.mjs",
   "test-native-host-tool-late-settle.mjs",
   "test-default-import.mjs",
   "test-list-models.mjs",
@@ -39,7 +40,7 @@ const scripts = [
 ];
 for (const script of scripts) {
   const args = [fileURLToPath(new URL(script, import.meta.url))];
-  if (script === "test-native-core-workers.mjs") args.unshift("--expose-gc");
+  if (script === "test-native-core-workers.mjs" || script === "test-native-model.mjs") args.unshift("--expose-gc");
   const result = spawnSync(process.execPath, args, {
     cwd: repoRoot,
     stdio: "inherit",

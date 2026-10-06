@@ -578,30 +578,191 @@ export function createFxTerminal(options = {}) {
   return createWithFallback("terminal", "createFxTerminal", createWasmTerminal, defaultTermWasm, options);
 }
 
-// Public model/provider API: reusable FX model calls without agent loop
-export async function createFxModel(config) {
-  if (!config?.baseUrl || !config?.model) {
-    throw new TypeError("createFxModel requires {baseUrl, model, apiKeyEnv?}");
-  }
-  const nativeBackend = await getNativeBackend();
-  if (!nativeBackend || !nativeBackend.createModel) {
-    throw new Error("FX model API requires native backend (Node.js with native addon)");
-  }
-  const modelHandle = nativeBackend.createModel({
-    id: config.id ?? "openai-compatible",
-    baseUrl: config.baseUrl,
-    model: config.model,
-    apiKeyEnv: config.apiKeyEnv ?? "OPENAI_API_KEY",
+const modelRoles = new Set(["system", "user", "assistant", "tool"]);
+const modelToolChoices = new Set(["auto", "none", "required"]);
+const modelTerminalEvents = new Set(["completion", "failure", "error"]);
+
+function requiredModelString(value, name) {
+  if (typeof value !== "string" || value.length === 0) throw new TypeError(`${name} must be a non-empty string`);
+  return value;
+}
+
+function optionalModelString(value, name) {
+  if (value === undefined || value === null) return undefined;
+  if (typeof value !== "string") throw new TypeError(`${name} must be a string`);
+  return value;
+}
+
+function modelToolCalls(calls, name) {
+  if (calls === undefined || calls === null) return [];
+  if (!Array.isArray(calls)) throw new TypeError(`${name} must be an array`);
+  return calls.map((call, index) => {
+    const prefix = `${name}[${index}]`;
+    if (typeof call?.arguments_json !== "string") throw new TypeError(`${prefix}.arguments_json must be a JSON string`);
+    return {
+      id: requiredModelString(call.id, `${prefix}.id`),
+      name: requiredModelString(call.name, `${prefix}.name`),
+      arguments_json: call.arguments_json,
+    };
   });
-  if (!modelHandle) {
-    throw new Error("Failed to create model provider");
+}
+
+function normalizeModelRequest(request) {
+  if (request === null || typeof request !== "object") throw new TypeError("model request must be an object");
+  if (!Array.isArray(request.messages) || request.messages.length === 0) {
+    throw new TypeError("model request messages must be a non-empty array");
+  }
+  const messages = request.messages.map((message, index) => {
+    const name = `messages[${index}]`;
+    if (!modelRoles.has(message?.role)) throw new TypeError(`${name}.role must be system, user, assistant, or tool`);
+    return {
+      role: message.role,
+      content: optionalModelString(message.content, `${name}.content`),
+      tool_call_id: optionalModelString(message.tool_call_id, `${name}.tool_call_id`),
+      tool_calls: modelToolCalls(message.tool_calls, `${name}.tool_calls`),
+    };
+  });
+  const tools = request.tools ?? [];
+  if (!Array.isArray(tools)) throw new TypeError("model request tools must be an array");
+  const toolChoice = request.tool_choice ?? "auto";
+  if (!modelToolChoices.has(toolChoice)) throw new TypeError("tool_choice must be auto, none, or required");
+  const maxOutputTokens = request.max_output_tokens ?? undefined;
+  if (maxOutputTokens !== undefined && (!Number.isSafeInteger(maxOutputTokens) || maxOutputTokens < 1 || maxOutputTokens > 0xffffffff)) {
+    throw new TypeError("max_output_tokens must be a positive integer");
   }
   return {
-    async chat(request) {
-      if (!modelHandle) throw new Error("Model handle destroyed");
-      // NAPI modelChat returns a Promise now for non-blocking execution
-      const result = await nativeBackend.modelChat(modelHandle, request);
-      return result;
+    messages,
+    tools: tools.map((tool, index) => {
+      const schema = tool?.input_schema ?? { type: "object", properties: {} };
+      if (schema === null || typeof schema !== "object" || Array.isArray(schema)) {
+        throw new TypeError(`tools[${index}].input_schema must be a JSON Schema object`);
+      }
+      return {
+        name: requiredModelString(tool.name, `tools[${index}].name`),
+        description: optionalModelString(tool.description, `tools[${index}].description`) ?? "",
+        input_schema_json: JSON.stringify(schema),
+      };
+    }),
+    tool_choice: toolChoice,
+    max_output_tokens: maxOutputTokens,
+  };
+}
+
+function modelSignal(options) {
+  const signal = options?.signal;
+  if (signal !== undefined && !(signal instanceof AbortSignal)) throw new TypeError("signal must be an AbortSignal");
+  if (signal?.aborted) {
+    const error = new Error("model call was cancelled", { cause: signal.reason });
+    error.name = "AbortError";
+    error.code = "LIBFX_MODEL_CANCELLED";
+    throw error;
+  }
+  return signal;
+}
+
+function nativeModelError(error) {
+  if (error?.code === "LIBFX_MODEL_CANCELLED") error.name = "AbortError";
+  return error;
+}
+
+function createModelStream(addon, handle, request, signal) {
+  const buffered = [];
+  const waiters = [];
+  let ended = false;
+  let closed = false;
+  const call = addon.createModelCall();
+  const cancel = () => addon.cancelModelCall(call);
+  const release = () => {
+    signal?.removeEventListener("abort", cancel);
+    for (const waiter of waiters.splice(0)) waiter(null);
+  };
+  const deliver = (event) => {
+    if (event === null) return { done: true, value: undefined };
+    if (event.type === "error") throw nativeModelError(event.error);
+    return { done: false, value: event };
+  };
+  signal?.addEventListener("abort", cancel, { once: true });
+  try {
+    addon.modelStream(handle, call, request, (event) => {
+      if (closed) return;
+      const waiter = waiters.shift();
+      if (waiter) waiter(event);
+      else buffered.push(event);
+      if (modelTerminalEvents.has(event.type)) {
+        ended = true;
+        release();
+      }
+    });
+  } catch (error) {
+    release();
+    throw error;
+  }
+  return {
+    [Symbol.asyncIterator]() {
+      return this;
+    },
+    async next() {
+      if (buffered.length > 0) return deliver(buffered.shift());
+      if (ended || closed) return { done: true, value: undefined };
+      return deliver(await new Promise((resolve) => waiters.push(resolve)));
+    },
+    async return() {
+      // Leaving the loop early cancels the provider call instead of letting it run on.
+      if (!ended && !closed) cancel();
+      closed = true;
+      buffered.length = 0;
+      release();
+      return { done: true, value: undefined };
     },
   };
+}
+
+/**
+ * Creates a provider-neutral model backed by the native OpenAI-compatible
+ * provider. `chat()` resolves `{ completed }` or `{ failed }`; `stream()`
+ * yields `text_delta` and `reasoning_delta` events followed by exactly one
+ * `completion` or `failure` event. Cancellation and transport errors reject.
+ */
+export async function createFxModel(config) {
+  if (config === null || typeof config !== "object") throw new TypeError("createFxModel requires a configuration object");
+  const settings = {
+    id: requiredModelString(config.id ?? "openai-compatible", "id"),
+    baseUrl: requiredModelString(config.baseUrl, "baseUrl"),
+    model: requiredModelString(config.model, "model"),
+    apiKeyEnv: optionalModelString(config.apiKeyEnv, "apiKeyEnv"),
+    toolChoiceMode: config.toolChoiceMode ?? "omit",
+  };
+  if (settings.toolChoiceMode !== "omit" && settings.toolChoiceMode !== "send") {
+    throw new TypeError('toolChoiceMode must be "omit" or "send"');
+  }
+  const native = await resolveNativeBackend(config.nativeAddon);
+  const addon = native.backend;
+  if (typeof addon?.createModel !== "function") {
+    const error = native.error ?? new Error(`the libfx native addon is unavailable (${native.failure ?? "no model API"})`);
+    error.code ??= "LIBFX_NATIVE_UNAVAILABLE";
+    throw error;
+  }
+  const handle = addon.createModel(settings);
+  return Object.freeze({
+    id: settings.id,
+    model: settings.model,
+    async chat(request, options) {
+      const signal = modelSignal(options);
+      const normalized = normalizeModelRequest(request);
+      const call = addon.createModelCall();
+      const cancel = () => addon.cancelModelCall(call);
+      signal?.addEventListener("abort", cancel, { once: true });
+      try {
+        return await addon.modelChat(handle, call, normalized);
+      } catch (error) {
+        throw nativeModelError(error);
+      } finally {
+        signal?.removeEventListener("abort", cancel);
+      }
+    },
+    stream(request, options) {
+      const signal = modelSignal(options);
+      return createModelStream(addon, handle, normalizeModelRequest(request), signal);
+    },
+  });
 }
