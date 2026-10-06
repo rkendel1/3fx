@@ -5,7 +5,7 @@ in-memory conversation with `prompt`, `checkpoint`, and `close` operations,
 plus mid-turn steering on each running turn.
 
 ```sh
-npm install libfx
+npm install @appport/fx
 ```
 
 Node.js uses the native addon when available and falls back to WebAssembly.
@@ -16,7 +16,7 @@ filesystem read when imported.
 ## Agent
 
 ```js
-import { createFxAgent } from "libfx";
+import { createFxAgent } from "@appport/fx";
 
 const agent = await createFxAgent({
   apiKey: process.env.AI_GATEWAY_API_KEY,
@@ -314,7 +314,7 @@ Model discovery is explicit and does not create an Agent or load native or Wasm
 artifacts:
 
 ```js
-import { listModels } from "libfx";
+import { listModels } from "@appport/fx";
 
 const models = await listModels({
   apiKey: process.env.AI_GATEWAY_API_KEY,
@@ -334,7 +334,7 @@ contains the tool call and your code decides what to run. The model API requires
 the native Node addon; it has no Wasm or browser implementation.
 
 ```js
-import { createFxModel } from "libfx";
+import { createFxModel } from "@appport/fx";
 
 const model = await createFxModel({
   baseUrl: "http://localhost:11434/v1",
@@ -538,7 +538,7 @@ for calls to the MCP client. Each tool description and JSON schema may contain u
 to 64 KiB, within the control message's 8 MiB limit.
 
 ```js
-import { createMcpAdapter } from "libfx/mcp";
+import { createMcpAdapter } from "@appport/fx/mcp";
 
 const mcp = await createMcpAdapter(client, {
   prefix: "github_",
@@ -564,8 +564,8 @@ Use `libfx/skills` for already-loaded records or `libfx/skills/node` to load a
 `SKILL.md` explicitly in Node or Bun.
 
 ```js
-import { loadSkillFile } from "libfx/skills/node";
-import { createSkillsAdapter } from "libfx/skills";
+import { loadSkillFile } from "@appport/fx/skills/node";
+import { createSkillsAdapter } from "@appport/fx/skills";
 
 const record = await loadSkillFile("./skills/review/SKILL.md");
 const skills = createSkillsAdapter([record]);
@@ -580,7 +580,7 @@ await createFxAgent({ apiKey, backend: "native" }); // require N-API
 await createFxAgent({ apiKey, backend: "wasm" });   // require Wasm + JSPI
 ```
 
-CommonJS applications can load the same Node API with `require("libfx")`. The
+CommonJS applications can load the same Node API with `require("@appport/fx")`. The
 package chooses its generated CommonJS entry automatically and keeps asset
 paths relative to the installed package.
 
@@ -588,7 +588,7 @@ Use `getBackendInfo()` to inspect backend availability without creating an
 Agent or terminal:
 
 ```js
-import { getBackendInfo } from "libfx";
+import { getBackendInfo } from "@appport/fx";
 
 const info = await getBackendInfo({ surface: "agent", backend: "auto" });
 // {
@@ -657,7 +657,7 @@ JSPI and available Wasm assets; Next.js's standalone tracer excludes `.wasm`
 files, so a standalone Wasm host must supply those assets separately.
 
 ```js
-import { createFxAgent } from "libfx";
+import { createFxAgent } from "@appport/fx";
 
 export const runtime = "nodejs";
 
@@ -689,7 +689,7 @@ backend does not enable the CLI's built-in shell or filesystem tools.
 connect it to xterm.js with `xtermAdapter()`:
 
 ```js
-import { createFxTerminal, xtermAdapter } from "libfx/browser";
+import { createFxTerminal, xtermAdapter } from "@appport/fx/browser";
 
 const runtime = await createFxTerminal({
   terminal: xtermAdapter(term),
