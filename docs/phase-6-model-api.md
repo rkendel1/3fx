@@ -115,20 +115,24 @@ Model
 - Returns model object with `chat(request)` method
 - Proper error handling and fallback to WASM
 
-### Phase 6B-4: Tests (next)
+### Phase 6B-3: Verification ✓
 
-- Deterministic OpenAI-compatible mock server
-- Request/response mapping tests
-- End-to-end execution test
-- Provider failure tests
+- Deterministic OpenAI-compatible mock HTTP server
+- Integration test: public API reaches real native provider
+- Request mapping: user/system/assistant messages, model, usage
+- Response mapping: completed content, usage tokens, error handling
+- Provider failure test: failed results propagate correctly
+- Memory/lifetime review: ownership verified, no leaks detected
+- Boundary checker: model-provider passes, whole-agent passes
+- Package export: createFxModel exported from sdk/node.js
+- Documentation: implementation vs. deferred capabilities clarified
 
-### Phase 6B-5: Verification (next)
+### Phase 6B-4: Deferred
 
-- No Vercel/Chip/Compute dependency
-- No agent loop invoked
-- Streaming behavior documented (not yet implemented)
-- Cancellation documented (not yet implemented)
-- Package exports verified
+- Public streaming API (currently synchronous)
+- Browser/WASM model API support
+- Chip integration (next phase)
+- Additional error types/diagnostics
 
 ## Key Invariants
 
@@ -140,3 +144,7 @@ Model
 ✓ No Chip/Compute/Attn references
 ✓ No CLI invocation
 ✓ FFI-safe types only
+✓ Boundary checker passes (model-provider and whole-agent)
+✓ Public API exported from sdk/node.js
+✓ Real provider execution through OpenAICompatibleModelProvider
+✓ Deterministic test coverage with localhost mock
