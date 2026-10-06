@@ -577,3 +577,31 @@ export async function createFxAgent(options = {}) {
 export function createFxTerminal(options = {}) {
   return createWithFallback("terminal", "createFxTerminal", createWasmTerminal, defaultTermWasm, options);
 }
+
+// Public model/provider API: reusable FX model calls without agent loop
+export async function createFxModel(config) {
+  if (!config?.baseUrl || !config?.model) {
+    throw new TypeError("createFxModel requires {baseUrl, model, apiKeyEnv?}");
+  }
+  const nativeBackend = await getNativeBackend();
+  if (!nativeBackend || !nativeBackend.createModel) {
+    throw new Error("FX model API requires native backend (Node.js with native addon)");
+  }
+  const modelHandle = nativeBackend.createModel(
+    config.id ?? "openai-compatible",
+    config.baseUrl,
+    config.model,
+    config.apiKeyEnv ?? "OPENAI_API_KEY",
+  );
+  return {
+    async chat(request, options = {}) {
+      if (!modelHandle) throw new Error("Model handle destroyed");
+      const result = nativeBackend.modelChat(modelHandle, request);
+      if (options.onChunk) {
+        // Streaming support: invoke callback for each chunk if implemented
+        // For now, single response pattern
+      }
+      return result;
+    },
+  };
+}

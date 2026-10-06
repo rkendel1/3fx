@@ -21,6 +21,8 @@ const c = @cImport({
     @cInclude("node_api.h");
 });
 
+const napi_model = @import("napi_model_provider.zig");
+
 const Allocator = std.mem.Allocator;
 const max_drain_bytes = 1024 * 1024;
 const max_input_bytes = 8 * 1024 * 1024;
@@ -1328,6 +1330,21 @@ fn exportFunction(env: c.napi_env, exports: c.napi_value, name: [*:0]const u8, c
     return statusOk(env, c.napi_set_named_property(env, exports, name, function), "could not export addon function");
 }
 
+// Model API NAPI functions
+fn createModel(env: c.napi_env, info: c.napi_callback_info) callconv(.c) c.napi_value {
+    _ = env;
+    _ = info;
+    // Stub: real implementation deferred to Phase 6B-2
+    return null;
+}
+
+fn modelChat(env: c.napi_env, info: c.napi_callback_info) callconv(.c) c.napi_value {
+    _ = env;
+    _ = info;
+    // Stub: real implementation deferred to Phase 6B-2
+    return null;
+}
+
 export fn napi_register_module_v1(env: c.napi_env, exports: c.napi_value) callconv(.c) c.napi_value {
     ensureThreadedIo();
     var api_version: c.napi_value = undefined;
@@ -1354,5 +1371,8 @@ export fn napi_register_module_v1(env: c.napi_env, exports: c.napi_value) callco
     if (!exportFunction(env, exports, "coreExited", coreExited)) return null;
     if (!exportFunction(env, exports, "coreExitCode", coreExitCode)) return null;
     if (!exportFunction(env, exports, "destroyCore", destroyCore)) return null;
+    // Model API exports
+    if (!exportFunction(env, exports, "createModel", createModel)) return null;
+    if (!exportFunction(env, exports, "modelChat", modelChat)) return null;
     return exports;
 }
