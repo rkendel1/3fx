@@ -622,6 +622,9 @@ pub const Limits = struct {
     arguments_bytes: usize = 1024 * 1024,
     content_bytes: usize = 8 * 1024 * 1024,
     reasoning_bytes: usize = types.ProviderReplay.max_bytes,
+    /// Opt-in for servers that report `stop` on a tool-call turn. Tool calls are
+    /// still fully validated and the completion reports `tool_calls`.
+    accept_stop_with_tool_calls: bool = false,
 };
 
 const ReasoningPart = struct {
@@ -951,7 +954,8 @@ pub const Reducer = struct {
         if (cancelled) return error.Cancelled;
         if (self.phase == .closed) return error.StreamClosed;
         if (self.phase != .done) return error.IncompleteStream;
-        const reason = self.finish_reason.?;
+        var reason = self.finish_reason.?;
+        if (reason == .stop and self.limits.accept_stop_with_tool_calls and self.tools.items.len != 0) reason = .tool_calls;
         switch (reason) {
             .length => return error.OutputTruncated,
             .content_filter => return error.ContentFiltered,
@@ -2304,6 +2308,32 @@ test "chat completions terminal evidence and finish reasons are strict" {
     }
     {
         var reducer = try Reducer.init(alloc, test_tool_request(), .{});
+        defer reducer.deinit();
+        try std.testing.expectError(error.InconsistentFinishReason, test_finish(&reducer, test_tools_finish));
+    }
+}
+
+test "stop finish reason on a tool-call turn is accepted only when opted in and still validates calls" {
+    const alloc = std.testing.allocator;
+    const stop_terminal = "{\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}";
+    {
+        var reducer = try Reducer.init(alloc, test_tool_request(), .{ .accept_stop_with_tool_calls = true });
+        defer reducer.deinit();
+        try test_accept(&reducer, test_call);
+        var result = try test_finish(&reducer, stop_terminal);
+        defer result.deinit(alloc);
+        try std.testing.expectEqual(@as(usize, 1), result.completed.completion.tool_calls.len);
+        try std.testing.expectEqual(types.ProviderFinishReason.tool_calls, result.completed.completion.finish_reason);
+    }
+    {
+        var reducer = try Reducer.init(alloc, test_tool_request(), .{});
+        defer reducer.deinit();
+        try test_accept(&reducer, test_call);
+        try std.testing.expectError(error.InconsistentFinishReason, test_finish(&reducer, stop_terminal));
+    }
+    {
+        // The opt-in never loosens the reverse mismatch or call validation.
+        var reducer = try Reducer.init(alloc, test_tool_request(), .{ .accept_stop_with_tool_calls = true });
         defer reducer.deinit();
         try std.testing.expectError(error.InconsistentFinishReason, test_finish(&reducer, test_tools_finish));
     }

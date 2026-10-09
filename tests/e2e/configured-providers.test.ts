@@ -773,6 +773,106 @@ describe("standalone agent", () => {
 });
 
 
+function toolMessages(body: any) {
+  return body.messages.filter((message: any) => message.role === "tool").map((message: any) => String(message.content));
+}
+
+function countLines(path: string) {
+  return existsSync(path) ? readFileSync(path, "utf8").split("\n").filter(Boolean).length : 0;
+}
+
+describe("local shell tool calling", () => {
+  const stopCompletion = (model: string, args: unknown, finish: string) => {
+    const chunks = [
+      { id: "chat-tool", model, choices: [{ index: 0, delta: { tool_calls: [{ index: 0, id: "call-local", type: "function", function: { name: "shell", arguments: JSON.stringify(args) } }] }, finish_reason: null }] },
+      { id: "chat-tool", model, choices: [{ index: 0, delta: {}, finish_reason: finish }] },
+    ];
+    return new Response(chunks.map(value => `data: ${JSON.stringify(value)}\n\n`).join("") + "data: [DONE]\n\n", { headers: { "content-type": "text/event-stream" } });
+  };
+
+  test("flatten_unions reaches the wire while canonical mode keeps oneOf", async () => {
+    for (const mode of ["flatten_unions", "canonical"]) {
+      const f = fixture(body => completion(body.model, "done"));
+      try {
+        f.settings.providers.local.tool_schema_mode = mode;
+        f.save();
+        const result = await runFx(["ask", "--json", "--no-save", "hello"], { cwd: f.workspace, env: f.env, timeoutMs: 20000 });
+        if (result.code !== 0) throw new Error(result.stdout + result.stderr);
+        const shell = f.requests[0].body.tools.find((tool: any) => tool.function.name === "shell").function.parameters;
+        const request = shell.properties.request;
+        expect(shell.required).toEqual(["request"]);
+        if (mode === "flatten_unions") {
+          expect(JSON.stringify(shell)).not.toContain("oneOf");
+          expect(request.properties.action.enum).toEqual(["run", "interact", "stop"]);
+          expect(request.required).toEqual(["action"]);
+        } else {
+          expect(request.oneOf.length).toBeGreaterThan(1);
+        }
+      } finally { f.close(); }
+    }
+  }, 45000);
+
+  test("flat, nested, and stop-finish tool calls execute exactly once and return real output", async () => {
+    const cases: Array<{ name: string; args: (marker: string) => unknown; finish: string; extra?: Record<string, unknown> }> = [
+      { name: "flat", args: marker => ({ command: `echo run >> ${marker}; echo FXMARK_$((6*7))` }), finish: "tool_calls" },
+      { name: "nested", args: marker => ({ request: { action: "run", command: `echo run >> ${marker}; echo FXMARK_$((6*7))` } }), finish: "tool_calls" },
+      { name: "stop-finish", args: marker => ({ request: { action: "run", command: `echo run >> ${marker}; echo FXMARK_$((6*7))` } }), finish: "stop", extra: { finish_reason_mode: "accept_stop_with_tool_calls" } },
+    ];
+    for (const testCase of cases) {
+      let calls = 0;
+      const f = fixture(body => {
+        calls++;
+        const marker = join(f.workspace, "marker.txt");
+        return calls === 1 ? stopCompletion(body.model, testCase.args(marker), testCase.finish) : completion(body.model, "The command printed FXMARK_42");
+      });
+      try {
+        Object.assign(f.settings.providers.local, { tool_schema_mode: "flatten_unions", ...testCase.extra });
+        f.save();
+        const result = await runFx(["ask", "--json", "--no-save", "--full-access", "run the command"], { cwd: f.workspace, env: f.env, timeoutMs: 30000 });
+        if (result.code !== 0) throw new Error(testCase.name + ": " + result.stdout + result.stderr);
+        expect(JSON.parse(result.stdout).output).toContain("FXMARK_42");
+        expect(f.requests).toHaveLength(2);
+        expect(countLines(join(f.workspace, "marker.txt"))).toBe(1);
+        const results = toolMessages(f.requests[1].body);
+        expect(results).toHaveLength(1);
+        expect(results[0]).toContain("FXMARK_42");
+      } finally { f.close(); }
+    }
+  }, 120000);
+
+  test("stop finish reason with tool calls stays rejected without the opt-in and never executes", async () => {
+    const f = fixture(body => stopCompletion(body.model, { request: { action: "run", command: "echo run >> marker.txt" } }, "stop"));
+    try {
+      const result = await runFx(["ask", "--json", "--no-save", "--full-access", "run the command"], { cwd: f.workspace, env: f.env, timeoutMs: 30000 });
+      expect(result.code).not.toBe(0);
+      expect(existsSync(join(f.workspace, "marker.txt"))).toBe(false);
+    } finally { f.close(); }
+  }, 45000);
+
+  test("malformed and ambiguous shell calls never execute and the retry loop terminates", async () => {
+    const bad: unknown[] = [
+      { command: 42 },
+      { command: "echo run >> marker.txt", unknown_field: true },
+      { command: "echo run >> marker.txt", session_id: "shell-1" },
+      { request: { action: "explode", command: "echo run >> marker.txt" } },
+      { request: { action: "run" } },
+      { action: "run", command: "echo run >> marker.txt", profile: "a", shell: { kind: "bash", path: "/bin/bash" } },
+    ];
+    for (const args of bad) {
+      const f = fixture(body => stopCompletion(body.model, args, "tool_calls"));
+      try {
+        const result = await runFx(["ask", "--json", "--no-save", "--full-access", "run the command"], { cwd: f.workspace, env: f.env, timeoutMs: 60000 });
+        expect(result.timedOut ?? false).toBe(false);
+        expect(existsSync(join(f.workspace, "marker.txt"))).toBe(false);
+        expect(f.requests.length).toBeGreaterThanOrEqual(2);
+        expect(f.requests.length).toBeLessThanOrEqual(40);
+        expect(toolMessages(f.requests[1].body)[0]).toContain("invalid_shell_request");
+        expect(toolMessages(f.requests[1].body)[0]).toContain("\"executed\":false");
+      } finally { f.close(); }
+    }
+  }, 240000);
+});
+
 describe("neutral model contract architecture", () => {
   test("canonical contract and invocation step have a vendor-free dependency closure", () => {
     const output = execFileSync("python3", ["scripts/check-model-provider-boundary.py"], {

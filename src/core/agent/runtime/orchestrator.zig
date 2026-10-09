@@ -1325,15 +1325,56 @@ fn project_read_tool_result_request_messages(
     return projected orelse source;
 }
 
+/// Fields a flat (unwrapped, action-less) shell call may carry. This mirrors
+/// the `run` field contract of the shell tool, minus `action`, which is
+/// supplied here. Anything else leaves the call unchanged for strict decoding.
+const flat_shell_run_fields = [_][]const u8{ "command", "cwd", "profile", "shell", "tty", "yield_time_ms", "timeout_ms", "reload" };
+
+/// Rewrites the unambiguous flat run form `{"command":"..."}` that some local
+/// models emit into the canonical `{"action":"run","command":"..."}`. Returns
+/// null (leave unchanged) for anything else: an `action` key, a `request`
+/// wrapper, unknown fields, a non-string or empty command, or a profile/shell
+/// conflict. The executor still performs full canonical validation.
+fn flat_shell_run_arguments(
+    alloc: Allocator,
+    object: std.json.ObjectMap,
+) Allocator.Error!?[]u8 {
+    const command = object.get("command") orelse return null;
+    if (command != .string or command.string.len == 0) return null;
+    if (object.contains("action") or object.contains("request")) return null;
+    if (object.contains("profile") and object.contains("shell")) return null;
+    var fields = object.iterator();
+    while (fields.next()) |entry| {
+        var allowed = false;
+        for (flat_shell_run_fields) |name| {
+            if (std.mem.eql(u8, entry.key_ptr.*, name)) allowed = true;
+        }
+        if (!allowed) return null;
+    }
+    var canonical: std.json.ObjectMap = .empty;
+    defer canonical.deinit(alloc);
+    try canonical.put(alloc, "action", .{ .string = "run" });
+    fields = object.iterator();
+    while (fields.next()) |entry| try canonical.put(alloc, entry.key_ptr.*, entry.value_ptr.*);
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    defer out.deinit();
+    std.json.Stringify.value(std.json.Value{ .object = canonical }, .{}, &out.writer) catch return error.OutOfMemory;
+    return try out.toOwnedSlice();
+}
+
 fn normalized_terminal_request_arguments(
     alloc: Allocator,
     arguments_json: []const u8,
+    flat_shell_run_allowed: bool,
 ) Allocator.Error!?[]u8 {
     var parsed = std.json.parseFromSlice(std.json.Value, alloc, arguments_json, .{}) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         else => return null,
     };
     defer parsed.deinit();
+    if (flat_shell_run_allowed and parsed.value == .object) {
+        if (try flat_shell_run_arguments(alloc, parsed.value.object)) |flat| return flat;
+    }
     if (parsed.value != .object or parsed.value.object.count() != 1) return null;
     const request = parsed.value.object.getPtr("request") orelse return null;
     if (request.* != .object) return null;
@@ -1478,6 +1519,7 @@ fn normalize_terminal_request_tool_calls(
         const arguments_json = try normalized_terminal_request_arguments(
             alloc,
             call.arguments_json,
+            std.mem.eql(u8, tool.name, "shell"),
         ) orelse continue;
         if (normalized == null) {
             normalized = alloc.dupe(ToolCall, source) catch |err| {
@@ -1664,9 +1706,56 @@ test "terminal inferred model input round trips every atomic write payload" {
         const normalized = (try normalized_terminal_request_arguments(
             alloc,
             projected,
+            false,
         )).?;
         defer alloc.free(normalized);
         try std.testing.expectEqualStrings(case.internal, normalized);
+    }
+}
+
+test "flat shell run arguments normalize to the canonical run request only for the shell tool" {
+    const alloc = std.testing.allocator;
+    const accepted = [_]struct { flat: []const u8, canonical: []const u8 }{
+        .{ .flat = "{\"command\":\"pwd\"}", .canonical = "{\"action\":\"run\",\"command\":\"pwd\"}" },
+        .{ .flat = "{\"command\":\"sleep 1\",\"timeout_ms\":5000,\"tty\":false}", .canonical = "{\"action\":\"run\",\"command\":\"sleep 1\",\"timeout_ms\":5000,\"tty\":false}" },
+    };
+    for (accepted) |case| {
+        const normalized = (try normalized_terminal_request_arguments(alloc, case.flat, true)).?;
+        defer alloc.free(normalized);
+        try std.testing.expectEqualStrings(case.canonical, normalized);
+        // Generic terminal tools never receive the shell-only repair.
+        try std.testing.expect((try normalized_terminal_request_arguments(alloc, case.flat, false)) == null);
+    }
+    // Existing nested requests keep unwrapping for every supported action.
+    const nested = [_]struct { wrapped: []const u8, inner: []const u8 }{
+        .{ .wrapped = "{\"request\":{\"action\":\"run\",\"command\":\"pwd\"}}", .inner = "{\"action\":\"run\",\"command\":\"pwd\"}" },
+        .{ .wrapped = "{\"request\":{\"action\":\"interact\",\"session_id\":\"s1\",\"chars\":\"q\"}}", .inner = "{\"action\":\"interact\",\"session_id\":\"s1\",\"chars\":\"q\"}" },
+        .{ .wrapped = "{\"request\":{\"action\":\"stop\",\"session_id\":\"s1\"}}", .inner = "{\"action\":\"stop\",\"session_id\":\"s1\"}" },
+    };
+    for (nested) |case| {
+        const normalized = (try normalized_terminal_request_arguments(alloc, case.wrapped, true)).?;
+        defer alloc.free(normalized);
+        try std.testing.expectEqualStrings(case.inner, normalized);
+    }
+    // Ambiguous, malformed, or unsupported shapes are left for strict decoding.
+    const rejected = [_][]const u8{
+        "{",
+        "[]",
+        "{}",
+        "{\"command\":\"\"}",
+        "{\"command\":42}",
+        "{\"command\":[\"ls\"]}",
+        "{\"command\":\"pwd\",\"unknown\":1}",
+        "{\"command\":\"pwd\",\"session_id\":\"s1\"}",
+        "{\"command\":\"pwd\",\"chars\":\"x\"}",
+        "{\"command\":\"pwd\",\"force\":true}",
+        "{\"command\":\"pwd\",\"profile\":\"a\",\"shell\":{}}",
+        "{\"action\":\"run\",\"command\":\"pwd\"}",
+        "{\"session_id\":\"s1\"}",
+        "{\"command\":\"pwd\",\"request\":{\"action\":\"run\",\"command\":\"ls\"}}",
+    };
+    for (rejected) |args| {
+        try std.testing.expect((try normalized_terminal_request_arguments(alloc, args, true)) == null);
     }
 }
 
