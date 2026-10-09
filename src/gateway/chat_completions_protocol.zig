@@ -1878,7 +1878,7 @@ test "flattened shell schema is scoped and preserves action fields and union bou
     try std.testing.expectEqualStrings(canonical_read, projected_read);
 }
 
-test "flattened shell projection leaves shell_process_only and nonmatching shell schemas canonical" {
+test "flattened shell projection covers shell_process_only and leaves nonmatching shell schemas canonical" {
     const alloc = std.testing.allocator;
     const process_function = builtin_tools.shellProcessOnlySpec().model_schema;
     var request = test_request();
@@ -1888,7 +1888,11 @@ test "flattened shell projection leaves shell_process_only and nonmatching shell
     };
     const process_body = try build_request(alloc, request, .{ .tool_schema_mode = .flatten_unions });
     defer alloc.free(process_body);
-    try std.testing.expect(std.mem.find(u8, process_body, "\"oneOf\"") != null);
+    try std.testing.expect(std.mem.find(u8, process_body, "\"oneOf\"") == null);
+    try std.testing.expect(std.mem.find(u8, process_body, "\"enum\":[\"run\",\"interact\",\"stop\"]") != null);
+    const process_canonical = try build_request(alloc, request, .{});
+    defer alloc.free(process_canonical);
+    try std.testing.expect(std.mem.find(u8, process_canonical, "\"oneOf\"") != null);
 
     var changed_schema = builtin_tools.shell.model_schema;
     changed_schema.input_schema.required = &.{ "request", "extra" };
