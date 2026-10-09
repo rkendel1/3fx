@@ -1934,6 +1934,25 @@ test "shell timeout minimum is enforced before correction and execution" {
     }
 }
 
+test "shell run rejects fields belonging only to another action" {
+    const alloc = std.testing.allocator;
+    const result = try decode(.{ .allocator = alloc }, "{\"action\":\"run\",\"command\":\"pwd\",\"session_id\":\"shell-1\"}");
+    switch (result) {
+        .input => |input| {
+            input.deinit(alloc);
+            return error.TestUnexpectedResult;
+        },
+        .failure => |failure| {
+            defer alloc.free(failure);
+            var parsed = try std.json.parseFromSlice(std.json.Value, alloc, failure, .{});
+            defer parsed.deinit();
+            const detail = parsed.value.object.get("error").?.object;
+            try std.testing.expectEqualStrings("invalid_shell_request", detail.get("code").?.string);
+            try std.testing.expect(!detail.get("executed").?.bool);
+        },
+    }
+}
+
 test "shell request correction suggests only unambiguous repairs without executing" {
     const alloc = std.testing.allocator;
     const cases = [_]struct { input: []const u8, retry: ?[]const u8 }{

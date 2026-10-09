@@ -18,6 +18,7 @@ pub const OpenAICompatibleModelProvider = struct {
     model: []const u8,
     api_key_env: ?[]const u8 = null,
     tool_choice_mode: definitions.ToolChoiceMode = .omit,
+    tool_schema_mode: definitions.ToolSchemaMode = .canonical,
 
     pub fn init(id: []const u8, base_url: []const u8, model: []const u8, api_key_env: ?[]const u8) !OpenAICompatibleModelProvider {
         // Reuse the protocol configuration validator, without loading profile
@@ -86,7 +87,10 @@ pub const OpenAICompatibleModelProvider = struct {
         data.instructions = messages[0..instruction_count];
         data.messages = messages[instruction_count..];
         data.max_output_tokens = request.max_output_tokens;
-        return codec.build_request(alloc, data, .{ .tool_choice_mode = self.tool_choice_mode });
+        return codec.build_request(alloc, data, .{
+            .tool_choice_mode = self.tool_choice_mode,
+            .tool_schema_mode = self.tool_schema_mode,
+        });
     }
 };
 

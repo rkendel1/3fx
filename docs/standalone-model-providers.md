@@ -54,6 +54,23 @@ Set `MODEL_API_KEY` through your normal secret-management mechanism. Without `ap
 
 The existing named `providers` registry remains supported. Don't combine it with the single-provider object. Use the registry when you need several endpoints, explicit capability metadata, or a permission-review model.
 
+For a named provider that needs a shell-schema compatibility projection, set `tool_schema_mode` to `flatten_unions` in that provider's registry entry:
+
+```json
+{
+  "providers": {
+    "ollama": {
+      "protocol": "openai-chat-completions",
+      "base_url": "http://localhost:11434/v1",
+      "auth": { "type": "none" },
+      "tool_schema_mode": "flatten_unions"
+    }
+  }
+}
+```
+
+The default `canonical` mode is unchanged. `flatten_unions` omits `oneOf` only from the recognized built-in `shell` schema; it advertises `run`, `interact`, and `stop` through one broader request object. FX still validates every shell request against the canonical action-specific contract before execution. This setting is an opt-in compatibility measure for a provider/model combination that does not return structured tool calls for the canonical schema; it does not imply that all Ollama models or compatible endpoints need it.
+
 ## Inspect configuration
 
 ```bash

@@ -5,6 +5,7 @@ const types = @import("../core/shared/types.zig");
 const model_tool_schema = @import("../core/tooling/model_tool_schema.zig");
 const tool_result_errors = @import("../core/tooling/tool_result_errors.zig");
 const image_attachments = @import("../core/images/image_attachments.zig");
+const builtin_tools = @import("../builtins/tools.zig");
 const tool_call_ids = @import("tool_call_ids.zig");
 const sse = @import("sse.zig");
 const configured_provider = @import("../core/config/configured_provider.zig");
@@ -16,6 +17,7 @@ const Allocator = std.mem.Allocator;
 pub const ToolChoiceMode = configured_provider.ToolChoiceMode;
 pub const Options = struct {
     tool_choice_mode: ToolChoiceMode = .omit,
+    tool_schema_mode: configured_provider.ToolSchemaMode = .canonical,
     /// Borrowed only during serialization; includes the configured authority binding.
     provider: ?*const model_provider.ProviderId = null,
 };
@@ -585,7 +587,12 @@ fn write_request(writer: *std.Io.Writer, alloc: Allocator, request: stream_provi
             try model_tool_schema.writeCappedDescriptionJsonString(alloc, writer, function.description);
             try writer.writeAll(",\"parameters\":");
             switch (function.schema) {
-                .builtin => |schema| try model_tool_schema.writeObjectSchema(alloc, writer, schema),
+                .builtin => |schema| {
+                    const projected = options.tool_schema_mode == .flatten_unions and
+                        std.mem.eql(u8, function.name, "shell") and
+                        try model_tool_schema.writeFlattenedShellSchema(alloc, writer, schema);
+                    if (!projected) try model_tool_schema.writeObjectSchema(alloc, writer, schema);
+                },
                 .dynamic => |schema| try std.json.Stringify.value(schema, .{}, writer),
             }
             try writer.writeAll("}}");
@@ -1817,6 +1824,75 @@ test "chat completions nested builtin additional and dynamic tool wire" {
     var result = try test_finish(&reducer, test_tools_finish);
     defer result.deinit(alloc);
     try std.testing.expectEqualStrings("mcp_docs", result.completed.completion.tool_calls[0].name);
+}
+
+test "flattened shell schema is scoped and preserves action fields and union bounds" {
+    const alloc = std.testing.allocator;
+    const functions = [_]model_tool_schema.FunctionSchema{
+        builtin_tools.shell.model_schema,
+        builtin_tools.read_file.model_schema,
+    };
+    var request = test_request();
+    request.tools = .{
+        .advertised_names = &.{ "shell", "read_file" },
+        .advertised_functions = &functions,
+    };
+    const canonical_body = try build_request(alloc, request, .{});
+    defer alloc.free(canonical_body);
+    const projected_body = try build_request(alloc, request, .{ .tool_schema_mode = .flatten_unions });
+    defer alloc.free(projected_body);
+
+    var canonical = try std.json.parseFromSlice(std.json.Value, alloc, canonical_body, .{});
+    defer canonical.deinit();
+    var projected = try std.json.parseFromSlice(std.json.Value, alloc, projected_body, .{});
+    defer projected.deinit();
+    const canonical_tools = canonical.value.object.get("tools").?.array.items;
+    const projected_tools = projected.value.object.get("tools").?.array.items;
+    const canonical_shell = canonical_tools[0].object.get("function").?.object.get("parameters").?.object;
+    const projected_shell = projected_tools[0].object.get("function").?.object.get("parameters").?.object;
+    const canonical_request = canonical_shell.get("properties").?.object.get("request").?.object;
+    const projected_request = projected_shell.get("properties").?.object.get("request").?.object;
+    try std.testing.expect(canonical_request.get("oneOf") != null);
+    try std.testing.expect(projected_request.get("oneOf") == null);
+    const properties = projected_request.get("properties").?.object;
+    const action_values = properties.get("action").?.object.get("enum").?.array.items;
+    try std.testing.expectEqual(@as(usize, 3), action_values.len);
+    try std.testing.expectEqualStrings("run", action_values[0].string);
+    try std.testing.expectEqualStrings("interact", action_values[1].string);
+    try std.testing.expectEqualStrings("stop", action_values[2].string);
+    for ([_][]const u8{ "command", "session_id", "chars", "profile", "shell", "tty", "reload", "force" }) |name| {
+        try std.testing.expect(properties.get(name) != null);
+    }
+    try std.testing.expectEqual(@as(i64, 300000), properties.get("yield_time_ms").?.object.get("maximum").?.integer);
+    const required = projected_request.get("required").?.array.items;
+    try std.testing.expectEqual(@as(usize, 1), required.len);
+    try std.testing.expectEqualStrings("action", required[0].string);
+    const canonical_read = try std.json.Stringify.valueAlloc(alloc, canonical_tools[1].object.get("function").?.object.get("parameters").?, .{});
+    defer alloc.free(canonical_read);
+    const projected_read = try std.json.Stringify.valueAlloc(alloc, projected_tools[1].object.get("function").?.object.get("parameters").?, .{});
+    defer alloc.free(projected_read);
+    try std.testing.expectEqualStrings(canonical_read, projected_read);
+}
+
+test "flattened shell projection leaves shell_process_only and nonmatching shell schemas canonical" {
+    const alloc = std.testing.allocator;
+    const process_function = builtin_tools.shellProcessOnlySpec().model_schema;
+    var request = test_request();
+    request.tools = .{
+        .advertised_names = &.{"shell"},
+        .advertised_functions = &.{process_function},
+    };
+    const process_body = try build_request(alloc, request, .{ .tool_schema_mode = .flatten_unions });
+    defer alloc.free(process_body);
+    try std.testing.expect(std.mem.find(u8, process_body, "\"oneOf\"") != null);
+
+    var changed_schema = builtin_tools.shell.model_schema;
+    changed_schema.input_schema.required = &.{ "request", "extra" };
+    const nonmatching_functions = [_]model_tool_schema.FunctionSchema{changed_schema};
+    request.tools.advertised_functions = &nonmatching_functions;
+    const nonmatching_body = try build_request(alloc, request, .{ .tool_schema_mode = .flatten_unions });
+    defer alloc.free(nonmatching_body);
+    try std.testing.expect(std.mem.find(u8, nonmatching_body, "\"oneOf\"") != null);
 }
 
 test "chat completions bounds dynamic schema traversal before serialization" {

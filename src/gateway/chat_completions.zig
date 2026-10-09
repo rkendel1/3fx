@@ -45,7 +45,11 @@ fn build(raw: ?*anyopaque, alloc: Allocator, request: streams.RequestData) ![]u8
             break;
         }
     };
-    return codec.build_request(alloc, request, .{ .tool_choice_mode = definition.tool_choice_mode, .provider = &identity });
+    return codec.build_request(alloc, request, .{
+        .tool_choice_mode = definition.tool_choice_mode,
+        .tool_schema_mode = definition.tool_schema_mode,
+        .provider = &identity,
+    });
 }
 
 fn project_replay(alloc: Allocator, replay: ?types.ProviderReplay, calls: []const types.ToolCall, text: bool, reasoning: bool) !?types.ProviderReplay {
@@ -88,6 +92,35 @@ test "chat completions adapter binds replay to endpoint authority and wires proj
     defer alloc.free(stripped);
     try std.testing.expect(std.mem.find(u8, stripped, "reasoning_details") == null);
     try std.testing.expect(request.messages[0].provider_replay.?.parts_json.ptr == replay.parts_json.ptr);
+}
+
+test "configured provider projects only the full shell schema when opted in" {
+    const alloc = std.testing.allocator;
+    var registry = try definitions.Registry.parse_json(alloc,
+        \\{"default":{"protocol":"openai-chat-completions","base_url":"http://localhost:1234/v1","auth":{"type":"none"}},
+        \\"compat":{"protocol":"openai-chat-completions","base_url":"http://localhost:1234/v1","auth":{"type":"none"},"tool_schema_mode":"flatten_unions"}}
+    );
+    defer registry.deinit(alloc);
+    const request: streams.RequestData = .{
+        .model = "model",
+        .messages = &.{.{ .role = .user, .content = "run pwd" }},
+        .tools = .{
+            .advertised_names = &.{"shell"},
+            .advertised_functions = &.{@import("../builtins/tools.zig").shell.model_schema},
+        },
+        .tool_choice = .auto,
+        .provider_options = .{},
+    };
+    const canonical_adapter = bundle(registry.get("default").?).agent_stream.?;
+    const canonical = try canonical_adapter.build_request_fn.?(canonical_adapter.context, alloc, request);
+    defer alloc.free(canonical);
+    try std.testing.expect(std.mem.find(u8, canonical, "\"oneOf\"") != null);
+
+    const compatible_adapter = bundle(registry.get("compat").?).agent_stream.?;
+    const compatible = try compatible_adapter.build_request_fn.?(compatible_adapter.context, alloc, request);
+    defer alloc.free(compatible);
+    try std.testing.expect(std.mem.find(u8, compatible, "\"oneOf\"") == null);
+    try std.testing.expect(std.mem.find(u8, compatible, "\"enum\":[\"run\",\"interact\",\"stop\"]") != null);
 }
 
 fn stream(raw: ?*anyopaque, alloc: Allocator, request: streams.ModelRequest) !streams.Result {

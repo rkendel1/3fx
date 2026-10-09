@@ -40,6 +40,7 @@ pub fn chat(
         .bearer => |env| env,
     });
     adapter.tool_choice_mode = definition.tool_choice_mode;
+    adapter.tool_schema_mode = definition.tool_schema_mode;
     var events: Events = .{ .sink = request.events };
     var delivery: models.Delivery = .{};
     defer if (delivery.possibly_sent.load(.seq_cst)) request.delivery.markPossiblySent();

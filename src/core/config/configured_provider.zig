@@ -24,12 +24,14 @@ pub const ParseError = Allocator.Error || error{
     InvalidAuth,
     InvalidEnvironmentName,
     InvalidToolChoiceMode,
+    InvalidToolSchemaMode,
     InvalidModelId,
     InvalidModelMetadata,
 };
 
 pub const Protocol = enum { @"openai-chat-completions" };
 pub const ToolChoiceMode = enum { omit, send };
+pub const ToolSchemaMode = enum { canonical, flatten_unions };
 
 /// Describes a credential slot, never a credential value. Resolution belongs at
 /// the effectful edge; `none` must omit Authorization rather than supply a token.
@@ -54,6 +56,7 @@ pub const Definition = struct {
     base_url: []const u8,
     auth: Auth,
     tool_choice_mode: ToolChoiceMode = .omit,
+    tool_schema_mode: ToolSchemaMode = .canonical,
     reviewer_model: ?[]const u8 = null,
     model_metadata: []const ModelMetadata = &.{},
 
@@ -224,7 +227,7 @@ pub const Registry = struct {
 
 fn parse_definition(alloc: Allocator, id: []const u8, value: std.json.Value) ParseError!Definition {
     try validate_id(id);
-    try check_fields(value, &.{ "protocol", "base_url", "auth", "tool_choice_mode", "reviewer_model", "model_metadata" });
+    try check_fields(value, &.{ "protocol", "base_url", "auth", "tool_choice_mode", "tool_schema_mode", "reviewer_model", "model_metadata" });
     const protocol = try required(value, "protocol");
     if (protocol != .string or !std.mem.eql(u8, protocol.string, "openai-chat-completions")) return error.InvalidProtocol;
     const url = try required(value, "base_url");
@@ -235,6 +238,16 @@ fn parse_definition(alloc: Allocator, id: []const u8, value: std.json.Value) Par
     if (value.object.get("tool_choice_mode")) |choice| {
         if (choice != .string) return error.InvalidToolChoiceMode;
         mode = if (std.mem.eql(u8, choice.string, "omit")) .omit else if (std.mem.eql(u8, choice.string, "send")) .send else return error.InvalidToolChoiceMode;
+    }
+    var schema_mode: ToolSchemaMode = .canonical;
+    if (value.object.get("tool_schema_mode")) |schema_mode_value| {
+        if (schema_mode_value != .string) return error.InvalidToolSchemaMode;
+        schema_mode = if (std.mem.eql(u8, schema_mode_value.string, "canonical"))
+            .canonical
+        else if (std.mem.eql(u8, schema_mode_value.string, "flatten_unions"))
+            .flatten_unions
+        else
+            return error.InvalidToolSchemaMode;
     }
     var reviewer: ?[]const u8 = null;
     if (value.object.get("reviewer_model")) |model_value| {
@@ -263,6 +276,7 @@ fn parse_definition(alloc: Allocator, id: []const u8, value: std.json.Value) Par
         .base_url = owned_url,
         .auth = owned_auth,
         .tool_choice_mode = mode,
+        .tool_schema_mode = schema_mode,
         .reviewer_model = owned_reviewer,
         .model_metadata = if (value.object.get("model_metadata")) |metadata| try parse_metadata(alloc, metadata) else &.{},
     };
@@ -430,7 +444,7 @@ fn hash_part(hash: *std.crypto.hash.sha2.Sha256, part: []const u8) void {
 
 const test_json =
     \\{"local":{"protocol":"openai-chat-completions","base_url":"http://localhost:11434/v1/","auth":{"type":"none"}},
-    \\"router":{"protocol":"openai-chat-completions","base_url":"https://openrouter.ai/api/v1","auth":{"type":"bearer","env":"OPENROUTER_API_KEY"},"tool_choice_mode":"send","reviewer_model":"openai/review","model_metadata":{"openai/gpt-4.1":{"context_window":8192,"max_output_tokens":1024,"supports_tool_use":true,"supports_vision":false},"unknown":{}}}}
+    \\"router":{"protocol":"openai-chat-completions","base_url":"https://openrouter.ai/api/v1","auth":{"type":"bearer","env":"OPENROUTER_API_KEY"},"tool_choice_mode":"send","tool_schema_mode":"flatten_unions","reviewer_model":"openai/review","model_metadata":{"openai/gpt-4.1":{"context_window":8192,"max_output_tokens":1024,"supports_tool_use":true,"supports_vision":false},"unknown":{}}}}
 ;
 
 test "configured provider owns definitions and preserves unknown metadata" {
@@ -443,6 +457,7 @@ test "configured provider owns definitions and preserves unknown metadata" {
     const local = registry.get("local").?;
     try std.testing.expectEqual(Auth.none, local.auth);
     try std.testing.expectEqual(ToolChoiceMode.omit, local.tool_choice_mode);
+    try std.testing.expectEqual(ToolSchemaMode.canonical, local.tool_schema_mode);
     try std.testing.expect(local.reviewer_model == null);
     const chat = try local.chat_url(alloc);
     defer alloc.free(chat);
@@ -451,6 +466,7 @@ test "configured provider owns definitions and preserves unknown metadata" {
     try std.testing.expectEqualStrings("OPENROUTER_API_KEY", router.auth.bearer);
     try std.testing.expectEqualStrings("openai/review", router.reviewer_model.?);
     try std.testing.expectEqual(ToolChoiceMode.send, router.tool_choice_mode);
+    try std.testing.expectEqual(ToolSchemaMode.flatten_unions, router.tool_schema_mode);
     const metadata = router.model("openai/gpt-4.1").?;
     try std.testing.expectEqual(@as(?u32, 8192), metadata.context_window);
     try std.testing.expectEqual(@as(?u32, 1024), metadata.max_output_tokens);
@@ -557,6 +573,8 @@ test "configured provider invalid schemas fail explicitly" {
         .{ .json = "{\"local\":{" ++ test_required_fields ++ ",\"secret\":\"not-allowed\"}}", .err = error.UnknownField },
         .{ .json = "{\"local\":{" ++ test_required_fields ++ ",\"tool_choice_mode\":\"auto\"}}", .err = error.InvalidToolChoiceMode },
         .{ .json = "{\"local\":{" ++ test_required_fields ++ ",\"tool_choice_mode\":null}}", .err = error.InvalidToolChoiceMode },
+        .{ .json = "{\"local\":{" ++ test_required_fields ++ ",\"tool_schema_mode\":\"all\"}}", .err = error.InvalidToolSchemaMode },
+        .{ .json = "{\"local\":{" ++ test_required_fields ++ ",\"tool_schema_mode\":null}}", .err = error.InvalidToolSchemaMode },
         .{ .json = "{\"local\":{" ++ test_required_fields ++ ",\"reviewer_model\":null}}", .err = error.InvalidModelId },
         .{ .json = "{\"local\":{" ++ test_required_fields ++ ",\"reviewer_model\":\"\"}}", .err = error.InvalidModelId },
         .{ .json = "{\"local\":{" ++ test_required_fields ++ ",\"reviewer_model\":\"bad\\nmodel\"}}", .err = error.InvalidModelId },

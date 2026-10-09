@@ -76,6 +76,190 @@ pub fn isSingleRequiredObjectUnionField(
     };
 }
 
+/// Writes the narrowly recognized full shell schema with its action union
+/// projected into one object. Returns false without writing if the schema no
+/// longer matches that canonical shape.
+pub fn writeFlattenedShellSchema(
+    alloc: std.mem.Allocator,
+    writer: *std.Io.Writer,
+    schema: ObjectSchema,
+) anyerror!bool {
+    if (!isExpectedShellSchema(schema)) return false;
+    const union_schema = schema.properties[0].shape.?.object.*;
+
+    try writer.writeAll("{\"type\":\"object\",\"properties\":{\"request\":{\"type\":\"object\",\"properties\":{");
+    var emitted: std.ArrayList([]const u8) = .empty;
+    defer emitted.deinit(alloc);
+    var property_count: usize = 0;
+    for (union_schema.one_of) |alternative| {
+        for (alternative.properties) |property| {
+            if (std.mem.eql(u8, property.name, "action")) {
+                if (containsName(emitted.items, "action")) continue;
+                try writeProjectedPropertyName(writer, property.name, &property_count);
+                try writer.writeAll("{\"type\":\"string\",\"enum\":[\"run\",\"interact\",\"stop\"]}");
+                try emitted.append(alloc, property.name);
+                continue;
+            }
+            if (containsName(emitted.items, property.name)) continue;
+            var merged = property;
+            var merged_bounds = no_property_bounds;
+            var saw_candidate = false;
+            var has_bounds = false;
+            var description_matches = true;
+            const description = property.description;
+            for (union_schema.one_of) |candidate_schema| {
+                const candidate = findProperty(candidate_schema, property.name) orelse continue;
+                const candidate_bounds = candidate.bounds orelse &no_property_bounds;
+                if (!saw_candidate) {
+                    merged_bounds = candidate_bounds.*;
+                    saw_candidate = true;
+                } else {
+                    merged_bounds = unionBounds(merged_bounds, candidate_bounds.*);
+                }
+                has_bounds = has_bounds or !std.meta.eql(candidate_bounds.*, no_property_bounds);
+                if (!std.mem.eql(u8, description, candidate.description)) description_matches = false;
+            }
+            merged.bounds = if (has_bounds) &merged_bounds else null;
+            merged.description = if (description_matches) description else "";
+            try writeProjectedPropertyName(writer, property.name, &property_count);
+            try writePropertySchema(alloc, writer, merged);
+            try emitted.append(alloc, property.name);
+        }
+    }
+    try writer.writeAll("},\"additionalProperties\":false,\"required\":[\"action\"]}},\"additionalProperties\":false,\"required\":[\"request\"]}");
+    return true;
+}
+
+fn isExpectedShellSchema(schema: ObjectSchema) bool {
+    if (!isSingleRequiredObjectUnionField(schema, "request") or
+        schema.min_properties != no_u32_bound or schema.max_properties != no_u32_bound)
+    {
+        return false;
+    }
+    const request = schema.properties[0];
+    if (request.json_type != .object or request.bounds != null or request.description.len != 0) return false;
+    const union_schema = request.shape.?.object.*;
+    if (union_schema.one_of.len != 4 or union_schema.properties.len != 0 or
+        union_schema.required.len != 0 or union_schema.additional_properties != null or
+        union_schema.min_properties != no_u32_bound or union_schema.max_properties != no_u32_bound)
+    {
+        return false;
+    }
+
+    var run_variants: usize = 0;
+    var interact_variants: usize = 0;
+    var stop_variants: usize = 0;
+    for (union_schema.one_of) |alternative| {
+        if (alternative.additional_properties != false or alternative.one_of.len != 0 or
+            alternative.min_properties != no_u32_bound or alternative.max_properties != no_u32_bound)
+        {
+            return false;
+        }
+        for (alternative.required) |required_name| {
+            if (findProperty(alternative, required_name) == null) return false;
+        }
+        const action = findProperty(alternative, "action") orelse return false;
+        if (action.json_type != .string or action.bounds != null or action.description.len != 0) return false;
+        const values = action.shape orelse return false;
+        const action_value = switch (values.*) {
+            .enum_values => |enum_values| if (enum_values.len == 1) enum_values[0] else return false,
+            else => return false,
+        };
+        if (!containsName(alternative.required, "action")) return false;
+        if (std.mem.eql(u8, action_value, "run")) {
+            if (containsName(alternative.required, "shell") and containsName(alternative.required, "tty")) {
+                if (!hasExactlyRequired(alternative, &.{ "action", "command", "shell", "tty" })) return false;
+            } else if (!hasExactlyRequired(alternative, &.{ "action", "command" })) return false;
+            run_variants += 1;
+        } else if (std.mem.eql(u8, action_value, "interact")) {
+            if (!hasExactlyRequired(alternative, &.{ "action", "session_id" })) return false;
+            interact_variants += 1;
+        } else if (std.mem.eql(u8, action_value, "stop")) {
+            if (!hasExactlyRequired(alternative, &.{ "action", "session_id" })) return false;
+            stop_variants += 1;
+        } else return false;
+    }
+    return run_variants == 2 and interact_variants == 1 and stop_variants == 1 and
+        projectedPropertiesAreCompatible(union_schema);
+}
+
+fn projectedPropertiesAreCompatible(schema: ObjectSchema) bool {
+    for (schema.one_of) |alternative| {
+        for (alternative.properties) |property| {
+            if (std.mem.eql(u8, property.name, "action")) continue;
+            for (schema.one_of) |candidate_schema| {
+                const candidate = findProperty(candidate_schema, property.name) orelse continue;
+                if (candidate.json_type != property.json_type or !sameShape(candidate.shape, property.shape)) return false;
+            }
+        }
+    }
+    return true;
+}
+
+fn hasExactlyRequired(schema: ObjectSchema, names: []const []const u8) bool {
+    if (schema.required.len != names.len) return false;
+    for (names) |name| if (!containsName(schema.required, name)) return false;
+    return true;
+}
+
+fn containsName(names: []const []const u8, name: []const u8) bool {
+    for (names) |candidate| if (std.mem.eql(u8, candidate, name)) return true;
+    return false;
+}
+
+fn findProperty(schema: ObjectSchema, name: []const u8) ?Property {
+    for (schema.properties) |property| {
+        if (std.mem.eql(u8, property.name, name)) return property;
+    }
+    return null;
+}
+
+fn sameShape(left: ?*const PropertyShape, right: ?*const PropertyShape) bool {
+    if (left == null or right == null) return left == null and right == null;
+    return switch (left.?.*) {
+        .enum_values => |values| switch (right.?.*) {
+            .enum_values => |other| valuesEqual(values, other),
+            else => false,
+        },
+        .object => |object| switch (right.?.*) {
+            .object => |other| object == other,
+            else => false,
+        },
+        .array_values => |values| switch (right.?.*) {
+            .array_values => |other| values.json_type == other.json_type and valuesEqual(values.enum_values, other.enum_values),
+            else => false,
+        },
+        .array_objects => |object| switch (right.?.*) {
+            .array_objects => |other| object == other,
+            else => false,
+        },
+    };
+}
+
+fn valuesEqual(left: []const []const u8, right: []const []const u8) bool {
+    if (left.len != right.len) return false;
+    for (left, right) |a, b| if (!std.mem.eql(u8, a, b)) return false;
+    return true;
+}
+
+fn unionBounds(left: PropertyBounds, right: PropertyBounds) PropertyBounds {
+    return .{
+        .min_length = if (left.min_length == no_u32_bound or right.min_length == no_u32_bound) no_u32_bound else @min(left.min_length, right.min_length),
+        .max_length = if (left.max_length == no_u32_bound or right.max_length == no_u32_bound) no_u32_bound else @max(left.max_length, right.max_length),
+        .minimum = if (left.minimum == no_u64_bound or right.minimum == no_u64_bound) no_u64_bound else @min(left.minimum, right.minimum),
+        .maximum = if (left.maximum == no_u64_bound or right.maximum == no_u64_bound) no_u64_bound else @max(left.maximum, right.maximum),
+        .min_items = if (left.min_items == no_u32_bound or right.min_items == no_u32_bound) no_u32_bound else @min(left.min_items, right.min_items),
+        .max_items = if (left.max_items == no_u32_bound or right.max_items == no_u32_bound) no_u32_bound else @max(left.max_items, right.max_items),
+    };
+}
+
+fn writeProjectedPropertyName(writer: *std.Io.Writer, name: []const u8, count: *usize) anyerror!void {
+    if (count.* != 0) try writer.writeByte(',');
+    count.* += 1;
+    try std.json.Stringify.value(name, .{}, writer);
+    try writer.writeByte(':');
+}
+
 test "static property representation stays within the measured size budget" {
     try std.testing.expect(@sizeOf(Property) <= 64);
 }

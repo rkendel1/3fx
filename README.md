@@ -69,7 +69,7 @@ For one-shot requests, select the provider through your profile or the environme
 FX_PROVIDER=ollama FX_MODEL=qwen3-coder fx ask "explain the changes in this repository"
 ```
 
-See [Standalone model providers](docs/standalone-model-providers.md) for remote credentials, source-build checks, and the remaining boundary work. Existing `fx login`, `fx login codex`, `fx login grok`, and `fx setup` commands remain available for users who explicitly choose those integrations.
+See [Standalone model providers](docs/standalone-model-providers.md) for remote credentials, the opt-in shell-schema compatibility mode, source-build checks, and the remaining boundary work. Existing `fx login`, `fx login codex`, `fx login grok`, and `fx setup` commands remain available for users who explicitly choose those integrations.
 
 Inside the shell, run `/help` to browse interactive commands.
 
