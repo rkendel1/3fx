@@ -58,6 +58,8 @@ const runtime_execution_memory = @import("execution_memory.zig");
 const execution_memory_helpers = @import("../execution_memory.zig");
 const runtime_agent = @import("agent.zig");
 const runtime_tool_admission = @import("tool_admission.zig");
+const observation_discipline = @import("observation_discipline.zig");
+const context_meter_mod = @import("context_meter.zig");
 const runtime_interruption = @import("interruption.zig");
 const runtime_parallel_execution = @import("parallel_execution.zig");
 const runtime_tool_batch = @import("tool_batch.zig");
@@ -1325,15 +1327,56 @@ fn project_read_tool_result_request_messages(
     return projected orelse source;
 }
 
+/// Fields a flat (unwrapped, action-less) shell call may carry. This mirrors
+/// the `run` field contract of the shell tool, minus `action`, which is
+/// supplied here. Anything else leaves the call unchanged for strict decoding.
+const flat_shell_run_fields = [_][]const u8{ "command", "cwd", "profile", "shell", "tty", "yield_time_ms", "timeout_ms", "reload" };
+
+/// Rewrites the unambiguous flat run form `{"command":"..."}` that some local
+/// models emit into the canonical `{"action":"run","command":"..."}`. Returns
+/// null (leave unchanged) for anything else: an `action` key, a `request`
+/// wrapper, unknown fields, a non-string or empty command, or a profile/shell
+/// conflict. The executor still performs full canonical validation.
+fn flat_shell_run_arguments(
+    alloc: Allocator,
+    object: std.json.ObjectMap,
+) Allocator.Error!?[]u8 {
+    const command = object.get("command") orelse return null;
+    if (command != .string or command.string.len == 0) return null;
+    if (object.contains("action") or object.contains("request")) return null;
+    if (object.contains("profile") and object.contains("shell")) return null;
+    var fields = object.iterator();
+    while (fields.next()) |entry| {
+        var allowed = false;
+        for (flat_shell_run_fields) |name| {
+            if (std.mem.eql(u8, entry.key_ptr.*, name)) allowed = true;
+        }
+        if (!allowed) return null;
+    }
+    var canonical: std.json.ObjectMap = .empty;
+    defer canonical.deinit(alloc);
+    try canonical.put(alloc, "action", .{ .string = "run" });
+    fields = object.iterator();
+    while (fields.next()) |entry| try canonical.put(alloc, entry.key_ptr.*, entry.value_ptr.*);
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    defer out.deinit();
+    std.json.Stringify.value(std.json.Value{ .object = canonical }, .{}, &out.writer) catch return error.OutOfMemory;
+    return try out.toOwnedSlice();
+}
+
 fn normalized_terminal_request_arguments(
     alloc: Allocator,
     arguments_json: []const u8,
+    flat_shell_run_allowed: bool,
 ) Allocator.Error!?[]u8 {
     var parsed = std.json.parseFromSlice(std.json.Value, alloc, arguments_json, .{}) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         else => return null,
     };
     defer parsed.deinit();
+    if (flat_shell_run_allowed and parsed.value == .object) {
+        if (try flat_shell_run_arguments(alloc, parsed.value.object)) |flat| return flat;
+    }
     if (parsed.value != .object or parsed.value.object.count() != 1) return null;
     const request = parsed.value.object.getPtr("request") orelse return null;
     if (request.* != .object) return null;
@@ -1478,6 +1521,7 @@ fn normalize_terminal_request_tool_calls(
         const arguments_json = try normalized_terminal_request_arguments(
             alloc,
             call.arguments_json,
+            std.mem.eql(u8, tool.name, "shell"),
         ) orelse continue;
         if (normalized == null) {
             normalized = alloc.dupe(ToolCall, source) catch |err| {
@@ -1664,9 +1708,56 @@ test "terminal inferred model input round trips every atomic write payload" {
         const normalized = (try normalized_terminal_request_arguments(
             alloc,
             projected,
+            false,
         )).?;
         defer alloc.free(normalized);
         try std.testing.expectEqualStrings(case.internal, normalized);
+    }
+}
+
+test "flat shell run arguments normalize to the canonical run request only for the shell tool" {
+    const alloc = std.testing.allocator;
+    const accepted = [_]struct { flat: []const u8, canonical: []const u8 }{
+        .{ .flat = "{\"command\":\"pwd\"}", .canonical = "{\"action\":\"run\",\"command\":\"pwd\"}" },
+        .{ .flat = "{\"command\":\"sleep 1\",\"timeout_ms\":5000,\"tty\":false}", .canonical = "{\"action\":\"run\",\"command\":\"sleep 1\",\"timeout_ms\":5000,\"tty\":false}" },
+    };
+    for (accepted) |case| {
+        const normalized = (try normalized_terminal_request_arguments(alloc, case.flat, true)).?;
+        defer alloc.free(normalized);
+        try std.testing.expectEqualStrings(case.canonical, normalized);
+        // Generic terminal tools never receive the shell-only repair.
+        try std.testing.expect((try normalized_terminal_request_arguments(alloc, case.flat, false)) == null);
+    }
+    // Existing nested requests keep unwrapping for every supported action.
+    const nested = [_]struct { wrapped: []const u8, inner: []const u8 }{
+        .{ .wrapped = "{\"request\":{\"action\":\"run\",\"command\":\"pwd\"}}", .inner = "{\"action\":\"run\",\"command\":\"pwd\"}" },
+        .{ .wrapped = "{\"request\":{\"action\":\"interact\",\"session_id\":\"s1\",\"chars\":\"q\"}}", .inner = "{\"action\":\"interact\",\"session_id\":\"s1\",\"chars\":\"q\"}" },
+        .{ .wrapped = "{\"request\":{\"action\":\"stop\",\"session_id\":\"s1\"}}", .inner = "{\"action\":\"stop\",\"session_id\":\"s1\"}" },
+    };
+    for (nested) |case| {
+        const normalized = (try normalized_terminal_request_arguments(alloc, case.wrapped, true)).?;
+        defer alloc.free(normalized);
+        try std.testing.expectEqualStrings(case.inner, normalized);
+    }
+    // Ambiguous, malformed, or unsupported shapes are left for strict decoding.
+    const rejected = [_][]const u8{
+        "{",
+        "[]",
+        "{}",
+        "{\"command\":\"\"}",
+        "{\"command\":42}",
+        "{\"command\":[\"ls\"]}",
+        "{\"command\":\"pwd\",\"unknown\":1}",
+        "{\"command\":\"pwd\",\"session_id\":\"s1\"}",
+        "{\"command\":\"pwd\",\"chars\":\"x\"}",
+        "{\"command\":\"pwd\",\"force\":true}",
+        "{\"command\":\"pwd\",\"profile\":\"a\",\"shell\":{}}",
+        "{\"action\":\"run\",\"command\":\"pwd\"}",
+        "{\"session_id\":\"s1\"}",
+        "{\"command\":\"pwd\",\"request\":{\"action\":\"run\",\"command\":\"ls\"}}",
+    };
+    for (rejected) |args| {
+        try std.testing.expect((try normalized_terminal_request_arguments(alloc, args, true)) == null);
     }
 }
 
@@ -6461,6 +6552,7 @@ fn processQueuedPromptLoop(
     defer shell_execution_failure_retry.deinit(arena);
     var identical_failure_escalation: runtime_tool_admission.IdenticalFailureEscalationState = .{};
     defer identical_failure_escalation.deinit(arena);
+    var context_meter: context_meter_mod.ContextMeter = .{};
     var malformed_arguments_retry: runtime_tool_admission.MalformedArgumentsRetryState = .{};
     var active_compaction_handoff: ?[]const u8 = null;
     var active_compaction_history_tail: []const ChatMessage = &.{};
@@ -6932,11 +7024,23 @@ fn processQueuedPromptLoop(
                     subagent_request_messages.len,
                 });
             }
-            const result_request_messages = try project_read_tool_result_request_messages(
+            const read_result_request_messages = try project_read_tool_result_request_messages(
                 overlay_arena,
                 read_tool_result_request_eligible,
                 subagent_request_messages,
             );
+            // Classify observations and measure what reuse would be denied.
+            // FX tools carry no reuse contract or state-freshness guarantee, so
+            // production supplies no contracts and reuse stays disabled: the
+            // request is unchanged. See docs/context-discipline.md.
+            const discipline = try observation_discipline.project(
+                overlay_arena,
+                read_result_request_messages,
+                observation_discipline.ContractSource.none,
+                false,
+            );
+            context_meter.stage(discipline.stats, observation_discipline.callReason(discipline.messages));
+            const result_request_messages = discipline.messages;
             if (!tool_image_capabilities_resolved and request_capabilities.image_input_support == .unknown) {
                 for (result_request_messages) |message| {
                     const memory = message.tool_result_memory orelse continue;
@@ -7293,6 +7397,8 @@ fn processQueuedPromptLoop(
                 deps.usage,
                 deps.usage_allocator,
             ) catch |err| {
+                context_meter.recordModelCall(gateway_attempt_evidence, null, last_gateway_message_count);
+                context_meter.trace(step_ctx);
                 parent_turn_delivery.observeGatewayDelivery(
                     deps,
                     overlay_arena,
@@ -7896,6 +8002,8 @@ fn processQueuedPromptLoop(
                     step_ctx,
                 );
             }
+            context_meter.recordModelCall(gateway_attempt_evidence, response_completion.usage, last_gateway_message_count);
+            context_meter.trace(step_ctx);
             runtime_assistant_stream.pushTokenProgressUpdate(&stream_ctx, summary_accumulator.reconcileTokenRequest(response_completion.usage, response_completion.delivery_ambiguous)) catch |progress_err| {
                 debug_trace.logf("agent", "token progress publication failed source=gateway_usage err={s}", .{@errorName(progress_err)});
             };
@@ -9917,6 +10025,7 @@ fn processQueuedPromptLoop(
                             "call_id={s} name={s}",
                             .{ executable_call.id, executable_call.name },
                         );
+                        context_meter.recordToolExecution();
                         if (deps.tool_activity_recorder) |recorder| {
                             recorder.record(
                                 executable_call.id,
@@ -11272,6 +11381,7 @@ fn processQueuedPromptLoop(
 
             debug_trace.eventf("tool", "before_tool_execution", step_ctx, "call_id={s} name={s}", .{ tool_call.id, tool_call.name });
             debug_trace.eventf("tool", "execution_start", step_ctx, "call_id={s} name={s}", .{ tool_call.id, tool_call.name });
+            context_meter.recordToolExecution();
             if (deps.tool_activity_recorder) |recorder| {
                 recorder.record(tool_call.id, tool_call.name, .started) catch |err| {
                     debug_trace.eventf(
@@ -11767,32 +11877,26 @@ fn processQueuedPromptLoop(
                     .continued => continue :agent_steps_loop,
                 }
             }
-            try deps.push_system_notice(
-                deps.ctx,
-                repeated_terminal_validation_notice,
+            // Exhausted recovery is a failed turn, as for the other repeated-failure
+            // guards: nothing was executed and the goal was not reached.
+            debug_trace.eventf(
+                "agent",
+                "repeated_terminal_validation_failure",
+                step_ctx,
+                "tool_call_count={d}",
+                .{effective_tool_calls.len},
             );
-            const assistant_text: runtime_finalization.TerminalText = .{ .history = "", .presentation = if (stop_state.retained_candidate != null)
-                try hooks.prompt.joinVisibleSegments(
-                    arena,
-                    stop_state.retained_candidate,
-                    stop_state.latest_partial,
-                )
-            else
-                null };
-            stop_state.terminal_materializing = true;
-            try runtime_finalization.finishCommonAssistantTerminal(
+            try finishFailedTurnWithNotice(
                 deps,
                 finalization,
                 arena,
                 job,
                 within_turn_suffix.items,
                 &summary_accumulator,
-                assistant_text,
-                .completed,
-                null,
+                stop_state,
                 &finish_trace,
+                repeated_terminal_validation_notice,
                 "terminal_validation_retry",
-                null,
             );
             return;
         }

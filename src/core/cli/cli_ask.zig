@@ -278,6 +278,7 @@ fn runAskChild(
             .permission_mode = admission.permission_mode,
             .permission_rules = admission.rules,
             .subagent_available = true,
+            .capabilities = ctx.executionCapabilities(ctx.alloc) catch return error.OutOfMemory,
         },
     ) catch return error.OutOfMemory;
     defer child_projection.deinit(ctx.alloc);
@@ -894,6 +895,23 @@ const AskContext = struct {
     }
 
     /// The saved session's side-file capability, if any.
+    /// What this run's execution path can actually run. Tool advertisement and
+    /// prompt guidance both derive from these facts: provider-executed tools
+    /// need the provider's search capability (the same flag the web-search
+    /// dispatch uses), and MCP needs the same model-catalog snapshot that
+    /// `appendStaticContext` renders.
+    fn executionCapabilities(self: *AskContext, alloc: Allocator) !tool_projection_mod.ExecutionCapabilities {
+        const mcp_available = if (self.mcp) |mcp| blk: {
+            var snapshot = try mcp.snapshotModelCatalog(alloc, self.permission_rules, true);
+            defer snapshot.deinit(alloc);
+            break :blk snapshot.hasEnabledServer();
+        } else false;
+        return .{
+            .provider_executed_tools = self.cfg.provider_set.select(self.provider).capabilities.fx_search,
+            .mcp = mcp_available,
+        };
+    }
+
     fn sessionChildCapability(self: *AskContext) ?*session_child_store.SessionChildCapability {
         if (self.v2) |v2| return v2.childCapability() catch |err| {
             debug_trace.logf("session", "event=sessions_v2_side_files_unavailable session={s} err={s}", .{ v2.id(), @errorName(err) });
@@ -2040,12 +2058,47 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
         }
     }
     const session_child_capability = ctx.sessionChildCapability();
-    var tool_projection = try buildAskGatewayToolProjection(alloc, ctx.cfg.mode_registry, options.deps.tool_set, ctx.mode_id, .{
+    // EXPERIMENTAL: FX_EXPERIMENTAL_TOOL_ALLOWLIST narrows the advertised tools
+    // for this run only. Unset (the default) leaves the full set untouched.
+    // An empty value is treated as unset so a stray export cannot remove every tool.
+    const allowlist_text = io_mod.getenv("FX_EXPERIMENTAL_TOOL_ALLOWLIST");
+    const allowlist_storage: []const []const u8 = if (allowlist_text) |text|
+        try tool_projection_mod.parseAllowlist(alloc, text)
+    else
+        &.{};
+    defer if (allowlist_text != null) alloc.free(allowlist_storage);
+    var experimental_allowlist: ?[]const []const u8 = if (allowlist_storage.len > 0) allowlist_storage else null;
+    const projection_options: tool_projection_mod.Options = .{
         .permission_mode = ctx.permission_mode,
         .permission_rules = ctx.permission_rules,
         .subagent_available = ctx.subagent_host != null,
-    }, session_child_capability != null);
+        .experimental_allowlist = experimental_allowlist,
+        .capabilities = try ctx.executionCapabilities(alloc),
+    };
+    var tool_projection = try buildAskGatewayToolProjection(alloc, ctx.cfg.mode_registry, options.deps.tool_set, ctx.mode_id, projection_options, session_child_capability != null);
     defer tool_projection.deinit(alloc);
+    if (experimental_allowlist != null and tool_projection.advertised_names.len == 0) {
+        // An allowlist that matches nothing must not leave the model without tools.
+        try ctx.writeStderr("fx ask: experimental tool allowlist matched no available tool; using the full tool set\n");
+        experimental_allowlist = null;
+        tool_projection.deinit(alloc);
+        var fallback_options = projection_options;
+        fallback_options.experimental_allowlist = null;
+        tool_projection = try buildAskGatewayToolProjection(alloc, ctx.cfg.mode_registry, options.deps.tool_set, ctx.mode_id, fallback_options, session_child_capability != null);
+    }
+    if (experimental_allowlist) |list| {
+        const missing = try tool_projection_mod.unavailableAllowlistNames(alloc, list, tool_projection.advertised_names);
+        defer alloc.free(missing);
+        var notice: std.ArrayList(u8) = .empty;
+        defer notice.deinit(alloc);
+        try notice.print(alloc, "fx ask: experimental tool allowlist active; advertising {d} tool(s)", .{tool_projection.advertised_names.len});
+        for (missing, 0..) |name, index| {
+            try notice.appendSlice(alloc, if (index == 0) "; unavailable: " else ", ");
+            try notice.appendSlice(alloc, name);
+        }
+        try notice.append(alloc, '\n');
+        try ctx.writeStderr(notice.items);
+    }
 
     const context_history = try ctx.session.snapshotHistory(alloc);
     defer types.freeHistoryTurnSlice(alloc, context_history);
@@ -5294,14 +5347,13 @@ const TestContextRegistryFixture = struct {
         );
 
         if (expected_static_context) |expected_static| {
-            try std.testing.expectEqual(@as(usize, 3), messages.items.len);
-            try std.testing.expectEqualStrings(expected_static, messages.items[0].content.?);
-            try std.testing.expect(std.mem.find(u8, messages.items[1].content.?, "<mcp_servers>") != null);
-            try std.testing.expectEqualStrings(test_registry_transient_context, messages.items[2].content.?);
-        } else {
+            // No MCP server is configured, so no MCP section is rendered.
             try std.testing.expectEqual(@as(usize, 2), messages.items.len);
-            try std.testing.expect(std.mem.find(u8, messages.items[0].content.?, "<mcp_servers>") != null);
+            try std.testing.expectEqualStrings(expected_static, messages.items[0].content.?);
             try std.testing.expectEqualStrings(test_registry_transient_context, messages.items[1].content.?);
+        } else {
+            try std.testing.expectEqual(@as(usize, 1), messages.items.len);
+            try std.testing.expectEqualStrings(test_registry_transient_context, messages.items[0].content.?);
         }
 
         try testPushAssistantText(deps, "assistant text");

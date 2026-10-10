@@ -1,9 +1,11 @@
 import { describe, expect, test } from "bun:test";
 import { execFileSync } from "node:child_process";
-import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { FX_BIN, runFx } from "../evals/eval-helpers";
 import { completion, toolCompletion, createConfiguredProviderFixture as fixture } from "./fixtures/chat-completions";
+import { scenarios, runScenario } from "../../benchmarks/sequencing/lib";
+import { tasks, runTask, outcomeCorrect, CONDITIONS } from "../../benchmarks/sequencing/context";
 
 async function withReasoning(response: Response, ...deltas: Record<string, unknown>[]) {
   const prefix = deltas.map(delta => `data: ${JSON.stringify({ choices: [{ index: 0, delta }] })}\n\n`).join("");
@@ -772,6 +774,454 @@ describe("standalone agent", () => {
   }, 60000);
 });
 
+
+function toolMessages(body: any) {
+  return body.messages.filter((message: any) => message.role === "tool").map((message: any) => String(message.content));
+}
+
+function countLines(path: string) {
+  return existsSync(path) ? readFileSync(path, "utf8").split("\n").filter(Boolean).length : 0;
+}
+
+describe("local shell tool calling", () => {
+  const stopCompletion = (model: string, args: unknown, finish: string) => {
+    const chunks = [
+      { id: "chat-tool", model, choices: [{ index: 0, delta: { tool_calls: [{ index: 0, id: "call-local", type: "function", function: { name: "shell", arguments: JSON.stringify(args) } }] }, finish_reason: null }] },
+      { id: "chat-tool", model, choices: [{ index: 0, delta: {}, finish_reason: finish }] },
+    ];
+    return new Response(chunks.map(value => `data: ${JSON.stringify(value)}\n\n`).join("") + "data: [DONE]\n\n", { headers: { "content-type": "text/event-stream" } });
+  };
+
+  test("flatten_unions reaches the wire while canonical mode keeps oneOf", async () => {
+    for (const mode of ["flatten_unions", "canonical"]) {
+      const f = fixture(body => completion(body.model, "done"));
+      try {
+        f.settings.providers.local.tool_schema_mode = mode;
+        f.save();
+        const result = await runFx(["ask", "--json", "--no-save", "hello"], { cwd: f.workspace, env: f.env, timeoutMs: 20000 });
+        if (result.code !== 0) throw new Error(result.stdout + result.stderr);
+        const shell = f.requests[0].body.tools.find((tool: any) => tool.function.name === "shell").function.parameters;
+        const request = shell.properties.request;
+        expect(shell.required).toEqual(["request"]);
+        if (mode === "flatten_unions") {
+          expect(JSON.stringify(shell)).not.toContain("oneOf");
+          expect(request.properties.action.enum).toEqual(["run", "interact", "stop"]);
+          expect(request.required).toEqual(["action"]);
+        } else {
+          expect(request.oneOf.length).toBeGreaterThan(1);
+        }
+      } finally { f.close(); }
+    }
+  }, 45000);
+
+  test("flat, nested, and stop-finish tool calls execute exactly once and return real output", async () => {
+    const cases: Array<{ name: string; args: (marker: string) => unknown; finish: string; extra?: Record<string, unknown> }> = [
+      { name: "flat", args: marker => ({ command: `echo run >> ${marker}; echo FXMARK_$((6*7))` }), finish: "tool_calls" },
+      { name: "nested", args: marker => ({ request: { action: "run", command: `echo run >> ${marker}; echo FXMARK_$((6*7))` } }), finish: "tool_calls" },
+      { name: "stop-finish", args: marker => ({ request: { action: "run", command: `echo run >> ${marker}; echo FXMARK_$((6*7))` } }), finish: "stop", extra: { finish_reason_mode: "accept_stop_with_tool_calls" } },
+    ];
+    for (const testCase of cases) {
+      let calls = 0;
+      const f = fixture(body => {
+        calls++;
+        const marker = join(f.workspace, "marker.txt");
+        return calls === 1 ? stopCompletion(body.model, testCase.args(marker), testCase.finish) : completion(body.model, "The command printed FXMARK_42");
+      });
+      try {
+        Object.assign(f.settings.providers.local, { tool_schema_mode: "flatten_unions", ...testCase.extra });
+        f.save();
+        const result = await runFx(["ask", "--json", "--no-save", "--full-access", "run the command"], { cwd: f.workspace, env: f.env, timeoutMs: 30000 });
+        if (result.code !== 0) throw new Error(testCase.name + ": " + result.stdout + result.stderr);
+        expect(JSON.parse(result.stdout).output).toContain("FXMARK_42");
+        expect(f.requests).toHaveLength(2);
+        expect(countLines(join(f.workspace, "marker.txt"))).toBe(1);
+        const results = toolMessages(f.requests[1].body);
+        expect(results).toHaveLength(1);
+        expect(results[0]).toContain("FXMARK_42");
+      } finally { f.close(); }
+    }
+  }, 120000);
+
+  test("measurement comes from real events: calls, executions, request bytes, and provider usage", async () => {
+    let calls = 0;
+    const f = fixture(body => {
+      calls++;
+      return calls === 1
+        ? stopCompletion(body.model, { request: { action: "run", command: "echo measured" } }, "tool_calls")
+        : completion(body.model, "done", 12);
+    });
+    try {
+      const trace = join(f.home, "trace.log");
+      const result = await runFx(["ask", "--json", "--no-save", "--full-access", "run it"], {
+        cwd: f.workspace, env: { ...f.env, FX_TRACE_LOG: trace, FX_TRACE_SCOPES: "context" }, timeoutMs: 30000,
+      });
+      if (result.code !== 0) throw new Error(result.stdout + result.stderr);
+      const lines = readFileSync(trace, "utf8").split("\n").filter(line => line.includes("measurement"));
+      expect(lines.length).toBe(2);
+      const field = (name: string) => lines.at(-1)!.match(new RegExp(`${name}=(\\S+)`))![1];
+      expect(f.requests).toHaveLength(2);
+      expect(field("model_calls")).toBe("2");
+      expect(field("tool_executions")).toBe("1");
+      // Runtime bytes are the bodies the server actually received; provider tokens are only what it reported.
+      expect(field("serialized_request_bytes")).toBe(String(f.requests[0].bytes + f.requests[1].bytes));
+      expect(field("requests_with_known_bytes")).toBe("2");
+      expect(field("provider_input_tokens")).toBe("12");
+      expect(field("provider_output_tokens")).toBe("3");
+      expect(field("omitted_observations")).toBe("0");
+      expect(field("omissions_denied")).toBe("0");
+    } finally { f.close(); }
+  }, 45000);
+
+  test("an unreported provider usage stays unknown", async () => {
+    const f = fixture(body => {
+      const chunks = [
+        { id: "c", model: body.model, choices: [{ index: 0, delta: { role: "assistant", content: "ok" }, finish_reason: null }] },
+        { id: "c", model: body.model, choices: [{ index: 0, delta: {}, finish_reason: "stop" }] },
+      ];
+      return new Response(chunks.map(value => `data: ${JSON.stringify(value)}\n\n`).join("") + "data: [DONE]\n\n", { headers: { "content-type": "text/event-stream" } });
+    });
+    try {
+      const trace = join(f.home, "trace.log");
+      const result = await runFx(["ask", "--json", "--no-save", "hello"], {
+        cwd: f.workspace, env: { ...f.env, FX_TRACE_LOG: trace, FX_TRACE_SCOPES: "context" }, timeoutMs: 30000,
+      });
+      if (result.code !== 0) throw new Error(result.stdout + result.stderr);
+      const last = readFileSync(trace, "utf8").split("\n").filter(line => line.includes("measurement")).at(-1)!;
+      expect(last).toContain("provider_input_tokens=null");
+      expect(last).toContain("provider_output_tokens=null");
+      expect(last).toContain(`serialized_request_bytes=${f.requests[0].bytes}`);
+    } finally { f.close(); }
+  }, 45000);
+
+  test("stop finish reason with tool calls stays rejected without the opt-in and never executes", async () => {
+    const f = fixture(body => stopCompletion(body.model, { request: { action: "run", command: "echo run >> marker.txt" } }, "stop"));
+    try {
+      const result = await runFx(["ask", "--json", "--no-save", "--full-access", "run the command"], { cwd: f.workspace, env: f.env, timeoutMs: 30000 });
+      expect(result.code).not.toBe(0);
+      expect(existsSync(join(f.workspace, "marker.txt"))).toBe(false);
+    } finally { f.close(); }
+  }, 45000);
+
+  test("malformed and ambiguous shell calls never execute and the retry loop terminates", async () => {
+    const bad: unknown[] = [
+      { command: 42 },
+      { command: "echo run >> marker.txt", unknown_field: true },
+      { command: "echo run >> marker.txt", session_id: "shell-1" },
+      { request: { action: "explode", command: "echo run >> marker.txt" } },
+      { request: { action: "run" } },
+      { action: "run", command: "echo run >> marker.txt", profile: "a", shell: { kind: "bash", path: "/bin/bash" } },
+    ];
+    for (const args of bad) {
+      const f = fixture(body => stopCompletion(body.model, args, "tool_calls"));
+      try {
+        const result = await runFx(["ask", "--json", "--no-save", "--full-access", "run the command"], { cwd: f.workspace, env: f.env, timeoutMs: 60000 });
+        expect(result.timedOut ?? false).toBe(false);
+        // Exhausted recovery is a failed turn: a nonzero exit, never a success.
+        expect(result.code).toBe(1);
+        expect(JSON.parse(result.stdout).exit_code).toBe(1);
+        expect(existsSync(join(f.workspace, "marker.txt"))).toBe(false);
+        expect(f.requests.length).toBeGreaterThanOrEqual(2);
+        expect(f.requests.length).toBeLessThanOrEqual(40);
+        expect(toolMessages(f.requests[1].body)[0]).toContain("invalid_shell_request");
+        expect(toolMessages(f.requests[1].body)[0]).toContain("\"executed\":false");
+      } finally { f.close(); }
+    }
+  }, 240000);
+});
+
+// Pins the order of work FX performs per scenario (docs/runtime-sequencing.md).
+// calls = model calls by reason [initial, after tools, after failed tools].
+// A change here means the sequence of decisions, reviews or executions changed.
+describe("runtime sequencing", () => {
+  const expected: Record<string, { exit: number; reasons: string; reviews: number; proposed: number; executed: number; failed: number; output?: string }> = {
+    S1: { exit: 0, reasons: "1/0/0", reviews: 0, proposed: 0, executed: 0, failed: 0, output: "Hello." },
+    S2: { exit: 0, reasons: "1/1/0", reviews: 0, proposed: 1, executed: 1, failed: 0, output: "Read it." },
+    S3: { exit: 0, reasons: "1/3/0", reviews: 0, proposed: 3, executed: 3, failed: 0, output: "Read all." },
+    S4: { exit: 0, reasons: "1/1/0", reviews: 0, proposed: 1, executed: 1, failed: 0, output: "Written." },
+    S5: { exit: 0, reasons: "1/1/1", reviews: 0, proposed: 2, executed: 1, failed: 1, output: "Fixed." },
+    S6: { exit: 0, reasons: "1/1/1", reviews: 0, proposed: 2, executed: 2, failed: 1, output: "Recovered." },
+    // A repeated identical failure is executed once; the repeat is stopped, not run.
+    S7: { exit: 1, reasons: "1/0/1", reviews: 0, proposed: 2, executed: 1, failed: 2 },
+    // A repeated invalid call never executes.
+    S7b: { exit: 1, reasons: "1/0/1", reviews: 0, proposed: 2, executed: 0, failed: 2 },
+    S8: { exit: 0, reasons: "1/4/0", reviews: 0, proposed: 4, executed: 4, failed: 0, output: "Done." },
+    // At the step limit the second proposed call is not executed and the run is not a success.
+    S9: { exit: 1, reasons: "1/1/0", reviews: 0, proposed: 2, executed: 1, failed: 0 },
+    S10: { exit: 0, reasons: "1/1/0", reviews: 0, proposed: 1, executed: 1, failed: 0, output: "Ran." },
+    // Review is a model call: the default shell profile pays it, the clean profile's direct read-only path does not.
+    S11: { exit: 0, reasons: "1/1/0", reviews: 1, proposed: 1, executed: 1, failed: 0, output: "Listed." },
+    S12: { exit: 0, reasons: "1/1/0", reviews: 0, proposed: 1, executed: 1, failed: 0, output: "Listed." },
+    // Validation precedes review: an invalid call costs no review.
+    S13: { exit: 0, reasons: "1/0/1", reviews: 0, proposed: 1, executed: 0, failed: 1, output: "Gave up." },
+    // A clear review covers only the exact action, so an identical repeat is reviewed again.
+    S14: { exit: 0, reasons: "1/2/0", reviews: 2, proposed: 2, executed: 2, failed: 0, output: "Done." },
+    // Without --auto a state change stops after one model call, before anything runs.
+    S15: { exit: 1, reasons: "1/0/0", reviews: 0, proposed: 1, executed: 0, failed: 1 },
+  };
+
+  test("each scenario performs its work in the pinned order", async () => {
+    expect(new Set(scenarios.map(s => s.id))).toEqual(new Set(Object.keys(expected)));
+    for (const scenario of scenarios) {
+      const want = expected[scenario.id];
+      const got = await runScenario(scenario);
+      const label = `${scenario.id} ${scenario.title}`;
+      expect([label, got.exit]).toEqual([label, want.exit]);
+      expect([label, got.reasons]).toEqual([label, want.reasons]);
+      expect([label, got.review_calls]).toEqual([label, want.reviews]);
+      expect([label, got.proposed]).toEqual([label, want.proposed]);
+      expect([label, got.executed]).toEqual([label, want.executed]);
+      expect([label, got.rejected_or_failed]).toEqual([label, want.failed]);
+      // Every request extends the previous one: tools and earlier messages are unchanged (cache-stable).
+      expect([label, got.prefix_stable]).toEqual([label, true]);
+      if (want.output !== undefined) expect(got.output).toBe(want.output);
+      // Runtime evidence for the outcome: no run that ended in a stop wrote a file.
+      if (want.exit === 1) expect(got.files).toEqual([]);
+    }
+  }, 240000);
+});
+
+// Request-context experiment invariants (docs/request-context-efficiency.md).
+describe("request context accounting", () => {
+  const task = (id: string) => tasks.find(t => t.id === id)!;
+  const scenario = (id: string) => scenarios.find(t => t.id === id)!;
+  // What a configured chat-completions provider with no MCP server is actually offered.
+  const BASE_TOOLS = ["read_file", "glob_files", "grep_files", "edit_file", "write_file", "shell", "capability_search", "skill", "install_skill", "ask_user_question", "web_fetch", "read_tool_result"];
+  const MCP_TOOLS = ["mcp_select_tool", "mcp_features"];
+
+  function pairingValid(messages: any[]) {
+    for (let i = 0; i < messages.length; i++) {
+      const calls = messages[i].role === "assistant" ? messages[i].tool_calls ?? [] : [];
+      calls.forEach((call: any, k: number) => {
+        const result = messages[i + 1 + k];
+        if (!result || result.role !== "tool" || result.tool_call_id !== call.id) throw new Error(`unpaired tool call ${call.id} at ${i}`);
+      });
+    }
+    return true;
+  }
+
+  test("every provider request is counted once and reviewers are included", async () => {
+    for (const id of ["S1", "S5", "S11", "S12", "S13", "S14"]) {
+      const r = await runScenario(scenario(id));
+      const label = `${id} ${r.title}`;
+      const reviewers = r.requests.filter(q => q.purpose === "reviewer").length;
+      // Server-side total = main agent calls + reviewer calls, each exactly once.
+      expect([label, r.total_requests]).toEqual([label, r.model_calls + r.review_calls]);
+      expect([label, reviewers]).toEqual([label, r.review_calls]);
+      // The permission-review send events (provider attempts) agree with what the server received.
+      expect([label, r.reviewer_sends]).toEqual([label, r.review_calls]);
+      expect([label, r.requests.length]).toEqual([label, r.total_requests]);
+      expect(r.requests.every(q => q.purpose !== "unknown")).toBe(true);
+    }
+  }, 120000);
+
+  test("request purposes agree with what was actually sent", async () => {
+    const purposes = async (id: string) => (await runScenario(scenario(id))).requests.map(q => q.purpose);
+    expect(await purposes("S1")).toEqual(["initial"]);
+    expect(await purposes("S2")).toEqual(["initial", "after_tools"]);
+    expect(await purposes("S5")).toEqual(["initial", "after_failed_tools", "after_tools"]);
+    expect(await purposes("S6")).toEqual(["initial", "after_failed_tools", "after_tools"]);
+    expect(await purposes("S11")).toEqual(["initial", "reviewer", "after_tools"]);
+    expect(await purposes("S14")).toEqual(["initial", "reviewer", "after_tools", "reviewer", "after_tools"]);
+  }, 120000);
+
+  test("the default request is the full set the execution path supports and the allowlist is inert when empty", async () => {
+    const base = await runTask(task("C2"), "baseline");
+    expect(base.advertised).toEqual(BASE_TOOLS);
+    for (const env of [{ FX_EXPERIMENTAL_TOOL_ALLOWLIST: "" }]) {
+      const r = await runScenario(task("C2"), { env });
+      expect(r.advertised).toEqual(BASE_TOOLS);
+      expect(r.requests[0].tools_bytes).toBe(base.requests[0].tools_bytes);
+      expect(r.requests[0].instruction_bytes).toBe(base.requests[0].instruction_bytes);
+    }
+  }, 60000);
+
+  test("the experimental allowlist advertises exactly the selected schemas, in the original order", async () => {
+    for (const cond of ["core6", "min4"]) {
+      const want = BASE_TOOLS.filter(name => CONDITIONS[cond].FX_EXPERIMENTAL_TOOL_ALLOWLIST.split(",").includes(name));
+      const r = await runTask(task("C3"), cond);
+      for (const q of r.requests.filter(x => x.purpose !== "reviewer")) expect([cond, q.tools_count]).toEqual([cond, want.length]);
+      expect([cond, r.advertised]).toEqual([cond, want]);
+    }
+  }, 120000);
+
+  test("a candidate differs from the baseline only in what the tool selection implies", async () => {
+    const a = await runTask(task("C2"), "baseline");
+    const b = await runTask(task("C2"), "core6");
+    expect(b.requests[0].tools_bytes).toBeLessThan(a.requests[0].tools_bytes);
+    // Same task and settings: base instructions and the user message are byte-identical.
+    expect(b.bodies[0].messages[0]).toEqual(a.bodies[0].messages[0]);
+    expect(b.bodies[0].messages.at(-1)).toEqual(a.bodies[0].messages.at(-1));
+    expect(b.bodies[0].model).toBe(a.bodies[0].model);
+    // Guidance for removed tools goes with them, so instructions can only shrink.
+    expect(b.requests[0].instruction_bytes).toBeLessThanOrEqual(a.requests[0].instruction_bytes);
+    expect(b.output).toBe(a.output);
+    expect(b.success && a.success).toBe(true);
+  }, 60000);
+
+  test("tool-call and result pairing and message order stay valid and append-only under a candidate", async () => {
+    for (const cond of ["baseline", "core6"]) {
+      const r = await runTask(task("C3"), cond);
+      expect([cond, r.success]).toEqual([cond, true]);
+      expect([cond, r.prefix_stable]).toEqual([cond, true]);
+      const first = r.requests[0].messages;
+      expect([cond, r.requests.map(q => q.messages)]).toEqual([cond, [first, first + 2, first + 4]]);
+      for (const body of r.bodies) expect(pairingValid(body.messages)).toBe(true);
+    }
+  }, 120000);
+
+  test("a required tool that is not offered fails truthfully and never becomes a false success", async () => {
+    const t = task("C7");
+    const baseline = await runTask(t, "baseline");
+    expect(baseline.success).toBe(true);
+    const r = await runTask(t, "min4");
+    expect(r.success).toBe(false);
+    expect(r.exit).not.toBe(0);
+    expect(r.executed).toBe(0);
+    expect(r.output).not.toBe("Found.");
+    expect(r.total_requests).toBe(1);
+    expect(outcomeCorrect(t, r)).toBe(true);
+    // Removing dedicated tools can push work onto shell, which needs approval: that is a regression, not a pass.
+    const c3 = await runTask(task("C3"), "min4");
+    expect(c3.success).toBe(false);
+    expect(outcomeCorrect(task("C3"), c3)).toBe(false);
+  }, 60000);
+
+  test("validation and authorization are unchanged under a candidate", async () => {
+    for (const id of ["S13", "S15", "S7b"]) {
+      const base = await runScenario(scenario(id));
+      const cand = await runScenario(scenario(id), { env: CONDITIONS.core6 });
+      for (const key of ["exit", "executed", "review_calls", "model_calls", "rejected_or_failed", "proposed"] as const) {
+        expect([id, key, cand[key]]).toEqual([id, key, base[key]]);
+      }
+    }
+  }, 120000);
+
+  test("an allowlist that matches nothing falls back to the full tool set with a notice", async () => {
+    const r = await runScenario(task("C2"), { env: { FX_EXPERIMENTAL_TOOL_ALLOWLIST: "no_such_tool" } });
+    expect(r.advertised).toEqual(BASE_TOOLS);
+    expect(r.stderr + "").toBeDefined();
+    expect(r.success).toBe(true);
+  }, 60000);
+
+  test("provider usage of zero is reported as zero and an unreported count stays unknown", async () => {
+    const f = fixture(body => {
+      const chunks = [
+        { id: "c", model: body.model, choices: [{ index: 0, delta: { role: "assistant", content: "ok" }, finish_reason: null }] },
+        { id: "c", model: body.model, choices: [{ index: 0, delta: {}, finish_reason: "stop" }] },
+        { id: "c", model: body.model, choices: [], usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 } },
+      ];
+      return new Response(chunks.map(v => `data: ${JSON.stringify(v)}\n\n`).join("") + "data: [DONE]\n\n", { headers: { "content-type": "text/event-stream" } });
+    });
+    try {
+      const trace = join(f.home, "trace.log");
+      const result = await runFx(["ask", "--json", "--no-save", "hello"], { cwd: f.workspace, env: { ...f.env, FX_TRACE_LOG: trace, FX_TRACE_SCOPES: "context" }, timeoutMs: 30000 });
+      if (result.code !== 0) throw new Error(result.stdout + result.stderr);
+      const last = readFileSync(trace, "utf8").split("\n").filter(l => l.includes("measurement")).at(-1)!;
+      expect(last).toContain("provider_input_tokens=0");
+      expect(last).toContain("provider_output_tokens=0");
+    } finally { f.close(); }
+  }, 45000);
+});
+
+// Tool advertisements and tool-specific guidance follow the execution path (docs/capability-consistent-requests.md).
+describe("capability-consistent requests", () => {
+  const MCP_FIXTURE = join(import.meta.dirname, "fixtures", "mcp-modern-stdio.mjs");
+  const MCP_TOOLS = ["mcp_select_tool", "mcp_features"];
+  const FORBIDDEN_WITHOUT_MCP = ["mcp_select_tool", "mcp_features", "<mcp_servers>", "Configured MCP servers"];
+  const FORBIDDEN_WITHOUT_SEARCH = ["web_search", "Search the current public web"];
+
+  /** One request through the real binary; returns the first serialized request body and its text. */
+  async function firstRequest(configure?: (home: string) => void, args: string[] = []) {
+    const f = fixture(body => completion(body.model, "ok", 5));
+    try {
+      configure?.(f.home);
+      const result = await runFx(["ask", "--json", "--no-save", ...args, "hello"], { cwd: f.workspace, env: f.env, timeoutMs: 30000 });
+      if (result.code !== 0) throw new Error(result.stdout + result.stderr);
+      const body = f.requests[0].body;
+      const tools = (body.tools as any[]).map(t => t.function.name as string);
+      return { body, tools, text: JSON.stringify(body), bytes: f.requests[0].bytes, capabilitySearch: (body.tools as any[]).find(t => t.function.name === "capability_search")?.function.description as string };
+    } finally { f.close(); }
+  }
+
+  const writeMcp = (enabled: boolean) => (home: string) => {
+    mkdirSync(join(home, ".fx"), { recursive: true });
+    writeFileSync(join(home, ".fx", "mcp.json"), JSON.stringify({ mcp: { fixture: { type: "local", command: [process.execPath, MCP_FIXTURE], enabled } } }));
+  };
+
+  test("a provider that cannot execute web search gets no web-search tool or guidance", async () => {
+    const r = await firstRequest();
+    for (const needle of FORBIDDEN_WITHOUT_SEARCH) expect([needle, r.text.includes(needle)]).toEqual([needle, false]);
+    expect(r.tools).not.toContain("web_search");
+    expect(r.body.messages.filter((m: any) => m.role === "system").length).toBeGreaterThan(0);
+  }, 45000);
+
+  test("MCP support compiled into FX does not make MCP available", async () => {
+    const r = await firstRequest();
+    for (const needle of FORBIDDEN_WITHOUT_MCP) expect([needle, r.text.includes(needle)]).toEqual([needle, false]);
+    for (const name of MCP_TOOLS) expect(r.tools).not.toContain(name);
+    // capability_search stays for skills, with no MCP wording or properties.
+    expect(r.tools).toContain("capability_search");
+    expect(r.capabilitySearch).not.toMatch(/MCP|mcp_/);
+    const schema = (r.body.tools as any[]).find(t => t.function.name === "capability_search").function.parameters;
+    expect(Object.keys(schema.properties)).toEqual(["query"]);
+  }, 45000);
+
+  test("a configured MCP server that is disabled does not count as available", async () => {
+    const r = await firstRequest(writeMcp(false));
+    for (const needle of FORBIDDEN_WITHOUT_MCP) expect([needle, r.text.includes(needle)]).toEqual([needle, false]);
+    for (const name of MCP_TOOLS) expect(r.tools).not.toContain(name);
+  }, 45000);
+
+  test("a configured and enabled MCP server keeps the MCP guidance and tools", async () => {
+    const r = await firstRequest(writeMcp(true));
+    expect(r.text).toContain("<mcp_servers>");
+    expect(r.text).toContain('name=\\"fixture\\"');
+    for (const name of MCP_TOOLS) expect(r.tools).toContain(name);
+    expect(r.capabilitySearch).toContain("mcp_select_tool");
+    const schema = (r.body.tools as any[]).find(t => t.function.name === "capability_search").function.parameters;
+    expect(Object.keys(schema.properties)).toEqual(["query", "server"]);
+    // Nothing else about web search changes for a provider that cannot run it.
+    expect(r.tools).not.toContain("web_search");
+  }, 45000);
+
+  test("tools that are not advertised cannot be executed through another path", async () => {
+    for (const [tool, args] of [["web_search", { query: "fx" }], ["mcp_select_tool", { name: "mcp_fixture_echo" }], ["mcp_features", { action: "list_resources", server: "fixture" }]] as const) {
+      let calls = 0;
+      const f = fixture(body => { calls++; return calls === 1 ? toolCompletion(body.model, tool, args) : completion(body.model, "Found it.", 5); });
+      try {
+        const result = await runFx(["ask", "--json", "--no-save", "--full-access", "use it"], { cwd: f.workspace, env: f.env, timeoutMs: 30000 });
+        const json = JSON.parse(result.stdout || "{}");
+        // Truthful failure: non-zero exit, nothing executed, no success claim from the model's follow-up.
+        expect([tool, result.code]).not.toEqual([tool, 0]);
+        expect([tool, (json.tool_calls ?? []).length]).toEqual([tool, 0]);
+        expect([tool, String(json.final_output ?? "")]).not.toEqual([tool, "Found it."]);
+        expect([tool, f.requests.length]).toEqual([tool, 1]);
+      } finally { f.close(); }
+    }
+  }, 90000);
+
+  test("the request mentions no capability the execution path lacks, and messages stay valid", async () => {
+    let n = 0;
+    const g = fixture(body => { n++; return n === 1 ? toolCompletion(body.model, "read_file", { path: "a.txt" }) : completion(body.model, "done", 5); });
+    try {
+      writeFileSync(join(g.workspace, "a.txt"), "alpha\n");
+      const result = await runFx(["ask", "--json", "--no-save", "read it"], { cwd: g.workspace, env: g.env, timeoutMs: 30000 });
+      if (result.code !== 0) throw new Error(result.stdout + result.stderr);
+      expect(g.requests).toHaveLength(2);
+      for (const request of g.requests) {
+        const text = JSON.stringify(request.body);
+        for (const needle of [...FORBIDDEN_WITHOUT_SEARCH, ...FORBIDDEN_WITHOUT_MCP]) expect([needle, text.includes(needle)]).toEqual([needle, false]);
+        const messages = request.body.messages as any[];
+        for (let i = 0; i < messages.length; i++) {
+          const calls = messages[i].role === "assistant" ? messages[i].tool_calls ?? [] : [];
+          calls.forEach((call: any, k: number) => expect(messages[i + 1 + k]?.tool_call_id).toBe(call.id));
+        }
+      }
+      // Tool-call/result pairing and order are as before: request two extends request one.
+      expect(g.requests[1].body.messages.length).toBe(g.requests[0].body.messages.length + 2);
+    } finally { g.close(); }
+  }, 60000);
+});
 
 describe("neutral model contract architecture", () => {
   test("canonical contract and invocation step have a vendor-free dependency closure", () => {

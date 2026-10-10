@@ -7,11 +7,66 @@ const types = @import("../shared/types.zig");
 
 const Allocator = std.mem.Allocator;
 
+/// Facts about the execution path of one request, resolved by the caller from
+/// authoritative sources: the provider bundle's capabilities and the MCP
+/// runtime's model-catalog snapshot. Tool projection and prompt guidance read
+/// the same facts, so a request never advertises or describes a capability the
+/// path cannot run. The defaults keep every tool, for callers that cannot resolve
+/// a fact; they never grant execution (runtime validation still decides).
+pub const ExecutionCapabilities = struct {
+    /// The selected provider can execute provider-executed tools (web search).
+    provider_executed_tools: bool = true,
+    /// At least one MCP server is configured and not disabled for this request
+    /// (`mcp.model_catalog.Snapshot.hasEnabledServer`).
+    mcp: bool = true,
+};
+
 pub const Options = struct {
     permission_mode: types.PermissionMode = .auto,
     permission_rules: types.PermissionRuleSet = .{},
     subagent_available: bool = false,
+    /// EXPERIMENTAL, off by default. When set, only these registry names are
+    /// advertised. It narrows the schemas sent to the model; it grants nothing,
+    /// and a call to an unadvertised tool is still rejected by the stream
+    /// validator before any execution.
+    experimental_allowlist: ?[]const []const u8 = null,
+    /// What the selected execution path can actually run for this request.
+    capabilities: ExecutionCapabilities = .{},
 };
+
+/// Tools that only make sense when an MCP server exists. `capability_search`
+/// stays: it also finds installed skills.
+fn requiresMcp(tool: tool_dispatch.Tool) bool {
+    return tool.executor_kind == .mcp_select_tool or tool.executor_kind == .mcp_features;
+}
+
+/// Parses a comma-separated tool name list. Whitespace around names is
+/// ignored and empty entries are dropped. The returned slice and the names
+/// borrow `text`; free only the slice.
+pub fn parseAllowlist(alloc: Allocator, text: []const u8) Allocator.Error![]const []const u8 {
+    var names: std.ArrayList([]const u8) = .empty;
+    errdefer names.deinit(alloc);
+    var parts = std.mem.splitScalar(u8, text, ',');
+    while (parts.next()) |part| {
+        const name = std.mem.trim(u8, part, " \t");
+        if (name.len != 0) try names.append(alloc, name);
+    }
+    return names.toOwnedSlice(alloc);
+}
+
+/// Names in `allowlist` that the projection did not advertise.
+pub fn unavailableAllowlistNames(
+    alloc: Allocator,
+    allowlist: []const []const u8,
+    advertised_names: []const []const u8,
+) Allocator.Error![]const []const u8 {
+    var missing: std.ArrayList([]const u8) = .empty;
+    errdefer missing.deinit(alloc);
+    for (allowlist) |name| {
+        if (!containsName(advertised_names, name)) try missing.append(alloc, name);
+    }
+    return missing.toOwnedSlice(alloc);
+}
 
 const BuildKind = enum { full, read_only };
 
@@ -557,6 +612,11 @@ fn appendBuiltinTool(
     options: Options,
 ) !void {
     if (!tool.model_visible) return;
+    if (options.experimental_allowlist) |allowlist| {
+        if (!containsName(allowlist, tool.name)) return;
+    }
+    if (!options.capabilities.provider_executed_tools and tool.provider_executed) return;
+    if (!options.capabilities.mcp and requiresMcp(tool)) return;
     if (!includeBuiltinForKind(tool.name, kind, tool_set)) return;
     if (std.mem.eql(u8, tool.name, "subagent") and !options.subagent_available) return;
     if (std.mem.eql(u8, tool.name, "vision")) return;
@@ -566,7 +626,8 @@ fn appendBuiltinTool(
     }
     try advertised_names.append(alloc, tool.name);
     if (!tool.provider_executed and tool.write_provider_advertisement_fn == null) {
-        try advertised_functions.append(alloc, tool.model_schema);
+        const schema = if (!options.capabilities.mcp) tool.model_schema_without_mcp orelse tool.model_schema else tool.model_schema;
+        try advertised_functions.append(alloc, schema);
     }
     if (tool.write_provider_advertisement_fn != null) {
         if (first_custom_guidance.*) {
@@ -783,4 +844,85 @@ test "subagent and shell selection follow host capability" {
     try expectContainsName(available.advertised_names, "subagent");
     try expectNotContainsName(available.advertised_names, "task");
     try expectContainsName(available.advertised_names, "shell");
+}
+
+test "experimental allowlist is off by default and only narrows the advertised set" {
+    const alloc = std.testing.allocator;
+    var full = try buildTestModelToolProjection(alloc, .{});
+    defer full.deinit(alloc);
+    var explicit_null = try buildTestModelToolProjection(alloc, .{ .experimental_allowlist = null });
+    defer explicit_null.deinit(alloc);
+    try std.testing.expectEqual(full.advertised_names.len, explicit_null.advertised_names.len);
+    try std.testing.expect(full.advertised_names.len > 1);
+
+    const keep = [_][]const u8{full.advertised_names[0]};
+    var narrowed = try buildTestModelToolProjection(alloc, .{ .experimental_allowlist = &keep });
+    defer narrowed.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), narrowed.advertised_names.len);
+    try std.testing.expectEqualStrings(keep[0], narrowed.advertised_names[0]);
+    // Schemas follow names: nothing outside the allowlist is advertised.
+    try std.testing.expect(narrowed.advertised_functions.len <= narrowed.advertised_names.len);
+
+    // An allowlist never adds a tool the base projection would not advertise.
+    const unknown = [_][]const u8{"no_such_tool"};
+    var none = try buildTestModelToolProjection(alloc, .{ .experimental_allowlist = &unknown });
+    defer none.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 0), none.advertised_names.len);
+    const missing = try unavailableAllowlistNames(alloc, &unknown, none.advertised_names);
+    defer alloc.free(missing);
+    try std.testing.expectEqual(@as(usize, 1), missing.len);
+}
+
+test "allowlist parsing trims names and drops empty entries" {
+    const alloc = std.testing.allocator;
+    const names = try parseAllowlist(alloc, " read_file, shell ,,edit_file ");
+    defer alloc.free(names);
+    try std.testing.expectEqual(@as(usize, 3), names.len);
+    try std.testing.expectEqualStrings("read_file", names[0]);
+    try std.testing.expectEqualStrings("shell", names[1]);
+    try std.testing.expectEqualStrings("edit_file", names[2]);
+    const empty = try parseAllowlist(alloc, "");
+    defer alloc.free(empty);
+    try std.testing.expectEqual(@as(usize, 0), empty.len);
+}
+
+test "provider-executed tools follow the provider's execution capability" {
+    const alloc = std.testing.allocator;
+    var supported = try buildTestModelToolProjection(alloc, .{});
+    defer supported.deinit(alloc);
+    var unsupported = try buildTestModelToolProjection(alloc, .{ .capabilities = .{ .provider_executed_tools = false } });
+    defer unsupported.deinit(alloc);
+    try std.testing.expect(containsName(supported.advertised_names, "web_search"));
+    try std.testing.expect(supported.custom_guidance.len > 0);
+    try std.testing.expect(!containsName(unsupported.advertised_names, "web_search"));
+    try std.testing.expectEqual(@as(usize, 0), unsupported.custom_guidance.len);
+    // Locally executed tools are untouched.
+    try std.testing.expectEqual(supported.advertised_names.len - 1, unsupported.advertised_names.len);
+}
+
+test "capability filters compose with permission denies and leave other tools alone" {
+    const alloc = std.testing.allocator;
+    var rules = [_]types.PermissionRule{.{
+        .permission = @constCast("edit"),
+        .pattern = @constCast("*"),
+        .action = .deny,
+    }};
+    var base = try buildTestModelToolProjection(alloc, .{});
+    defer base.deinit(alloc);
+    var denied = try buildTestModelToolProjection(alloc, .{ .permission_rules = .{ .rules = &rules }, .capabilities = .{ .provider_executed_tools = false, .mcp = false } });
+    defer denied.deinit(alloc);
+    for ([_][]const u8{ "web_search", "mcp_select_tool", "mcp_features" }) |name| {
+        try std.testing.expect(!containsName(denied.advertised_names, name));
+    }
+    // The permission deny still applies on top of the capability filters.
+    try std.testing.expect(containsName(base.advertised_names, "edit_file"));
+    try std.testing.expect(!containsName(denied.advertised_names, "edit_file"));
+    try std.testing.expect(containsName(denied.advertised_names, "read_file"));
+    // An allowlist narrows after the capability filters and never re-adds a filtered tool.
+    const wanted = [_][]const u8{ "web_search", "mcp_select_tool", "read_file" };
+    var narrowed = try buildTestModelToolProjection(alloc, .{ .experimental_allowlist = &wanted, .capabilities = .{ .provider_executed_tools = false, .mcp = false } });
+    defer narrowed.deinit(alloc);
+    try std.testing.expect(!containsName(narrowed.advertised_names, "web_search"));
+    try std.testing.expect(!containsName(narrowed.advertised_names, "mcp_select_tool"));
+    try std.testing.expect(containsName(narrowed.advertised_names, "read_file"));
 }

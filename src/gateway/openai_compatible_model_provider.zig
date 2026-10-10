@@ -19,6 +19,7 @@ pub const OpenAICompatibleModelProvider = struct {
     api_key_env: ?[]const u8 = null,
     tool_choice_mode: definitions.ToolChoiceMode = .omit,
     tool_schema_mode: definitions.ToolSchemaMode = .canonical,
+    finish_reason_mode: definitions.FinishReasonMode = .strict,
 
     pub fn init(id: []const u8, base_url: []const u8, model: []const u8, api_key_env: ?[]const u8) !OpenAICompatibleModelProvider {
         // Reuse the protocol configuration validator, without loading profile
@@ -251,7 +252,7 @@ fn post(alloc: Allocator, self: *OpenAICompatibleModelProvider, request: models.
             .retry_after_seconds = retry_after,
         } };
     }
-    var limits: codec.Limits = .{};
+    var limits: codec.Limits = .{ .accept_stop_with_tool_calls = self.finish_reason_mode == .accept_stop_with_tool_calls };
     if (request.max_content_bytes) |limit| limits.content_bytes = @min(limit, limits.content_bytes);
     return consume(alloc, reader, self.model, request, limits);
 }

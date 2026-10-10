@@ -25,6 +25,7 @@ pub const ParseError = Allocator.Error || error{
     InvalidEnvironmentName,
     InvalidToolChoiceMode,
     InvalidToolSchemaMode,
+    InvalidFinishReasonMode,
     InvalidModelId,
     InvalidModelMetadata,
 };
@@ -32,6 +33,9 @@ pub const ParseError = Allocator.Error || error{
 pub const Protocol = enum { @"openai-chat-completions" };
 pub const ToolChoiceMode = enum { omit, send };
 pub const ToolSchemaMode = enum { canonical, flatten_unions };
+/// `accept_stop_with_tool_calls` tolerates a `stop` finish reason on a turn that
+/// carries fully received, validated tool calls (Ollama's streaming behavior).
+pub const FinishReasonMode = enum { strict, accept_stop_with_tool_calls };
 
 /// Describes a credential slot, never a credential value. Resolution belongs at
 /// the effectful edge; `none` must omit Authorization rather than supply a token.
@@ -57,6 +61,7 @@ pub const Definition = struct {
     auth: Auth,
     tool_choice_mode: ToolChoiceMode = .omit,
     tool_schema_mode: ToolSchemaMode = .canonical,
+    finish_reason_mode: FinishReasonMode = .strict,
     reviewer_model: ?[]const u8 = null,
     model_metadata: []const ModelMetadata = &.{},
 
@@ -204,7 +209,7 @@ pub const Registry = struct {
     pub fn ensure_ollama(self: *Registry, alloc: Allocator) !void {
         if (self.get("ollama") != null) return;
         var preset = try Registry.parse_json(alloc,
-            \\{"ollama":{"protocol":"openai-chat-completions","base_url":"http://localhost:11434/v1","auth":{"type":"none"},"model_metadata":{"qwen3-coder":{"supports_tool_use":true}}}}
+            \\{"ollama":{"protocol":"openai-chat-completions","base_url":"http://localhost:11434/v1","auth":{"type":"none"},"finish_reason_mode":"accept_stop_with_tool_calls","model_metadata":{"qwen3-coder":{"supports_tool_use":true}}}}
         );
         errdefer preset.deinit(alloc);
         const combined = try alloc.alloc(Definition, self.definitions.len + 1);
@@ -227,7 +232,7 @@ pub const Registry = struct {
 
 fn parse_definition(alloc: Allocator, id: []const u8, value: std.json.Value) ParseError!Definition {
     try validate_id(id);
-    try check_fields(value, &.{ "protocol", "base_url", "auth", "tool_choice_mode", "tool_schema_mode", "reviewer_model", "model_metadata" });
+    try check_fields(value, &.{ "protocol", "base_url", "auth", "tool_choice_mode", "tool_schema_mode", "finish_reason_mode", "reviewer_model", "model_metadata" });
     const protocol = try required(value, "protocol");
     if (protocol != .string or !std.mem.eql(u8, protocol.string, "openai-chat-completions")) return error.InvalidProtocol;
     const url = try required(value, "base_url");
@@ -248,6 +253,16 @@ fn parse_definition(alloc: Allocator, id: []const u8, value: std.json.Value) Par
             .flatten_unions
         else
             return error.InvalidToolSchemaMode;
+    }
+    var finish_mode: FinishReasonMode = .strict;
+    if (value.object.get("finish_reason_mode")) |finish_mode_value| {
+        if (finish_mode_value != .string) return error.InvalidFinishReasonMode;
+        finish_mode = if (std.mem.eql(u8, finish_mode_value.string, "strict"))
+            .strict
+        else if (std.mem.eql(u8, finish_mode_value.string, "accept_stop_with_tool_calls"))
+            .accept_stop_with_tool_calls
+        else
+            return error.InvalidFinishReasonMode;
     }
     var reviewer: ?[]const u8 = null;
     if (value.object.get("reviewer_model")) |model_value| {
@@ -277,6 +292,7 @@ fn parse_definition(alloc: Allocator, id: []const u8, value: std.json.Value) Par
         .auth = owned_auth,
         .tool_choice_mode = mode,
         .tool_schema_mode = schema_mode,
+        .finish_reason_mode = finish_mode,
         .reviewer_model = owned_reviewer,
         .model_metadata = if (value.object.get("model_metadata")) |metadata| try parse_metadata(alloc, metadata) else &.{},
     };
@@ -444,7 +460,7 @@ fn hash_part(hash: *std.crypto.hash.sha2.Sha256, part: []const u8) void {
 
 const test_json =
     \\{"local":{"protocol":"openai-chat-completions","base_url":"http://localhost:11434/v1/","auth":{"type":"none"}},
-    \\"router":{"protocol":"openai-chat-completions","base_url":"https://openrouter.ai/api/v1","auth":{"type":"bearer","env":"OPENROUTER_API_KEY"},"tool_choice_mode":"send","tool_schema_mode":"flatten_unions","reviewer_model":"openai/review","model_metadata":{"openai/gpt-4.1":{"context_window":8192,"max_output_tokens":1024,"supports_tool_use":true,"supports_vision":false},"unknown":{}}}}
+    \\"router":{"protocol":"openai-chat-completions","base_url":"https://openrouter.ai/api/v1","auth":{"type":"bearer","env":"OPENROUTER_API_KEY"},"tool_choice_mode":"send","tool_schema_mode":"flatten_unions","finish_reason_mode":"accept_stop_with_tool_calls","reviewer_model":"openai/review","model_metadata":{"openai/gpt-4.1":{"context_window":8192,"max_output_tokens":1024,"supports_tool_use":true,"supports_vision":false},"unknown":{}}}}
 ;
 
 test "configured provider owns definitions and preserves unknown metadata" {
@@ -458,6 +474,7 @@ test "configured provider owns definitions and preserves unknown metadata" {
     try std.testing.expectEqual(Auth.none, local.auth);
     try std.testing.expectEqual(ToolChoiceMode.omit, local.tool_choice_mode);
     try std.testing.expectEqual(ToolSchemaMode.canonical, local.tool_schema_mode);
+    try std.testing.expectEqual(FinishReasonMode.strict, local.finish_reason_mode);
     try std.testing.expect(local.reviewer_model == null);
     const chat = try local.chat_url(alloc);
     defer alloc.free(chat);
@@ -467,6 +484,7 @@ test "configured provider owns definitions and preserves unknown metadata" {
     try std.testing.expectEqualStrings("openai/review", router.reviewer_model.?);
     try std.testing.expectEqual(ToolChoiceMode.send, router.tool_choice_mode);
     try std.testing.expectEqual(ToolSchemaMode.flatten_unions, router.tool_schema_mode);
+    try std.testing.expectEqual(FinishReasonMode.accept_stop_with_tool_calls, router.finish_reason_mode);
     const metadata = router.model("openai/gpt-4.1").?;
     try std.testing.expectEqual(@as(?u32, 8192), metadata.context_window);
     try std.testing.expectEqual(@as(?u32, 1024), metadata.max_output_tokens);
@@ -575,6 +593,8 @@ test "configured provider invalid schemas fail explicitly" {
         .{ .json = "{\"local\":{" ++ test_required_fields ++ ",\"tool_choice_mode\":null}}", .err = error.InvalidToolChoiceMode },
         .{ .json = "{\"local\":{" ++ test_required_fields ++ ",\"tool_schema_mode\":\"all\"}}", .err = error.InvalidToolSchemaMode },
         .{ .json = "{\"local\":{" ++ test_required_fields ++ ",\"tool_schema_mode\":null}}", .err = error.InvalidToolSchemaMode },
+        .{ .json = "{\"local\":{" ++ test_required_fields ++ ",\"finish_reason_mode\":\"lenient\"}}", .err = error.InvalidFinishReasonMode },
+        .{ .json = "{\"local\":{" ++ test_required_fields ++ ",\"finish_reason_mode\":null}}", .err = error.InvalidFinishReasonMode },
         .{ .json = "{\"local\":{" ++ test_required_fields ++ ",\"reviewer_model\":null}}", .err = error.InvalidModelId },
         .{ .json = "{\"local\":{" ++ test_required_fields ++ ",\"reviewer_model\":\"\"}}", .err = error.InvalidModelId },
         .{ .json = "{\"local\":{" ++ test_required_fields ++ ",\"reviewer_model\":\"bad\\nmodel\"}}", .err = error.InvalidModelId },

@@ -4516,6 +4516,12 @@ test "ACP command routes parsed options and launch config through the injected r
     try std.testing.expect(capture.launch_matches);
 }
 
+fn hostManagedConfig(base: Config) Config {
+    var cfg = base;
+    cfg.auth_mode = .host_managed;
+    return cfg;
+}
+
 test "ACP runner errors preserve their identity" {
     const Fixture = struct {
         fn run(_: ?*anyopaque, _: Allocator, _: acp_runner.Config) anyerror!void {
@@ -4527,7 +4533,9 @@ test "ACP runner errors preserve their identity" {
     cfg.acp_runner = .{ .run_fn = Fixture.run };
     try std.testing.expectError(
         error.TestAcpRunnerFailed,
-        runIfRequested(std.testing.allocator, &.{@constCast("acp")}, cfg),
+        // Host-managed auth skips the local provider requirement, keeping this test
+        // independent of the machine's ~/.fx/settings.json.
+        runIfRequested(std.testing.allocator, &.{@constCast("acp")}, hostManagedConfig(cfg)),
     );
 }
 

@@ -24,13 +24,14 @@ export function createConfiguredProviderFixture(respond?: (body: any) => Respons
   const workspace = join(home, "workspace");
   mkdirSync(workspace);
   mkdirSync(join(home, ".fx"), { mode: 0o700 });
-  const requests: Array<{ path: string; authorization: string | null; body: any }> = [];
+  const requests: Array<{ path: string; authorization: string | null; body: any; bytes: number; at: number }> = [];
   const server = Bun.serve({
     hostname: "127.0.0.1", port: 0,
     async fetch(request) {
       const path = new URL(request.url).pathname;
-      const body = request.method === "POST" ? await request.json() : null;
-      requests.push({ path, authorization: request.headers.get("authorization"), body });
+      const raw = request.method === "POST" ? await request.text() : "";
+      const body = request.method === "POST" ? JSON.parse(raw) : null;
+      requests.push({ path, authorization: request.headers.get("authorization"), body, bytes: Buffer.byteLength(raw), at: Date.now() });
       if (path !== `${apiPrefix}/chat/completions`) return new Response("unexpected endpoint", { status: 500 });
       return respond ? respond(body) : completion((body as any).model);
     },

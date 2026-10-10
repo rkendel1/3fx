@@ -1961,6 +1961,7 @@ const App = struct {
         self: *App,
         alloc: Allocator,
         permission_mode: types.PermissionMode,
+        capabilities: tool_projection.ExecutionCapabilities,
     ) !tool_projection.EffectiveToolProjection {
         self.permission_state.authority_mutex.lockUncancelable(io_mod.getIo());
         defer self.permission_state.authority_mutex.unlock(io_mod.getIo());
@@ -1968,6 +1969,7 @@ const App = struct {
             alloc,
             permission_mode,
             self.permission_engine.rules,
+            capabilities,
         );
     }
 
@@ -1976,11 +1978,13 @@ const App = struct {
         alloc: Allocator,
         permission_mode: types.PermissionMode,
         permission_rules: types.PermissionRuleSet,
+        capabilities: tool_projection.ExecutionCapabilities,
     ) !tool_projection.EffectiveToolProjection {
         return self.snapshotModelToolProjectionForRules(
             alloc,
             permission_mode,
             permission_rules,
+            capabilities,
         );
     }
 
@@ -1989,11 +1993,13 @@ const App = struct {
         alloc: Allocator,
         permission_mode: types.PermissionMode,
         permission_rules: types.PermissionRuleSet,
+        capabilities: tool_projection.ExecutionCapabilities,
     ) !tool_projection.EffectiveToolProjection {
         return tool_projection.buildModelToolProjectionForSet(alloc, self.toolAdvertisementSet(), .{
             .permission_mode = permission_mode,
             .permission_rules = permission_rules,
             .subagent_available = self.session_persistence.subagent_host != null,
+            .capabilities = capabilities,
         });
     }
 

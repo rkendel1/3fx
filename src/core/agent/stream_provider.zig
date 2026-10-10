@@ -107,6 +107,9 @@ pub const NetworkFailureEvidence = struct {
 pub const AttemptEvidence = struct {
     provider_admitted: bool = false,
     network_failure: ?NetworkFailureEvidence = null,
+    /// Bytes of the serialized request body the adapter sent. Adapters that do
+    /// not report it leave it null; it is never estimated.
+    serialized_request_bytes: ?usize = null,
 };
 
 /// Gives a cooperative single-threaded host a chance to publish UI and runtime

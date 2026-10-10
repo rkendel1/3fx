@@ -123,6 +123,137 @@ test "configured provider projects only the full shell schema when opted in" {
     try std.testing.expect(std.mem.find(u8, compatible, "\"enum\":[\"run\",\"interact\",\"stop\"]") != null);
 }
 
+const discipline_fixture = struct {
+    const observation_discipline = @import("../core/agent/runtime/observation_discipline.zig");
+
+    fn lookup(_: ?*const anyopaque, name: []const u8) ?observation_discipline.ReuseContract {
+        if (std.mem.eql(u8, name, "read_file")) return .{ .permits_reuse = true, .mutates_state = false };
+        return null;
+    }
+    const contracts: observation_discipline.ContractSource = .{ .lookup_fn = lookup };
+
+    const body = "line of file content that the model needs to see once\n" ** 80;
+
+    /// `reads` identical read_file results, optionally followed by a state change and another read.
+    fn messages(alloc: Allocator, reads: usize, change_state: bool) ![]types.ChatMessage {
+        var list: std.ArrayList(types.ChatMessage) = .empty;
+        try list.append(alloc, .{ .role = .user, .content = "inspect the file" });
+        const total = reads + @intFromBool(change_state);
+        for (0..total) |n| {
+            const id = try std.fmt.allocPrint(alloc, "call-{d}", .{n});
+            const calls = try alloc.alloc(types.ToolCall, 1);
+            const write_step = change_state and n == reads;
+            calls[0] = .{ .id = id, .name = if (write_step) "shell" else "read_file", .arguments_json = if (write_step) "{\"request\":{\"action\":\"run\",\"command\":\"echo x > a.txt\"}}" else "{\"path\":\"a.txt\"}" };
+            try list.append(alloc, .{ .role = .assistant, .tool_calls = calls });
+            try list.append(alloc, .{
+                .role = .tool,
+                .content = if (write_step) "{\"exit_code\":0}" else body,
+                .tool_call_id = id,
+                .tool_name = calls[0].name,
+                .tool_result_status = .success,
+            });
+        }
+        return list.items;
+    }
+
+    fn serialize(alloc: Allocator, conversation: []const types.ChatMessage) ![]u8 {
+        const functions = [_]@import("../core/tooling/model_tool_schema.zig").FunctionSchema{
+            @import("../builtins/tools.zig").read_file.model_schema,
+            @import("../builtins/tools.zig").shell.model_schema,
+        };
+        return codec.build_request(alloc, .{
+            .model = "model",
+            .messages = conversation,
+            .tools = .{ .advertised_names = &.{ "read_file", "shell" }, .advertised_functions = &functions },
+            .tool_choice = .auto,
+            .provider_options = .{},
+        }, .{});
+    }
+};
+
+test "context projection experiment: serialized bytes with and without reuse on repeated reads" {
+    const alloc = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const od = discipline_fixture.observation_discipline;
+
+    const conversation = try discipline_fixture.messages(a, 6, false);
+    const baseline = try od.project(a, conversation, discipline_fixture.contracts, false);
+    const projected = try od.project(a, conversation, discipline_fixture.contracts, true);
+    const baseline_wire = try discipline_fixture.serialize(a, baseline.messages);
+    const projected_wire = try discipline_fixture.serialize(a, projected.messages);
+
+    // Reuse disabled: the exact same messages, so the exact same request.
+    try std.testing.expect(baseline.messages.ptr == conversation.ptr);
+    try std.testing.expectEqual(@as(usize, 5), baseline.stats.repeated);
+    try std.testing.expectEqual(@as(usize, 0), baseline.stats.omitted);
+    // Reuse enabled: five earlier copies become references, one full copy stays.
+    try std.testing.expectEqual(@as(usize, 5), projected.stats.omitted);
+    try std.testing.expectEqual(conversation.len, projected.messages.len);
+    try std.testing.expect(projected_wire.len < baseline_wire.len);
+    // The retained copy is the newest one, so the evidence is still available.
+    try std.testing.expectEqualStrings(discipline_fixture.body, projected.messages[projected.messages.len - 1].content.?);
+    try std.testing.expect(std.mem.find(u8, projected_wire, "identical to the result of tool call call-5") != null);
+    // Every call still has exactly one result with the same id and order.
+    for (conversation, projected.messages) |before, after| {
+        try std.testing.expectEqual(before.role, after.role);
+        try std.testing.expectEqualStrings(before.tool_call_id orelse "", after.tool_call_id orelse "");
+    }
+    std.debug.print(
+        "\ncontext experiment (repeated reads): messages {d} -> {d}, serialized request bytes {d} -> {d}, omitted {d}, denied {d}\n",
+        .{ baseline.messages.len, projected.messages.len, baseline_wire.len, projected_wire.len, projected.stats.omitted, projected.stats.denied },
+    );
+}
+
+test "context projection experiment: a state change after the reads keeps every copy" {
+    const alloc = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const od = discipline_fixture.observation_discipline;
+
+    const conversation = try discipline_fixture.messages(a, 6, true);
+    const projected = try od.project(a, conversation, discipline_fixture.contracts, true);
+    try std.testing.expectEqual(@as(usize, 0), projected.stats.omitted);
+    try std.testing.expect(projected.messages.ptr == conversation.ptr);
+    const baseline_wire = try discipline_fixture.serialize(a, conversation);
+    const projected_wire = try discipline_fixture.serialize(a, projected.messages);
+    try std.testing.expectEqualStrings(baseline_wire, projected_wire);
+}
+
+test "serialized request bytes reported by the adapter match the body it builds" {
+    const alloc = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const conversation = try discipline_fixture.messages(a, 2, false);
+    const wire = try discipline_fixture.serialize(a, conversation);
+    var evidence: streams.AttemptEvidence = .{};
+    evidence.serialized_request_bytes = wire.len;
+    var meter: @import("../core/agent/runtime/context_meter.zig").ContextMeter = .{};
+    evidence.provider_admitted = true;
+    meter.recordModelCall(evidence, .{ .input_tokens = 321, .output_tokens = 9 }, conversation.len);
+    try std.testing.expectEqual(@as(u64, wire.len), meter.serialized_request_bytes);
+    // Provider tokens are separate from bytes.
+    try std.testing.expectEqual(@as(?u64, 321), meter.provider_input_tokens);
+    try std.testing.expect(meter.serialized_request_bytes != 321);
+}
+
+test "only a provider that can execute search keeps the provider-executed web-search tool" {
+    var registry = try definitions.Registry.parse_json(std.testing.allocator,
+        \\{"local":{"protocol":"openai-chat-completions","base_url":"http://localhost:1234/v1","auth":{"type":"none"}}}
+    );
+    defer registry.deinit(std.testing.allocator);
+    const configured = bundle(registry.get("local").?);
+    const gateway = @import("../builtins/gateway.zig").provider_bundle;
+    // These flags are the capability source for both tool projection and the web-search backend.
+    try std.testing.expect(!configured.capabilities.fx_search);
+    try std.testing.expect(gateway.capabilities.fx_search);
+    try std.testing.expectEqual(configured.agentFeatures().native_search, configured.capabilities.fx_search);
+    try std.testing.expectEqual(gateway.agentFeatures().native_search, gateway.capabilities.fx_search);
+}
+
 fn stream(raw: ?*anyopaque, alloc: Allocator, request: streams.ModelRequest) !streams.Result {
     if (request.cancel_flag.load(.seq_cst)) return error.Cancelled;
     const definition = definition_at(raw);
@@ -138,6 +269,7 @@ fn stream(raw: ?*anyopaque, alloc: Allocator, request: streams.ModelRequest) !st
     }
     const payload = request.prepared_request_body orelse try build(raw, alloc, request.data());
     defer if (request.prepared_request_body == null) alloc.free(payload);
+    request.attempt_evidence.serialized_request_bytes = payload.len;
     return @import("legacy_model_provider.zig").chat(alloc, definition, request, payload);
 }
 

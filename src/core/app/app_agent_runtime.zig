@@ -806,6 +806,33 @@ pub fn Runtime(comptime App: type) type {
             }
         }
 
+        /// What this request's execution path can run. Tool advertisement and the
+        /// MCP prompt guidance read the same facts: the provider bundle's search
+        /// capability, and the MCP model-catalog snapshot (read without touching
+        /// the change-notice baseline that `snapshotMcpModelCatalog` maintains).
+        pub fn executionCapabilities(
+            app: *App,
+            alloc: Allocator,
+            provider: model_provider.ProviderId,
+            permission_rules: types.PermissionRuleSet,
+        ) !tool_projection_mod.ExecutionCapabilities {
+            var capabilities: tool_projection_mod.ExecutionCapabilities = .{};
+            if (comptime @hasDecl(App, "providerSet")) {
+                capabilities.provider_executed_tools = app.providerSet().select(provider).capabilities.fx_search;
+            }
+            if (comptime @hasDecl(App, "acquireMcpRuntime")) {
+                capabilities.mcp = false;
+                if (app.acquireMcpRuntime()) |acquired| {
+                    var lease = acquired;
+                    defer lease.deinit();
+                    var snapshot = try lease.runtime.snapshotModelCatalog(alloc, permission_rules, false);
+                    defer snapshot.deinit(alloc);
+                    capabilities.mcp = snapshot.hasEnabledServer();
+                }
+            }
+            return capabilities;
+        }
+
         pub fn appendStaticContextMessage(
             app: *App,
             arena: Allocator,
@@ -1048,6 +1075,7 @@ pub fn Runtime(comptime App: type) type {
             var tool_projection = try app.snapshotModelToolProjection(
                 std.heap.c_allocator,
                 job.permission_mode,
+                try executionCapabilities(app, std.heap.c_allocator, job.provider, if (comptime @hasField(App, "permission_engine")) app.permission_engine.rules else .{}),
             );
             defer tool_projection.deinit(std.heap.c_allocator);
             const session_child_capability =
@@ -1170,10 +1198,13 @@ pub fn Runtime(comptime App: type) type {
         ) subagent_execution.ServiceError!subagent_execution.RunOutcome {
             const app: *App = @ptrCast(@alignCast(raw.?));
             const alloc = std.heap.c_allocator;
+            const child_capabilities = executionCapabilities(app, alloc, admission.provider, admission.rules) catch
+                return error.OutOfMemory;
             var child_projection = app.snapshotSubagentModelToolProjection(
                 alloc,
                 admission.permission_mode,
                 admission.rules,
+                child_capabilities,
             ) catch
                 return error.OutOfMemory;
             defer child_projection.deinit(alloc);
@@ -1746,6 +1777,7 @@ const FakeApp = struct {
         self: *FakeApp,
         alloc: Allocator,
         permission_mode: PermissionMode,
+        _: tool_projection_mod.ExecutionCapabilities,
     ) !tool_projection_mod.EffectiveToolProjection {
         self.snapshot_tools_count += 1;
         self.snapshot_permission_mode = permission_mode;
@@ -1771,6 +1803,7 @@ const FakeApp = struct {
         alloc: Allocator,
         permission_mode: PermissionMode,
         permission_rules: types.PermissionRuleSet,
+        _: tool_projection_mod.ExecutionCapabilities,
     ) !tool_projection_mod.EffectiveToolProjection {
         self.snapshot_tools_count += 1;
         self.snapshot_permission_mode = permission_mode;
@@ -2580,11 +2613,11 @@ test "app agent runtime appends static and transient context through configured 
     try Runtime(FakeApp).appendStaticContextMessage(&app, arena, null, &messages, &test_ignored_list_entries, 100, 1024, 40, 120, 2048, 2, test_gateway_chat_url);
     try Runtime(FakeApp).appendTransientRuntimeContextMessage(&app, arena, &messages, &test_ignored_list_entries, 100, 1024, 40, 120, 2048, 2, test_gateway_chat_url);
 
-    try std.testing.expectEqual(@as(usize, 3), messages.items.len);
+    // No MCP server is configured, so there is no MCP section between them.
+    try std.testing.expectEqual(@as(usize, 2), messages.items.len);
     try std.testing.expectEqual(types.ChatRole.system, messages.items[0].role);
     try std.testing.expectEqualStrings("provider static:project context", messages.items[0].content.?);
-    try std.testing.expect(std.mem.find(u8, messages.items[1].content.?, "<mcp_servers>") != null);
-    try std.testing.expectEqualStrings("provider transient:/tmp/workspace:auto", messages.items[2].content.?);
+    try std.testing.expectEqualStrings("provider transient:/tmp/workspace:auto", messages.items[1].content.?);
 }
 
 test "app agent runtime prefers active queued project context snapshot" {
@@ -2604,9 +2637,8 @@ test "app agent runtime prefers active queued project context snapshot" {
 
     try Runtime(FakeApp).appendStaticContextMessage(&app, arena, null, &messages, &test_ignored_list_entries, 100, 1024, 40, 120, 2048, 2, test_gateway_chat_url);
 
-    try std.testing.expectEqual(@as(usize, 2), messages.items.len);
+    try std.testing.expectEqual(@as(usize, 1), messages.items.len);
     try std.testing.expectEqualStrings("provider static:queued project context", messages.items[0].content.?);
-    try std.testing.expect(std.mem.find(u8, messages.items[1].content.?, "<mcp_servers>") != null);
     const tool_context = testToolContext(&app);
     try std.testing.expectEqualStrings("test.default_context", tool_context.context_registry.defaultProvider().id);
 }
@@ -2625,10 +2657,10 @@ test "app agent runtime shows MCP availability changes to the model" {
 
     try Runtime(FakeApp).appendStaticContextMessage(&app, arena, null, &messages, &test_ignored_list_entries, 100, 1024, 40, 120, 2048, 2, test_gateway_chat_url);
 
-    try std.testing.expectEqual(@as(usize, 3), messages.items.len);
-    try std.testing.expect(std.mem.find(u8, messages.items[1].content.?, "<mcp_servers>") != null);
-    try std.testing.expectEqual(types.ChatRole.system, messages.items[2].role);
-    try std.testing.expect(std.mem.find(u8, messages.items[2].content.?, "linear: authentication_required -> ready (74 tools)") != null);
+    // The change notice is independent of the (here empty) catalog section.
+    try std.testing.expectEqual(@as(usize, 2), messages.items.len);
+    try std.testing.expectEqual(types.ChatRole.system, messages.items[1].role);
+    try std.testing.expect(std.mem.find(u8, messages.items[1].content.?, "linear: authentication_required -> ready (74 tools)") != null);
 }
 
 fn makeQueuedPrompt(alloc: Allocator) !worker_runtime.CompatibilityExecutionJob {

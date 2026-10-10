@@ -4936,10 +4936,12 @@ describe("gateway stream lifecycle", () => {
         env: { ...fixtureEnv(root, gateway, tracePath), FX_TRACE_SCOPES: "agent,tool,permission" },
         timeoutMs: 15_000,
       });
-      expect(result.code).toBe(0);
+      // Exhausted shell-validation recovery is a failed turn, not a success: nothing ran.
+      expect(result.code).toBe(1);
       expect(gateway.requestCount()).toBe(2);
       expect(existsSync(marker)).toBe(false);
       const json = parseAskJson(result.stdout);
+      expect(json.exit_code).toBe(1);
       expect(json.tool_calls.filter((call) => call.name === "shell" && call.status === "error")).toHaveLength(2);
       expect(json.tool_calls.filter((call) => call.name === "read_file" && call.status === "success")).toHaveLength(2);
       const saved = await runFx(["session", "--id", json.session_id, "--json"], {

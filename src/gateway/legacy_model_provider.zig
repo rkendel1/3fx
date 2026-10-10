@@ -41,6 +41,7 @@ pub fn chat(
     });
     adapter.tool_choice_mode = definition.tool_choice_mode;
     adapter.tool_schema_mode = definition.tool_schema_mode;
+    adapter.finish_reason_mode = definition.finish_reason_mode;
     var events: Events = .{ .sink = request.events };
     var delivery: models.Delivery = .{};
     defer if (delivery.possibly_sent.load(.seq_cst)) request.delivery.markPossiblySent();

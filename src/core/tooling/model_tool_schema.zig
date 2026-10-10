@@ -76,7 +76,7 @@ pub fn isSingleRequiredObjectUnionField(
     };
 }
 
-/// Writes the narrowly recognized full shell schema with its action union
+/// Writes the narrowly recognized full or process-only shell schema with its action union
 /// projected into one object. Returns false without writing if the schema no
 /// longer matches that canonical shape.
 pub fn writeFlattenedShellSchema(
@@ -139,7 +139,7 @@ fn isExpectedShellSchema(schema: ObjectSchema) bool {
     const request = schema.properties[0];
     if (request.json_type != .object or request.bounds != null or request.description.len != 0) return false;
     const union_schema = request.shape.?.object.*;
-    if (union_schema.one_of.len != 4 or union_schema.properties.len != 0 or
+    if ((union_schema.one_of.len != 4 and union_schema.one_of.len != 3) or union_schema.properties.len != 0 or
         union_schema.required.len != 0 or union_schema.additional_properties != null or
         union_schema.min_properties != no_u32_bound or union_schema.max_properties != no_u32_bound)
     {
@@ -179,7 +179,11 @@ fn isExpectedShellSchema(schema: ObjectSchema) bool {
             stop_variants += 1;
         } else return false;
     }
-    return run_variants == 2 and interact_variants == 1 and stop_variants == 1 and
+    // Full session shell: run, run with a pty shell, interact, stop. Process-only shell
+    // (no interactive session fields): run, interact, stop.
+    const full_shape = union_schema.one_of.len == 4 and run_variants == 2;
+    const process_shape = union_schema.one_of.len == 3 and run_variants == 1;
+    return (full_shape or process_shape) and interact_variants == 1 and stop_variants == 1 and
         projectedPropertiesAreCompatible(union_schema);
 }
 
