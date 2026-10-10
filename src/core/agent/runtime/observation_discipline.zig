@@ -97,6 +97,28 @@ pub const Projection = struct {
     stats: Stats,
 };
 
+/// Why a model call is being made, derived only from the request's tail.
+pub const CallReason = enum {
+    /// The request ends with a user (or system) message, not tool results.
+    initial,
+    /// The request ends with tool results, at least one of which succeeded.
+    after_tools,
+    /// The request ends with tool results and every one of them failed or was rejected.
+    after_failed_tools,
+};
+
+pub fn callReason(messages: []const ChatMessage) CallReason {
+    var end = messages.len;
+    var any = false;
+    var all_failed = true;
+    while (end > 0 and messages[end - 1].role == .tool) : (end -= 1) {
+        any = true;
+        if (messages[end - 1].tool_result_status != .failure) all_failed = false;
+    }
+    if (!any) return .initial;
+    return if (all_failed) .after_failed_tools else .after_tools;
+}
+
 const PendingCall = struct { id: []const u8, name: []const u8, arguments: []const u8 };
 
 /// Classifies the tool results in `messages` and, when `reuse_enabled`,
@@ -417,4 +439,24 @@ test "stored images are never omitted" {
     const projection = try project(alloc, messages, test_contracts.source, true);
     try std.testing.expectEqual(@as(usize, 0), projection.stats.omitted);
     try std.testing.expectEqual(@as(usize, 1), projection.stats.denied);
+}
+
+test "call reason is derived from the request tail" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const none = try history(alloc, &.{});
+    try std.testing.expectEqual(CallReason.initial, callReason(none));
+    try std.testing.expectEqual(CallReason.initial, callReason(&.{}));
+    const ok = try history(alloc, &.{.{ .tool = "read", .args = "{}", .out = "x" }});
+    try std.testing.expectEqual(CallReason.after_tools, callReason(ok));
+    const failed = try history(alloc, &.{.{ .tool = "read", .args = "{}", .out = "e", .status = .failure }});
+    try std.testing.expectEqual(CallReason.after_failed_tools, callReason(failed));
+    // A batch with one success is not a pure failure.
+    const mixed = try history(alloc, &.{
+        .{ .tool = "read", .args = "{}", .out = "e", .status = .failure },
+        .{ .tool = "read", .args = "{\"b\":1}", .out = "x" },
+    });
+    // Two separate steps end with a single success: after_tools.
+    try std.testing.expectEqual(CallReason.after_tools, callReason(mixed));
 }

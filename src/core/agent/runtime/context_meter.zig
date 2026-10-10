@@ -32,13 +32,19 @@ pub const ContextMeter = struct {
     /// Totals over requests actually sent.
     omitted_observations: u64 = 0,
     omissions_denied: u64 = 0,
+    /// Admitted model calls by reason (see `observation_discipline.CallReason`).
+    calls_initial: u64 = 0,
+    calls_after_tools: u64 = 0,
+    calls_after_failed_tools: u64 = 0,
 
     staged: ?observation_discipline.Stats = null,
+    staged_reason: observation_discipline.CallReason = .initial,
 
     /// Records the projection built for the request about to be sent. It is
     /// committed only if that request is then admitted by the provider.
-    pub fn stage(self: *ContextMeter, stats: observation_discipline.Stats) void {
+    pub fn stage(self: *ContextMeter, stats: observation_discipline.Stats, reason: observation_discipline.CallReason) void {
         self.staged = stats;
+        self.staged_reason = reason;
     }
 
     pub fn recordToolExecution(self: *ContextMeter) void {
@@ -57,6 +63,11 @@ pub const ContextMeter = struct {
             return;
         }
         self.model_calls += 1;
+        switch (self.staged_reason) {
+            .initial => self.calls_initial += 1,
+            .after_tools => self.calls_after_tools += 1,
+            .after_failed_tools => self.calls_after_failed_tools += 1,
+        }
         self.last_request_messages = message_count;
         if (evidence.serialized_request_bytes) |bytes| {
             self.serialized_request_bytes += bytes;
@@ -82,7 +93,7 @@ pub const ContextMeter = struct {
             "context",
             "measurement",
             ctx,
-            "model_calls={d} tool_executions={d} provider_input_tokens={?d} provider_output_tokens={?d} serialized_request_bytes={d} requests_with_known_bytes={d} last_request_messages={d} repeated_observations={d} omitted_observations={d} omissions_denied={d}",
+            "model_calls={d} tool_executions={d} provider_input_tokens={?d} provider_output_tokens={?d} serialized_request_bytes={d} requests_with_known_bytes={d} last_request_messages={d} repeated_observations={d} omitted_observations={d} omissions_denied={d} calls_initial={d} calls_after_tools={d} calls_after_failed_tools={d}",
             .{
                 self.model_calls,
                 self.tool_executions,
@@ -94,6 +105,9 @@ pub const ContextMeter = struct {
                 self.repeated_observations,
                 self.omitted_observations,
                 self.omissions_denied,
+                self.calls_initial,
+                self.calls_after_tools,
+                self.calls_after_failed_tools,
             },
         );
     }
@@ -123,18 +137,22 @@ test "model calls count only admitted requests and tokens stay unknown when unre
 
 test "projection counters commit only for a request that was sent" {
     var meter: ContextMeter = .{};
-    meter.stage(.{ .repeated = 2, .omitted = 1, .denied = 3 });
+    meter.stage(.{ .repeated = 2, .omitted = 1, .denied = 3 }, .initial);
     meter.recordModelCall(.{ .provider_admitted = false }, null, 2);
     try std.testing.expectEqual(@as(u64, 0), meter.omitted_observations);
     try std.testing.expectEqual(@as(u64, 0), meter.omissions_denied);
 
-    meter.stage(.{ .repeated = 2, .omitted = 1, .denied = 3 });
+    meter.stage(.{ .repeated = 2, .omitted = 1, .denied = 3 }, .initial);
     meter.recordModelCall(.{ .provider_admitted = true }, null, 2);
-    meter.stage(.{ .repeated = 1, .omitted = 0, .denied = 1 });
+    meter.stage(.{ .repeated = 1, .omitted = 0, .denied = 1 }, .after_failed_tools);
     meter.recordModelCall(.{ .provider_admitted = true }, null, 2);
     try std.testing.expectEqual(@as(u64, 1), meter.omitted_observations);
     try std.testing.expectEqual(@as(u64, 4), meter.omissions_denied);
     try std.testing.expectEqual(@as(u64, 1), meter.repeated_observations);
+    // Reasons are committed with the same rule: the unsent request counted nothing.
+    try std.testing.expectEqual(@as(u64, 1), meter.calls_initial);
+    try std.testing.expectEqual(@as(u64, 1), meter.calls_after_failed_tools);
+    try std.testing.expectEqual(@as(u64, 0), meter.calls_after_tools);
 }
 
 test "tool executions are counted from started executions" {

@@ -4,6 +4,7 @@ import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { FX_BIN, runFx } from "../evals/eval-helpers";
 import { completion, toolCompletion, createConfiguredProviderFixture as fixture } from "./fixtures/chat-completions";
+import { scenarios, runScenario } from "../../benchmarks/sequencing/lib";
 
 async function withReasoning(response: Response, ...deltas: Record<string, unknown>[]) {
   const prefix = deltas.map(delta => `data: ${JSON.stringify({ choices: [{ index: 0, delta }] })}\n\n`).join("");
@@ -923,6 +924,57 @@ describe("local shell tool calling", () => {
         expect(toolMessages(f.requests[1].body)[0]).toContain("invalid_shell_request");
         expect(toolMessages(f.requests[1].body)[0]).toContain("\"executed\":false");
       } finally { f.close(); }
+    }
+  }, 240000);
+});
+
+// Pins the order of work FX performs per scenario (docs/runtime-sequencing.md).
+// calls = model calls by reason [initial, after tools, after failed tools].
+// A change here means the sequence of decisions, reviews or executions changed.
+describe("runtime sequencing", () => {
+  const expected: Record<string, { exit: number; reasons: string; reviews: number; proposed: number; executed: number; failed: number; output?: string }> = {
+    S1: { exit: 0, reasons: "1/0/0", reviews: 0, proposed: 0, executed: 0, failed: 0, output: "Hello." },
+    S2: { exit: 0, reasons: "1/1/0", reviews: 0, proposed: 1, executed: 1, failed: 0, output: "Read it." },
+    S3: { exit: 0, reasons: "1/3/0", reviews: 0, proposed: 3, executed: 3, failed: 0, output: "Read all." },
+    S4: { exit: 0, reasons: "1/1/0", reviews: 0, proposed: 1, executed: 1, failed: 0, output: "Written." },
+    S5: { exit: 0, reasons: "1/1/1", reviews: 0, proposed: 2, executed: 1, failed: 1, output: "Fixed." },
+    S6: { exit: 0, reasons: "1/1/1", reviews: 0, proposed: 2, executed: 2, failed: 1, output: "Recovered." },
+    // A repeated identical failure is executed once; the repeat is stopped, not run.
+    S7: { exit: 1, reasons: "1/0/1", reviews: 0, proposed: 2, executed: 1, failed: 2 },
+    // A repeated invalid call never executes.
+    S7b: { exit: 1, reasons: "1/0/1", reviews: 0, proposed: 2, executed: 0, failed: 2 },
+    S8: { exit: 0, reasons: "1/4/0", reviews: 0, proposed: 4, executed: 4, failed: 0, output: "Done." },
+    // At the step limit the second proposed call is not executed and the run is not a success.
+    S9: { exit: 1, reasons: "1/1/0", reviews: 0, proposed: 2, executed: 1, failed: 0 },
+    S10: { exit: 0, reasons: "1/1/0", reviews: 0, proposed: 1, executed: 1, failed: 0, output: "Ran." },
+    // Review is a model call: the default shell profile pays it, the clean profile's direct read-only path does not.
+    S11: { exit: 0, reasons: "1/1/0", reviews: 1, proposed: 1, executed: 1, failed: 0, output: "Listed." },
+    S12: { exit: 0, reasons: "1/1/0", reviews: 0, proposed: 1, executed: 1, failed: 0, output: "Listed." },
+    // Validation precedes review: an invalid call costs no review.
+    S13: { exit: 0, reasons: "1/0/1", reviews: 0, proposed: 1, executed: 0, failed: 1, output: "Gave up." },
+    // A clear review covers only the exact action, so an identical repeat is reviewed again.
+    S14: { exit: 0, reasons: "1/2/0", reviews: 2, proposed: 2, executed: 2, failed: 0, output: "Done." },
+    // Without --auto a state change stops after one model call, before anything runs.
+    S15: { exit: 1, reasons: "1/0/0", reviews: 0, proposed: 1, executed: 0, failed: 1 },
+  };
+
+  test("each scenario performs its work in the pinned order", async () => {
+    expect(new Set(scenarios.map(s => s.id))).toEqual(new Set(Object.keys(expected)));
+    for (const scenario of scenarios) {
+      const want = expected[scenario.id];
+      const got = await runScenario(scenario);
+      const label = `${scenario.id} ${scenario.title}`;
+      expect([label, got.exit]).toEqual([label, want.exit]);
+      expect([label, got.reasons]).toEqual([label, want.reasons]);
+      expect([label, got.review_calls]).toEqual([label, want.reviews]);
+      expect([label, got.proposed]).toEqual([label, want.proposed]);
+      expect([label, got.executed]).toEqual([label, want.executed]);
+      expect([label, got.rejected_or_failed]).toEqual([label, want.failed]);
+      // Every request extends the previous one: tools and earlier messages are unchanged (cache-stable).
+      expect([label, got.prefix_stable]).toEqual([label, true]);
+      if (want.output !== undefined) expect(got.output).toBe(want.output);
+      // Runtime evidence for the outcome: no run that ended in a stop wrote a file.
+      if (want.exit === 1) expect(got.files).toEqual([]);
     }
   }, 240000);
 });

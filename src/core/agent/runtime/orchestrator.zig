@@ -7039,7 +7039,7 @@ fn processQueuedPromptLoop(
                 observation_discipline.ContractSource.none,
                 false,
             );
-            context_meter.stage(discipline.stats);
+            context_meter.stage(discipline.stats, observation_discipline.callReason(discipline.messages));
             const result_request_messages = discipline.messages;
             if (!tool_image_capabilities_resolved and request_capabilities.image_input_support == .unknown) {
                 for (result_request_messages) |message| {
