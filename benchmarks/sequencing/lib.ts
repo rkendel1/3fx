@@ -7,7 +7,7 @@
 // request shape and call counts from runtime overhead; they say nothing about
 // real-model latency or token cost.
 import { join } from "node:path";
-import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
 import { runFx } from "../../tests/evals/eval-helpers";
 import { completion, toolCompletion, createConfiguredProviderFixture as fixture } from "../../tests/e2e/fixtures/chat-completions";
 
@@ -15,6 +15,8 @@ type Respond = (n: number, body: any, ws: string) => Response;
 export interface Scenario {
   id: string; title: string; args?: string[]; env?: Record<string, string>;
   settings?: Record<string, unknown>; respond: Respond; prepare?: (ws: string) => void;
+  /** Evaluated against the run result and workspace before the workspace is removed. */
+  success?: (result: any, workspace: string) => boolean;
 }
 
 const shell = (command: string) => ({ request: { action: "run", command } });
@@ -61,9 +63,9 @@ export const scenarios: Scenario[] = [
     } },
 ];
 
-const isReview = (body: any) => (body.tools?.length ?? 0) <= 1;
+const isReview = (body: any) => body.tools?.length === 1 && body.tools[0]?.function?.name === "permission_decision";
 
-export async function runScenario(s: Scenario) {
+export async function runScenario(s: Scenario, opts: { env?: Record<string, string> } = {}) {
   let n = 0;
   const f = fixture(body => {
     if (isReview(body)) return toolCompletion(MODEL(body), "permission_decision", { decision: "clear" }, "review");
@@ -75,7 +77,7 @@ export async function runScenario(s: Scenario) {
     const trace = join(f.home, "trace.log");
     const started = Date.now();
     const r = await runFx(["ask", "--json", "--no-save", ...(s.args ?? []), "do the task"], {
-      cwd: f.workspace, env: { ...f.env, ...(s.env ?? {}), FX_TRACE_LOG: trace, FX_TRACE_SCOPES: "agent,tool,context,permission" }, timeoutMs: 60000,
+      cwd: f.workspace, env: { ...f.env, ...(s.env ?? {}), ...(opts.env ?? {}), FX_TRACE_LOG: trace, FX_TRACE_SCOPES: "agent,tool,context,permission" }, timeoutMs: 60000,
     });
     const wall = Date.now() - started;
     let json: any = {}; try { json = JSON.parse(r.stdout); } catch {}
@@ -96,7 +98,39 @@ export async function runScenario(s: Scenario) {
     const part = (o: unknown) => Buffer.byteLength(JSON.stringify(o ?? null));
     const tools = first ? part(first.tools) : 0;
     const msgs = first ? part(first.messages) : 0;
-    return {
+    // Per-call purpose from successive cumulative `measurement` events (main agent calls only).
+    const cum = log.filter(l => l.includes("event=measurement")).map(l => ["calls_initial", "calls_after_tools", "calls_after_failed_tools"].map(k => Number(l.match(new RegExp(`${k}=(\\d+)`))?.[1] ?? 0)));
+    const mainPurposes: string[] = [];
+    for (let i = 0; i < cum.length; i++) {
+      const d = cum[i].map((v, k) => v - (cum[i - 1]?.[k] ?? 0));
+      mainPurposes.push(["initial", "after_tools", "after_failed_tools"][d.findIndex(x => x > 0)] ?? "unknown");
+    }
+    let mi = 0;
+    const requests = f.requests.map(q => {
+      const review = isReview(q.body);
+      const sys = (q.body.messages as any[]).filter(m => m.role === "system");
+      const conv = (q.body.messages as any[]).filter(m => m.role !== "system");
+      return {
+        purpose: review ? "reviewer" : (mainPurposes[mi++] ?? "unknown"), bytes: q.bytes, messages: q.body.messages.length,
+        tools_count: q.body.tools?.length ?? 0, tools_bytes: part(q.body.tools), instruction_bytes: part(sys), conversation_bytes: part(conv), at: q.at,
+      };
+    });
+    const sends = log.filter(l => l.includes("auto_review_send")).length;
+    const stamp = (l: string) => Number(l.split(" ")[0]);
+    let model_ms = 0, tool_ms = 0;
+    { let admitted: number | null = null; let started: number | null = null;
+      for (const l of log) {
+        if (l.includes("event=provider_admitted")) admitted = stamp(l);
+        else if (l.includes("event=measurement") && admitted !== null) { model_ms += stamp(l) - admitted; admitted = null; }
+        else if (l.includes("event=execution_start")) started = stamp(l);
+        else if (l.includes("event=execution_result") && started !== null) { tool_ms += stamp(l) - started; started = null; }
+      } }
+    const evidenceFiles = (() => { try { return readdirSync(f.workspace); } catch { return [] as string[]; } })();
+    const result = {
+      workspace: f.workspace, tools_used: calls.map((c: any) => c.name as string), workspace_files: evidenceFiles,
+      bodies: f.requests.map(q => q.body),
+      advertised: ((first?.tools ?? []) as any[]).map(t => t.function.name as string),
+      requests, total_requests: f.requests.length, reviewer_sends: sends, model_ms, tool_ms, tools_count: first?.tools?.length ?? 0,
       id: s.id, title: s.title, exit: r.code, finalSupported: undefined as unknown,
       model_calls: main.length, review_calls: reviews, reasons: `${field("calls_initial")}/${field("calls_after_tools")}/${field("calls_after_failed_tools")}`, prefix_stable: prefixOk, proposed: calls.length,
       executed: Number(field("tool_executions")), rejected_or_failed: calls.filter((c: any) => c.status !== "success").length,
@@ -107,6 +141,7 @@ export async function runScenario(s: Scenario) {
       files: ["out.txt", "fixed.txt"].filter(x => existsSync(join(f.workspace, x))),
       output: String(json.final_output ?? json.output ?? "").slice(0, 40), stderr: r.stderr.trim().split("\n").at(-1)?.slice(0, 90) ?? "",
     };
+    return { ...result, success: s.success ? s.success(result, f.workspace) : null };
   } finally { f.close(); }
 }
 

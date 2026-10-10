@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { FX_BIN, runFx } from "../evals/eval-helpers";
 import { completion, toolCompletion, createConfiguredProviderFixture as fixture } from "./fixtures/chat-completions";
 import { scenarios, runScenario } from "../../benchmarks/sequencing/lib";
+import { tasks, runTask, outcomeCorrect, CONDITIONS } from "../../benchmarks/sequencing/context";
 
 async function withReasoning(response: Response, ...deltas: Record<string, unknown>[]) {
   const prefix = deltas.map(delta => `data: ${JSON.stringify({ choices: [{ index: 0, delta }] })}\n\n`).join("");
@@ -977,6 +978,154 @@ describe("runtime sequencing", () => {
       if (want.exit === 1) expect(got.files).toEqual([]);
     }
   }, 240000);
+});
+
+// Request-context experiment invariants (docs/request-context-efficiency.md).
+describe("request context accounting", () => {
+  const task = (id: string) => tasks.find(t => t.id === id)!;
+  const scenario = (id: string) => scenarios.find(t => t.id === id)!;
+  const BASE_TOOLS = ["read_file", "glob_files", "grep_files", "edit_file", "write_file", "shell", "capability_search", "skill", "install_skill", "mcp_select_tool", "mcp_features", "ask_user_question", "web_fetch", "read_tool_result"];
+
+  function pairingValid(messages: any[]) {
+    for (let i = 0; i < messages.length; i++) {
+      const calls = messages[i].role === "assistant" ? messages[i].tool_calls ?? [] : [];
+      calls.forEach((call: any, k: number) => {
+        const result = messages[i + 1 + k];
+        if (!result || result.role !== "tool" || result.tool_call_id !== call.id) throw new Error(`unpaired tool call ${call.id} at ${i}`);
+      });
+    }
+    return true;
+  }
+
+  test("every provider request is counted once and reviewers are included", async () => {
+    for (const id of ["S1", "S5", "S11", "S12", "S13", "S14"]) {
+      const r = await runScenario(scenario(id));
+      const label = `${id} ${r.title}`;
+      const reviewers = r.requests.filter(q => q.purpose === "reviewer").length;
+      // Server-side total = main agent calls + reviewer calls, each exactly once.
+      expect([label, r.total_requests]).toEqual([label, r.model_calls + r.review_calls]);
+      expect([label, reviewers]).toEqual([label, r.review_calls]);
+      // The permission-review send events (provider attempts) agree with what the server received.
+      expect([label, r.reviewer_sends]).toEqual([label, r.review_calls]);
+      expect([label, r.requests.length]).toEqual([label, r.total_requests]);
+      expect(r.requests.every(q => q.purpose !== "unknown")).toBe(true);
+    }
+  }, 120000);
+
+  test("request purposes agree with what was actually sent", async () => {
+    const purposes = async (id: string) => (await runScenario(scenario(id))).requests.map(q => q.purpose);
+    expect(await purposes("S1")).toEqual(["initial"]);
+    expect(await purposes("S2")).toEqual(["initial", "after_tools"]);
+    expect(await purposes("S5")).toEqual(["initial", "after_failed_tools", "after_tools"]);
+    expect(await purposes("S6")).toEqual(["initial", "after_failed_tools", "after_tools"]);
+    expect(await purposes("S11")).toEqual(["initial", "reviewer", "after_tools"]);
+    expect(await purposes("S14")).toEqual(["initial", "reviewer", "after_tools", "reviewer", "after_tools"]);
+  }, 120000);
+
+  test("the default request is the full schema set and the experiment variables are inert when empty or off", async () => {
+    const base = await runTask(task("C2"), "baseline");
+    expect(base.advertised).toEqual(BASE_TOOLS);
+    for (const env of [{ FX_EXPERIMENTAL_TOOL_ALLOWLIST: "" }, { FX_EXPERIMENTAL_OMIT_UNEXECUTABLE_TOOLS: "0" }]) {
+      const r = await runScenario(task("C2"), { env });
+      expect(r.advertised).toEqual(BASE_TOOLS);
+      expect(r.requests[0].tools_bytes).toBe(base.requests[0].tools_bytes);
+      expect(r.requests[0].instruction_bytes).toBe(base.requests[0].instruction_bytes);
+    }
+  }, 60000);
+
+  test("the experimental allowlist advertises exactly the selected schemas, in the original order", async () => {
+    for (const cond of ["no_mcp", "core6", "min4"]) {
+      const want = BASE_TOOLS.filter(name => CONDITIONS[cond].FX_EXPERIMENTAL_TOOL_ALLOWLIST.split(",").includes(name));
+      const r = await runTask(task("C3"), cond);
+      for (const q of r.requests.filter(x => x.purpose !== "reviewer")) expect([cond, q.tools_count]).toEqual([cond, want.length]);
+      expect([cond, r.advertised]).toEqual([cond, want]);
+    }
+  }, 120000);
+
+  test("a candidate differs from the baseline only in what the tool selection implies", async () => {
+    const a = await runTask(task("C2"), "baseline");
+    const b = await runTask(task("C2"), "core6");
+    expect(b.requests[0].tools_bytes).toBeLessThan(a.requests[0].tools_bytes);
+    // Same task and settings: base instructions and the user message are byte-identical.
+    expect(b.bodies[0].messages[0]).toEqual(a.bodies[0].messages[0]);
+    expect(b.bodies[0].messages.at(-1)).toEqual(a.bodies[0].messages.at(-1));
+    expect(b.bodies[0].model).toBe(a.bodies[0].model);
+    // Guidance for removed tools goes with them, so instructions can only shrink.
+    expect(b.requests[0].instruction_bytes).toBeLessThanOrEqual(a.requests[0].instruction_bytes);
+    expect(b.output).toBe(a.output);
+    expect(b.success && a.success).toBe(true);
+    // The omit-unexecutable candidate keeps every schema; only the unusable web_search guidance goes.
+    const c = await runTask(task("C2"), "omit_unexecutable");
+    expect(c.advertised).toEqual(a.advertised);
+    expect(c.requests[0].tools_bytes).toBe(a.requests[0].tools_bytes);
+    expect(c.requests[0].instruction_bytes).toBeLessThan(a.requests[0].instruction_bytes);
+    expect(c.requests[0].messages).toBe(a.requests[0].messages - 1);
+    expect(c.bodies[0].messages.filter((m: any) => m.role !== "system")).toEqual(a.bodies[0].messages.filter((m: any) => m.role !== "system"));
+  }, 60000);
+
+  test("tool-call and result pairing and message order stay valid and append-only under a candidate", async () => {
+    for (const cond of ["baseline", "core6", "omit_unexecutable"]) {
+      const r = await runTask(task("C3"), cond);
+      expect([cond, r.success]).toEqual([cond, true]);
+      expect([cond, r.prefix_stable]).toEqual([cond, true]);
+      const first = r.requests[0].messages;
+      expect([cond, r.requests.map(q => q.messages)]).toEqual([cond, [first, first + 2, first + 4]]);
+      for (const body of r.bodies) expect(pairingValid(body.messages)).toBe(true);
+    }
+  }, 120000);
+
+  test("a required tool that is not offered fails truthfully and never becomes a false success", async () => {
+    const t = task("C7");
+    const baseline = await runTask(t, "baseline");
+    expect(baseline.success).toBe(true);
+    const r = await runTask(t, "min4");
+    expect(r.success).toBe(false);
+    expect(r.exit).not.toBe(0);
+    expect(r.executed).toBe(0);
+    expect(r.output).not.toBe("Found.");
+    expect(r.total_requests).toBe(1);
+    expect(outcomeCorrect(t, r)).toBe(true);
+    // Removing dedicated tools can push work onto shell, which needs approval: that is a regression, not a pass.
+    const c3 = await runTask(task("C3"), "min4");
+    expect(c3.success).toBe(false);
+    expect(outcomeCorrect(task("C3"), c3)).toBe(false);
+  }, 60000);
+
+  test("validation and authorization are unchanged under a candidate", async () => {
+    for (const id of ["S13", "S15", "S7b"]) {
+      const base = await runScenario(scenario(id));
+      const cand = await runScenario(scenario(id), { env: CONDITIONS.core6 });
+      for (const key of ["exit", "executed", "review_calls", "model_calls", "rejected_or_failed", "proposed"] as const) {
+        expect([id, key, cand[key]]).toEqual([id, key, base[key]]);
+      }
+    }
+  }, 120000);
+
+  test("an allowlist that matches nothing falls back to the full tool set with a notice", async () => {
+    const r = await runScenario(task("C2"), { env: { FX_EXPERIMENTAL_TOOL_ALLOWLIST: "no_such_tool" } });
+    expect(r.advertised).toEqual(BASE_TOOLS);
+    expect(r.stderr + "").toBeDefined();
+    expect(r.success).toBe(true);
+  }, 60000);
+
+  test("provider usage of zero is reported as zero and an unreported count stays unknown", async () => {
+    const f = fixture(body => {
+      const chunks = [
+        { id: "c", model: body.model, choices: [{ index: 0, delta: { role: "assistant", content: "ok" }, finish_reason: null }] },
+        { id: "c", model: body.model, choices: [{ index: 0, delta: {}, finish_reason: "stop" }] },
+        { id: "c", model: body.model, choices: [], usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 } },
+      ];
+      return new Response(chunks.map(v => `data: ${JSON.stringify(v)}\n\n`).join("") + "data: [DONE]\n\n", { headers: { "content-type": "text/event-stream" } });
+    });
+    try {
+      const trace = join(f.home, "trace.log");
+      const result = await runFx(["ask", "--json", "--no-save", "hello"], { cwd: f.workspace, env: { ...f.env, FX_TRACE_LOG: trace, FX_TRACE_SCOPES: "context" }, timeoutMs: 30000 });
+      if (result.code !== 0) throw new Error(result.stdout + result.stderr);
+      const last = readFileSync(trace, "utf8").split("\n").filter(l => l.includes("measurement")).at(-1)!;
+      expect(last).toContain("provider_input_tokens=0");
+      expect(last).toContain("provider_output_tokens=0");
+    } finally { f.close(); }
+  }, 45000);
 });
 
 describe("neutral model contract architecture", () => {

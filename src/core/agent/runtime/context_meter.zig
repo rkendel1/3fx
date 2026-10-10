@@ -161,3 +161,15 @@ test "tool executions are counted from started executions" {
     meter.recordToolExecution();
     try std.testing.expectEqual(@as(u64, 2), meter.tool_executions);
 }
+
+test "a reported zero is zero and an unreported count is unknown" {
+    var meter: ContextMeter = .{};
+    meter.recordModelCall(.{ .provider_admitted = true }, .{ .input_tokens = 0, .output_tokens = null }, 1);
+    // Reported zero input tokens: known and zero. Output never reported: unknown.
+    try std.testing.expectEqual(@as(?u64, 0), meter.provider_input_tokens);
+    try std.testing.expect(meter.provider_output_tokens == null);
+    // A later call that reports nothing leaves the totals as they were.
+    meter.recordModelCall(.{ .provider_admitted = true }, .{}, 1);
+    try std.testing.expectEqual(@as(?u64, 0), meter.provider_input_tokens);
+    try std.testing.expect(meter.provider_output_tokens == null);
+}

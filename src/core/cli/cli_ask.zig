@@ -2040,12 +2040,50 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
         }
     }
     const session_child_capability = ctx.sessionChildCapability();
-    var tool_projection = try buildAskGatewayToolProjection(alloc, ctx.cfg.mode_registry, options.deps.tool_set, ctx.mode_id, .{
+    // EXPERIMENTAL: FX_EXPERIMENTAL_TOOL_ALLOWLIST narrows the advertised tools
+    // for this run only. Unset (the default) leaves the full set untouched.
+    // An empty value is treated as unset so a stray export cannot remove every tool.
+    const allowlist_text = io_mod.getenv("FX_EXPERIMENTAL_TOOL_ALLOWLIST");
+    const allowlist_storage: []const []const u8 = if (allowlist_text) |text|
+        try tool_projection_mod.parseAllowlist(alloc, text)
+    else
+        &.{};
+    defer if (allowlist_text != null) alloc.free(allowlist_storage);
+    var experimental_allowlist: ?[]const []const u8 = if (allowlist_storage.len > 0) allowlist_storage else null;
+    // EXPERIMENTAL: FX_EXPERIMENTAL_OMIT_UNEXECUTABLE_TOOLS=1 stops advertising
+    // provider-executed tools the selected provider cannot execute.
+    const omit_unexecutable = if (io_mod.getenv("FX_EXPERIMENTAL_OMIT_UNEXECUTABLE_TOOLS")) |value| std.mem.eql(u8, value, "1") else false;
+    const projection_options: tool_projection_mod.Options = .{
         .permission_mode = ctx.permission_mode,
         .permission_rules = ctx.permission_rules,
         .subagent_available = ctx.subagent_host != null,
-    }, session_child_capability != null);
+        .experimental_allowlist = experimental_allowlist,
+        .provider_executed_available = !omit_unexecutable or ctx.cfg.provider_set.select(ctx.provider).agentFeatures().native_search,
+    };
+    var tool_projection = try buildAskGatewayToolProjection(alloc, ctx.cfg.mode_registry, options.deps.tool_set, ctx.mode_id, projection_options, session_child_capability != null);
     defer tool_projection.deinit(alloc);
+    if (experimental_allowlist != null and tool_projection.advertised_names.len == 0) {
+        // An allowlist that matches nothing must not leave the model without tools.
+        try ctx.writeStderr("fx ask: experimental tool allowlist matched no available tool; using the full tool set\n");
+        experimental_allowlist = null;
+        tool_projection.deinit(alloc);
+        var fallback_options = projection_options;
+        fallback_options.experimental_allowlist = null;
+        tool_projection = try buildAskGatewayToolProjection(alloc, ctx.cfg.mode_registry, options.deps.tool_set, ctx.mode_id, fallback_options, session_child_capability != null);
+    }
+    if (experimental_allowlist) |list| {
+        const missing = try tool_projection_mod.unavailableAllowlistNames(alloc, list, tool_projection.advertised_names);
+        defer alloc.free(missing);
+        var notice: std.ArrayList(u8) = .empty;
+        defer notice.deinit(alloc);
+        try notice.print(alloc, "fx ask: experimental tool allowlist active; advertising {d} tool(s)", .{tool_projection.advertised_names.len});
+        for (missing, 0..) |name, index| {
+            try notice.appendSlice(alloc, if (index == 0) "; unavailable: " else ", ");
+            try notice.appendSlice(alloc, name);
+        }
+        try notice.append(alloc, '\n');
+        try ctx.writeStderr(notice.items);
+    }
 
     const context_history = try ctx.session.snapshotHistory(alloc);
     defer types.freeHistoryTurnSlice(alloc, context_history);

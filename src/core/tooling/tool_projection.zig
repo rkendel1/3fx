@@ -11,7 +11,44 @@ pub const Options = struct {
     permission_mode: types.PermissionMode = .auto,
     permission_rules: types.PermissionRuleSet = .{},
     subagent_available: bool = false,
+    /// EXPERIMENTAL, off by default. When set, only these registry names are
+    /// advertised. It narrows the schemas sent to the model; it grants nothing,
+    /// and a call to an unadvertised tool is still rejected by the stream
+    /// validator before any execution.
+    experimental_allowlist: ?[]const []const u8 = null,
+    /// EXPERIMENTAL. False omits provider-executed tools (name and guidance)
+    /// because the selected provider cannot execute them. The default keeps
+    /// today's behavior of advertising them.
+    provider_executed_available: bool = true,
 };
+
+/// Parses a comma-separated tool name list. Whitespace around names is
+/// ignored and empty entries are dropped. The returned slice and the names
+/// borrow `text`; free only the slice.
+pub fn parseAllowlist(alloc: Allocator, text: []const u8) Allocator.Error![]const []const u8 {
+    var names: std.ArrayList([]const u8) = .empty;
+    errdefer names.deinit(alloc);
+    var parts = std.mem.splitScalar(u8, text, ',');
+    while (parts.next()) |part| {
+        const name = std.mem.trim(u8, part, " \t");
+        if (name.len != 0) try names.append(alloc, name);
+    }
+    return names.toOwnedSlice(alloc);
+}
+
+/// Names in `allowlist` that the projection did not advertise.
+pub fn unavailableAllowlistNames(
+    alloc: Allocator,
+    allowlist: []const []const u8,
+    advertised_names: []const []const u8,
+) Allocator.Error![]const []const u8 {
+    var missing: std.ArrayList([]const u8) = .empty;
+    errdefer missing.deinit(alloc);
+    for (allowlist) |name| {
+        if (!containsName(advertised_names, name)) try missing.append(alloc, name);
+    }
+    return missing.toOwnedSlice(alloc);
+}
 
 const BuildKind = enum { full, read_only };
 
@@ -557,6 +594,10 @@ fn appendBuiltinTool(
     options: Options,
 ) !void {
     if (!tool.model_visible) return;
+    if (options.experimental_allowlist) |allowlist| {
+        if (!containsName(allowlist, tool.name)) return;
+    }
+    if (tool.provider_executed and !options.provider_executed_available) return;
     if (!includeBuiltinForKind(tool.name, kind, tool_set)) return;
     if (std.mem.eql(u8, tool.name, "subagent") and !options.subagent_available) return;
     if (std.mem.eql(u8, tool.name, "vision")) return;
@@ -783,4 +824,58 @@ test "subagent and shell selection follow host capability" {
     try expectContainsName(available.advertised_names, "subagent");
     try expectNotContainsName(available.advertised_names, "task");
     try expectContainsName(available.advertised_names, "shell");
+}
+
+test "experimental allowlist is off by default and only narrows the advertised set" {
+    const alloc = std.testing.allocator;
+    var full = try buildTestModelToolProjection(alloc, .{});
+    defer full.deinit(alloc);
+    var explicit_null = try buildTestModelToolProjection(alloc, .{ .experimental_allowlist = null });
+    defer explicit_null.deinit(alloc);
+    try std.testing.expectEqual(full.advertised_names.len, explicit_null.advertised_names.len);
+    try std.testing.expect(full.advertised_names.len > 1);
+
+    const keep = [_][]const u8{full.advertised_names[0]};
+    var narrowed = try buildTestModelToolProjection(alloc, .{ .experimental_allowlist = &keep });
+    defer narrowed.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), narrowed.advertised_names.len);
+    try std.testing.expectEqualStrings(keep[0], narrowed.advertised_names[0]);
+    // Schemas follow names: nothing outside the allowlist is advertised.
+    try std.testing.expect(narrowed.advertised_functions.len <= narrowed.advertised_names.len);
+
+    // An allowlist never adds a tool the base projection would not advertise.
+    const unknown = [_][]const u8{"no_such_tool"};
+    var none = try buildTestModelToolProjection(alloc, .{ .experimental_allowlist = &unknown });
+    defer none.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 0), none.advertised_names.len);
+    const missing = try unavailableAllowlistNames(alloc, &unknown, none.advertised_names);
+    defer alloc.free(missing);
+    try std.testing.expectEqual(@as(usize, 1), missing.len);
+}
+
+test "allowlist parsing trims names and drops empty entries" {
+    const alloc = std.testing.allocator;
+    const names = try parseAllowlist(alloc, " read_file, shell ,,edit_file ");
+    defer alloc.free(names);
+    try std.testing.expectEqual(@as(usize, 3), names.len);
+    try std.testing.expectEqualStrings("read_file", names[0]);
+    try std.testing.expectEqualStrings("shell", names[1]);
+    try std.testing.expectEqualStrings("edit_file", names[2]);
+    const empty = try parseAllowlist(alloc, "");
+    defer alloc.free(empty);
+    try std.testing.expectEqual(@as(usize, 0), empty.len);
+}
+
+test "provider-executed tools are omitted only when the experiment says the provider cannot run them" {
+    const alloc = std.testing.allocator;
+    var default_projection = try buildTestModelToolProjection(alloc, .{});
+    defer default_projection.deinit(alloc);
+    var omitted = try buildTestModelToolProjection(alloc, .{ .provider_executed_available = false });
+    defer omitted.deinit(alloc);
+    try std.testing.expect(containsName(default_projection.advertised_names, "web_search"));
+    try std.testing.expect(default_projection.custom_guidance.len > 0);
+    try std.testing.expect(!containsName(omitted.advertised_names, "web_search"));
+    try std.testing.expectEqual(@as(usize, 0), omitted.custom_guidance.len);
+    // Locally executed tools are untouched.
+    try std.testing.expectEqual(default_projection.advertised_names.len - 1, omitted.advertised_names.len);
 }
