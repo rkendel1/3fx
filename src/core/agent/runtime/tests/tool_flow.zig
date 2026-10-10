@@ -5154,10 +5154,15 @@ test "processQueuedPrompt stops repeated distinct terminal corrections after the
         try std.testing.expectEqual(@as(usize, 2), step.tool_calls.len);
         try std.testing.expectEqual(@as(usize, 2), step.tool_results.len);
     }
-    try std.testing.expectEqual(@as(usize, 1), deps.system_notices.items.len);
-    try std.testing.expect(
-        std.mem.find(u8, deps.system_notices.items[0], "no shell effect") != null,
-    );
+    // Exhausted recovery ends as a failed turn, announced as operational text
+    // like the other repeated-failure guards, not as a system notice on a
+    // completed turn.
+    try std.testing.expectEqual(@as(usize, 0), deps.system_notices.items.len);
+    var announced = false;
+    for (deps.texts.items) |text| {
+        if (std.mem.find(u8, text, "no shell effect") != null) announced = true;
+    }
+    try std.testing.expect(announced);
 }
 
 test "processQueuedPrompt retains a terminal correction across valid neighboring calls" {

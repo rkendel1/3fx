@@ -863,6 +863,9 @@ describe("local shell tool calling", () => {
       try {
         const result = await runFx(["ask", "--json", "--no-save", "--full-access", "run the command"], { cwd: f.workspace, env: f.env, timeoutMs: 60000 });
         expect(result.timedOut ?? false).toBe(false);
+        // Exhausted recovery is a failed turn: a nonzero exit, never a success.
+        expect(result.code).toBe(1);
+        expect(JSON.parse(result.stdout).exit_code).toBe(1);
         expect(existsSync(join(f.workspace, "marker.txt"))).toBe(false);
         expect(f.requests.length).toBeGreaterThanOrEqual(2);
         expect(f.requests.length).toBeLessThanOrEqual(40);
