@@ -840,6 +840,57 @@ describe("local shell tool calling", () => {
     }
   }, 120000);
 
+  test("measurement comes from real events: calls, executions, request bytes, and provider usage", async () => {
+    let calls = 0;
+    const f = fixture(body => {
+      calls++;
+      return calls === 1
+        ? stopCompletion(body.model, { request: { action: "run", command: "echo measured" } }, "tool_calls")
+        : completion(body.model, "done", 12);
+    });
+    try {
+      const trace = join(f.home, "trace.log");
+      const result = await runFx(["ask", "--json", "--no-save", "--full-access", "run it"], {
+        cwd: f.workspace, env: { ...f.env, FX_TRACE_LOG: trace, FX_TRACE_SCOPES: "context" }, timeoutMs: 30000,
+      });
+      if (result.code !== 0) throw new Error(result.stdout + result.stderr);
+      const lines = readFileSync(trace, "utf8").split("\n").filter(line => line.includes("measurement"));
+      expect(lines.length).toBe(2);
+      const field = (name: string) => lines.at(-1)!.match(new RegExp(`${name}=(\\S+)`))![1];
+      expect(f.requests).toHaveLength(2);
+      expect(field("model_calls")).toBe("2");
+      expect(field("tool_executions")).toBe("1");
+      // Runtime bytes are the bodies the server actually received; provider tokens are only what it reported.
+      expect(field("serialized_request_bytes")).toBe(String(f.requests[0].bytes + f.requests[1].bytes));
+      expect(field("requests_with_known_bytes")).toBe("2");
+      expect(field("provider_input_tokens")).toBe("12");
+      expect(field("provider_output_tokens")).toBe("3");
+      expect(field("omitted_observations")).toBe("0");
+      expect(field("omissions_denied")).toBe("0");
+    } finally { f.close(); }
+  }, 45000);
+
+  test("an unreported provider usage stays unknown", async () => {
+    const f = fixture(body => {
+      const chunks = [
+        { id: "c", model: body.model, choices: [{ index: 0, delta: { role: "assistant", content: "ok" }, finish_reason: null }] },
+        { id: "c", model: body.model, choices: [{ index: 0, delta: {}, finish_reason: "stop" }] },
+      ];
+      return new Response(chunks.map(value => `data: ${JSON.stringify(value)}\n\n`).join("") + "data: [DONE]\n\n", { headers: { "content-type": "text/event-stream" } });
+    });
+    try {
+      const trace = join(f.home, "trace.log");
+      const result = await runFx(["ask", "--json", "--no-save", "hello"], {
+        cwd: f.workspace, env: { ...f.env, FX_TRACE_LOG: trace, FX_TRACE_SCOPES: "context" }, timeoutMs: 30000,
+      });
+      if (result.code !== 0) throw new Error(result.stdout + result.stderr);
+      const last = readFileSync(trace, "utf8").split("\n").filter(line => line.includes("measurement")).at(-1)!;
+      expect(last).toContain("provider_input_tokens=null");
+      expect(last).toContain("provider_output_tokens=null");
+      expect(last).toContain(`serialized_request_bytes=${f.requests[0].bytes}`);
+    } finally { f.close(); }
+  }, 45000);
+
   test("stop finish reason with tool calls stays rejected without the opt-in and never executes", async () => {
     const f = fixture(body => stopCompletion(body.model, { request: { action: "run", command: "echo run >> marker.txt" } }, "stop"));
     try {

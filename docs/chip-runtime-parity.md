@@ -143,9 +143,10 @@ changed binary, mock server that always returns an invalid shell call:
 2. Decide whether the Ollama preset should also default `tool_schema_mode` to `flatten_unions`. The direct
    Ollama experiments reported in the task support it, but they could not be reproduced here, so it was not
    changed.
-3. Request-time dedup of earlier identical read-only tool results (Chip `dedup-v1`). It rewrites earlier
-   messages, which invalidates provider prompt caches; it needs a measured comparison before adoption.
-4. Add repetition metrics (new, repeated identical, changed) to `fx ask --json`, as Chip's `ContextReport` does.
+3. Request-time dedup of earlier identical tool results (Chip `dedup-v1`): classification, the contract-gated
+   projection and measurement are implemented but reuse is disabled; see `context-discipline.md` for the missing
+   per-tool contract and state token, and for the caching caveat.
+4. Surface the new context measurements in `fx ask --json`; today they are trace events only.
 5. Report a stop reason in `fx ask --json` for runtime-initiated stops; today only the exit code and a stderr
    notice carry it. This extends a public contract, so it needs a decision.
 6. Re-point the gateway-fixture e2e tests at a configured provider so they run in the decoupled build.

@@ -63,6 +63,8 @@ test {
     _ = @import("stream_provider.zig");
     _ = @import("../compactor/compactor.zig");
     _ = @import("runtime/parallel_execution.zig");
+    _ = @import("runtime/observation_discipline.zig");
+    _ = @import("runtime/context_meter.zig");
     _ = @import("runtime/tests/gateway_flow.zig");
     _ = @import("runtime/tests/tool_flow.zig");
     _ = @import("runtime/tests/interruption_flow.zig");

@@ -58,6 +58,8 @@ const runtime_execution_memory = @import("execution_memory.zig");
 const execution_memory_helpers = @import("../execution_memory.zig");
 const runtime_agent = @import("agent.zig");
 const runtime_tool_admission = @import("tool_admission.zig");
+const observation_discipline = @import("observation_discipline.zig");
+const context_meter_mod = @import("context_meter.zig");
 const runtime_interruption = @import("interruption.zig");
 const runtime_parallel_execution = @import("parallel_execution.zig");
 const runtime_tool_batch = @import("tool_batch.zig");
@@ -6550,6 +6552,7 @@ fn processQueuedPromptLoop(
     defer shell_execution_failure_retry.deinit(arena);
     var identical_failure_escalation: runtime_tool_admission.IdenticalFailureEscalationState = .{};
     defer identical_failure_escalation.deinit(arena);
+    var context_meter: context_meter_mod.ContextMeter = .{};
     var malformed_arguments_retry: runtime_tool_admission.MalformedArgumentsRetryState = .{};
     var active_compaction_handoff: ?[]const u8 = null;
     var active_compaction_history_tail: []const ChatMessage = &.{};
@@ -7021,11 +7024,23 @@ fn processQueuedPromptLoop(
                     subagent_request_messages.len,
                 });
             }
-            const result_request_messages = try project_read_tool_result_request_messages(
+            const read_result_request_messages = try project_read_tool_result_request_messages(
                 overlay_arena,
                 read_tool_result_request_eligible,
                 subagent_request_messages,
             );
+            // Classify observations and measure what reuse would be denied.
+            // FX tools carry no reuse contract or state-freshness guarantee, so
+            // production supplies no contracts and reuse stays disabled: the
+            // request is unchanged. See docs/context-discipline.md.
+            const discipline = try observation_discipline.project(
+                overlay_arena,
+                read_result_request_messages,
+                observation_discipline.ContractSource.none,
+                false,
+            );
+            context_meter.stage(discipline.stats);
+            const result_request_messages = discipline.messages;
             if (!tool_image_capabilities_resolved and request_capabilities.image_input_support == .unknown) {
                 for (result_request_messages) |message| {
                     const memory = message.tool_result_memory orelse continue;
@@ -7382,6 +7397,8 @@ fn processQueuedPromptLoop(
                 deps.usage,
                 deps.usage_allocator,
             ) catch |err| {
+                context_meter.recordModelCall(gateway_attempt_evidence, null, last_gateway_message_count);
+                context_meter.trace(step_ctx);
                 parent_turn_delivery.observeGatewayDelivery(
                     deps,
                     overlay_arena,
@@ -7985,6 +8002,8 @@ fn processQueuedPromptLoop(
                     step_ctx,
                 );
             }
+            context_meter.recordModelCall(gateway_attempt_evidence, response_completion.usage, last_gateway_message_count);
+            context_meter.trace(step_ctx);
             runtime_assistant_stream.pushTokenProgressUpdate(&stream_ctx, summary_accumulator.reconcileTokenRequest(response_completion.usage, response_completion.delivery_ambiguous)) catch |progress_err| {
                 debug_trace.logf("agent", "token progress publication failed source=gateway_usage err={s}", .{@errorName(progress_err)});
             };
@@ -10006,6 +10025,7 @@ fn processQueuedPromptLoop(
                             "call_id={s} name={s}",
                             .{ executable_call.id, executable_call.name },
                         );
+                        context_meter.recordToolExecution();
                         if (deps.tool_activity_recorder) |recorder| {
                             recorder.record(
                                 executable_call.id,
@@ -11361,6 +11381,7 @@ fn processQueuedPromptLoop(
 
             debug_trace.eventf("tool", "before_tool_execution", step_ctx, "call_id={s} name={s}", .{ tool_call.id, tool_call.name });
             debug_trace.eventf("tool", "execution_start", step_ctx, "call_id={s} name={s}", .{ tool_call.id, tool_call.name });
+            context_meter.recordToolExecution();
             if (deps.tool_activity_recorder) |recorder| {
                 recorder.record(tool_call.id, tool_call.name, .started) catch |err| {
                     debug_trace.eventf(
