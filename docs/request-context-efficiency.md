@@ -9,6 +9,10 @@ chooses the right tool from a smaller schema, and they say nothing about tokens,
 Ollama was unavailable (`ollama.com` and `registry.ollama.ai` return HTTP 403 from the egress proxy), so every
 number below is mock-provider data. No production default changed.
 
+> Update: `FX_EXPERIMENTAL_OMIT_UNEXECUTABLE_TOOLS` and the `omit_unexecutable` condition described below were removed
+> by the capability-consistent change, which makes the default request omit tools and guidance the execution path
+> cannot run (see `capability-consistent-requests.md`). The tables below are the measurements at commit `92d003a`.
+
 Reproduce:
 
 ```

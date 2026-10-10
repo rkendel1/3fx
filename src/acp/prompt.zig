@@ -873,6 +873,7 @@ pub fn handlePrompt(
         .permission_mode = captured_permission_mode,
         .permission_rules = session.permission_rules,
         .subagent_available = state.subagent_host != null,
+        .capabilities = try acpExecutionCapabilities(alloc, state, session.provider, session.mcp, session.permission_rules),
     });
     defer tool_projection.deinit(alloc);
 
@@ -1068,6 +1069,27 @@ fn completeAcpTitleTask(state: *server.ServerState, session: *server.ActiveSessi
     }
 }
 
+/// What this session's execution path can run, from the same sources the
+/// prompt guidance uses: the provider bundle's search capability and the MCP
+/// model-catalog snapshot rendered by `appendStaticContext`.
+fn acpExecutionCapabilities(
+    alloc: Allocator,
+    state: *server.ServerState,
+    provider: model_provider.ProviderId,
+    mcp: anytype,
+    permission_rules: types.PermissionRuleSet,
+) !tool_projection_mod.ExecutionCapabilities {
+    const mcp_available = if (mcp) |runtime| blk: {
+        var snapshot = try runtime.snapshotModelCatalog(alloc, permission_rules, false);
+        defer snapshot.deinit(alloc);
+        break :blk snapshot.hasEnabledServer();
+    } else false;
+    return .{
+        .provider_executed_tools = state.cfg.provider_set.select(provider).capabilities.fx_search,
+        .mcp = mcp_available,
+    };
+}
+
 pub fn runSubagentChild(
     raw: ?*anyopaque,
     turn: *subagent_execution.TurnContext,
@@ -1085,6 +1107,11 @@ pub fn runSubagentChild(
     };
     const session_id = active.session_id;
     const captured_mode = active.mode;
+    // Resolved under the authority lock, like the rest of the captured session state.
+    const child_capabilities = acpExecutionCapabilities(alloc, state, active.provider, active.mcp, active.permission_rules) catch {
+        state.subagent_authority_mutex.unlock(io_mod.getIo());
+        return error.ProviderFailed;
+    };
     state.subagent_authority_mutex.unlock(io_mod.getIo());
     var ctx = AcpContext{
         .alloc = alloc,
@@ -1102,6 +1129,7 @@ pub fn runSubagentChild(
             .permission_mode = admission.permission_mode,
             .permission_rules = admission.rules,
             .subagent_available = true,
+            .capabilities = child_capabilities,
         },
     ) catch return error.OutOfMemory;
     defer child_projection.deinit(alloc);
@@ -4731,11 +4759,10 @@ test "ACP registry callbacks preserve snapshot bytes before transient context" {
     try deps.append_static_context.?(deps.ctx, arena, null, &messages);
     try deps.append_runtime_context(deps.ctx, arena, &messages);
 
-    try std.testing.expectEqual(@as(usize, 4), messages.items.len);
+    try std.testing.expectEqual(@as(usize, 3), messages.items.len);
     try std.testing.expectEqualStrings("base system", messages.items[0].content.?);
     try std.testing.expectEqualStrings("ACP registry context 1", messages.items[1].content.?);
-    try std.testing.expect(std.mem.find(u8, messages.items[2].content.?, "<mcp_servers>") != null);
-    try std.testing.expectEqualStrings("ACP registry transient", messages.items[3].content.?);
+    try std.testing.expectEqualStrings("ACP registry transient", messages.items[2].content.?);
     try std.testing.expectEqualStrings("ACP registry context 1", AcpContextRegistryFixture.static_context.?);
     try std.testing.expectEqual(@as(usize, 1), AcpContextRegistryFixture.transient_calls);
     try std.testing.expectEqual(

@@ -240,6 +240,20 @@ test "serialized request bytes reported by the adapter match the body it builds"
     try std.testing.expect(meter.serialized_request_bytes != 321);
 }
 
+test "only a provider that can execute search keeps the provider-executed web-search tool" {
+    var registry = try definitions.Registry.parse_json(std.testing.allocator,
+        \\{"local":{"protocol":"openai-chat-completions","base_url":"http://localhost:1234/v1","auth":{"type":"none"}}}
+    );
+    defer registry.deinit(std.testing.allocator);
+    const configured = bundle(registry.get("local").?);
+    const gateway = @import("../builtins/gateway.zig").provider_bundle;
+    // These flags are the capability source for both tool projection and the web-search backend.
+    try std.testing.expect(!configured.capabilities.fx_search);
+    try std.testing.expect(gateway.capabilities.fx_search);
+    try std.testing.expectEqual(configured.agentFeatures().native_search, configured.capabilities.fx_search);
+    try std.testing.expectEqual(gateway.agentFeatures().native_search, gateway.capabilities.fx_search);
+}
+
 fn stream(raw: ?*anyopaque, alloc: Allocator, request: streams.ModelRequest) !streams.Result {
     if (request.cancel_flag.load(.seq_cst)) return error.Cancelled;
     const definition = definition_at(raw);

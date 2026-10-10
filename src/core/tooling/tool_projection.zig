@@ -7,6 +7,20 @@ const types = @import("../shared/types.zig");
 
 const Allocator = std.mem.Allocator;
 
+/// Facts about the execution path of one request, resolved by the caller from
+/// authoritative sources: the provider bundle's capabilities and the MCP
+/// runtime's model-catalog snapshot. Tool projection and prompt guidance read
+/// the same facts, so a request never advertises or describes a capability the
+/// path cannot run. The defaults keep every tool, for callers that cannot resolve
+/// a fact; they never grant execution (runtime validation still decides).
+pub const ExecutionCapabilities = struct {
+    /// The selected provider can execute provider-executed tools (web search).
+    provider_executed_tools: bool = true,
+    /// At least one MCP server is configured and not disabled for this request
+    /// (`mcp.model_catalog.Snapshot.hasEnabledServer`).
+    mcp: bool = true,
+};
+
 pub const Options = struct {
     permission_mode: types.PermissionMode = .auto,
     permission_rules: types.PermissionRuleSet = .{},
@@ -16,11 +30,15 @@ pub const Options = struct {
     /// and a call to an unadvertised tool is still rejected by the stream
     /// validator before any execution.
     experimental_allowlist: ?[]const []const u8 = null,
-    /// EXPERIMENTAL. False omits provider-executed tools (name and guidance)
-    /// because the selected provider cannot execute them. The default keeps
-    /// today's behavior of advertising them.
-    provider_executed_available: bool = true,
+    /// What the selected execution path can actually run for this request.
+    capabilities: ExecutionCapabilities = .{},
 };
+
+/// Tools that only make sense when an MCP server exists. `capability_search`
+/// stays: it also finds installed skills.
+fn requiresMcp(tool: tool_dispatch.Tool) bool {
+    return tool.executor_kind == .mcp_select_tool or tool.executor_kind == .mcp_features;
+}
 
 /// Parses a comma-separated tool name list. Whitespace around names is
 /// ignored and empty entries are dropped. The returned slice and the names
@@ -597,7 +615,8 @@ fn appendBuiltinTool(
     if (options.experimental_allowlist) |allowlist| {
         if (!containsName(allowlist, tool.name)) return;
     }
-    if (tool.provider_executed and !options.provider_executed_available) return;
+    if (!options.capabilities.provider_executed_tools and tool.provider_executed) return;
+    if (!options.capabilities.mcp and requiresMcp(tool)) return;
     if (!includeBuiltinForKind(tool.name, kind, tool_set)) return;
     if (std.mem.eql(u8, tool.name, "subagent") and !options.subagent_available) return;
     if (std.mem.eql(u8, tool.name, "vision")) return;
@@ -607,7 +626,8 @@ fn appendBuiltinTool(
     }
     try advertised_names.append(alloc, tool.name);
     if (!tool.provider_executed and tool.write_provider_advertisement_fn == null) {
-        try advertised_functions.append(alloc, tool.model_schema);
+        const schema = if (!options.capabilities.mcp) tool.model_schema_without_mcp orelse tool.model_schema else tool.model_schema;
+        try advertised_functions.append(alloc, schema);
     }
     if (tool.write_provider_advertisement_fn != null) {
         if (first_custom_guidance.*) {
@@ -866,16 +886,43 @@ test "allowlist parsing trims names and drops empty entries" {
     try std.testing.expectEqual(@as(usize, 0), empty.len);
 }
 
-test "provider-executed tools are omitted only when the experiment says the provider cannot run them" {
+test "provider-executed tools follow the provider's execution capability" {
     const alloc = std.testing.allocator;
-    var default_projection = try buildTestModelToolProjection(alloc, .{});
-    defer default_projection.deinit(alloc);
-    var omitted = try buildTestModelToolProjection(alloc, .{ .provider_executed_available = false });
-    defer omitted.deinit(alloc);
-    try std.testing.expect(containsName(default_projection.advertised_names, "web_search"));
-    try std.testing.expect(default_projection.custom_guidance.len > 0);
-    try std.testing.expect(!containsName(omitted.advertised_names, "web_search"));
-    try std.testing.expectEqual(@as(usize, 0), omitted.custom_guidance.len);
+    var supported = try buildTestModelToolProjection(alloc, .{});
+    defer supported.deinit(alloc);
+    var unsupported = try buildTestModelToolProjection(alloc, .{ .capabilities = .{ .provider_executed_tools = false } });
+    defer unsupported.deinit(alloc);
+    try std.testing.expect(containsName(supported.advertised_names, "web_search"));
+    try std.testing.expect(supported.custom_guidance.len > 0);
+    try std.testing.expect(!containsName(unsupported.advertised_names, "web_search"));
+    try std.testing.expectEqual(@as(usize, 0), unsupported.custom_guidance.len);
     // Locally executed tools are untouched.
-    try std.testing.expectEqual(default_projection.advertised_names.len - 1, omitted.advertised_names.len);
+    try std.testing.expectEqual(supported.advertised_names.len - 1, unsupported.advertised_names.len);
+}
+
+test "capability filters compose with permission denies and leave other tools alone" {
+    const alloc = std.testing.allocator;
+    var rules = [_]types.PermissionRule{.{
+        .permission = @constCast("edit"),
+        .pattern = @constCast("*"),
+        .action = .deny,
+    }};
+    var base = try buildTestModelToolProjection(alloc, .{});
+    defer base.deinit(alloc);
+    var denied = try buildTestModelToolProjection(alloc, .{ .permission_rules = .{ .rules = &rules }, .capabilities = .{ .provider_executed_tools = false, .mcp = false } });
+    defer denied.deinit(alloc);
+    for ([_][]const u8{ "web_search", "mcp_select_tool", "mcp_features" }) |name| {
+        try std.testing.expect(!containsName(denied.advertised_names, name));
+    }
+    // The permission deny still applies on top of the capability filters.
+    try std.testing.expect(containsName(base.advertised_names, "edit_file"));
+    try std.testing.expect(!containsName(denied.advertised_names, "edit_file"));
+    try std.testing.expect(containsName(denied.advertised_names, "read_file"));
+    // An allowlist narrows after the capability filters and never re-adds a filtered tool.
+    const wanted = [_][]const u8{ "web_search", "mcp_select_tool", "read_file" };
+    var narrowed = try buildTestModelToolProjection(alloc, .{ .experimental_allowlist = &wanted, .capabilities = .{ .provider_executed_tools = false, .mcp = false } });
+    defer narrowed.deinit(alloc);
+    try std.testing.expect(!containsName(narrowed.advertised_names, "web_search"));
+    try std.testing.expect(!containsName(narrowed.advertised_names, "mcp_select_tool"));
+    try std.testing.expect(containsName(narrowed.advertised_names, "read_file"));
 }

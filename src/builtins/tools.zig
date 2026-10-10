@@ -160,6 +160,8 @@ const skill_description =
     "Load an installed skill or one required relative text resource completely. Copy the exact advertised location. Resolve paths mentioned in skill instructions from the selected skill directory, not the workspace. Read referenced text with the same location and its relative resource path. When to use: the user explicitly invokes a listed skill or the task clearly matches one. When NOT to use: installing a missing skill.";
 const capability_search_description =
     "Find installed skills and configured MCP tools for a described capability. Optionally restrict MCP results to one exact configured server. Results describe this query; no_match does not rule out another query. Use returned skill locations with skill. Matching MCP schemas are loaded automatically within the schema budget; call advertised tools directly or use mcp_select_tool for explicit selection. Do not guess identities.";
+const capability_search_skills_only_description =
+    "Find installed skills for a described capability. no_match does not rule out another query. Use returned skill locations with skill. Do not guess identities.";
 const install_skill_description =
     "Install a reusable skill from a supported source into fx managed skill storage. When to use: the user asks to install a skill or pastes a skills install command. When NOT to use: no installation is required, install packages, fetch unrelated repos, or modify project code.";
 const mcp_select_tool_description =
@@ -518,6 +520,17 @@ pub const capability_search = ToolSpec{
             .properties = &.{
                 .{ .name = "query", .json_type = .string, .bounds = &.{ .min_length = 1, .max_length = lexical_relevance.max_query_bytes }, .description = "Natural-language capability needed for the current task." },
                 .{ .name = "server", .json_type = .string, .bounds = &.{ .min_length = 1 }, .description = "Optional exact configured MCP server alias." },
+            },
+            .required = &.{"query"},
+            .additional_properties = false,
+        },
+    },
+    .model_schema_without_mcp = .{
+        .name = "capability_search",
+        .description = capability_search_skills_only_description,
+        .input_schema = .{
+            .properties = &.{
+                .{ .name = "query", .json_type = .string, .bounds = &.{ .min_length = 1, .max_length = lexical_relevance.max_query_bytes }, .description = "Natural-language capability needed for the current task." },
             },
             .required = &.{"query"},
             .additional_properties = false,
@@ -1843,4 +1856,54 @@ test "production registry keeps vision route-filtered from ordinary projections"
     inline for (&.{ &full, &read_only }) |projection| {
         try std.testing.expect(!tool_projection.containsName(projection.advertised_names, "vision"));
     }
+}
+
+test "MCP tools follow MCP availability and other tools are untouched" {
+    const alloc = std.testing.allocator;
+    var available = try tool_projection.buildModelToolProjectionForSet(alloc, advertisement_set, .{});
+    defer available.deinit(alloc);
+    var none = try tool_projection.buildModelToolProjectionForSet(alloc, advertisement_set, .{ .capabilities = .{ .mcp = false } });
+    defer none.deinit(alloc);
+    for ([_][]const u8{ "mcp_select_tool", "mcp_features" }) |name| {
+        try std.testing.expect(tool_projection.containsName(available.advertised_names, name));
+        try std.testing.expect(!tool_projection.containsName(none.advertised_names, name));
+    }
+    // capability_search also finds skills, so it stays.
+    try std.testing.expect(tool_projection.containsName(none.advertised_names, "capability_search"));
+    try std.testing.expectEqual(available.advertised_names.len - 2, none.advertised_names.len);
+}
+
+test "capability_search drops its MCP wording when no MCP server could serve the request" {
+    const alloc = std.testing.allocator;
+    var with_mcp = try tool_projection.buildModelToolProjectionForSet(alloc, advertisement_set, .{});
+    defer with_mcp.deinit(alloc);
+    var without = try tool_projection.buildModelToolProjectionForSet(alloc, advertisement_set, .{ .capabilities = .{ .mcp = false } });
+    defer without.deinit(alloc);
+    const find = struct {
+        fn schema(projection: tool_projection.EffectiveToolProjection) ?model_tool_schema.FunctionSchema {
+            for (projection.advertised_functions) |function| {
+                if (std.mem.eql(u8, function.name, "capability_search")) return function;
+            }
+            return null;
+        }
+    }.schema;
+    const a = find(with_mcp) orelse return error.TestExpectedEqual;
+    const b = find(without) orelse return error.TestExpectedEqual;
+    try std.testing.expect(std.mem.find(u8, a.description, "mcp_select_tool") != null);
+    try std.testing.expect(std.mem.find(u8, b.description, "MCP") == null);
+    try std.testing.expect(std.mem.find(u8, b.description, "mcp_") == null);
+    try std.testing.expectEqual(@as(usize, 1), b.input_schema.properties.len);
+    try std.testing.expectEqual(@as(usize, 2), a.input_schema.properties.len);
+}
+
+test "web search is advertised only for a provider that can execute it" {
+    const alloc = std.testing.allocator;
+    var supported = try tool_projection.buildModelToolProjectionForSet(alloc, advertisement_set, .{});
+    defer supported.deinit(alloc);
+    var unsupported = try tool_projection.buildModelToolProjectionForSet(alloc, advertisement_set, .{ .capabilities = .{ .provider_executed_tools = false } });
+    defer unsupported.deinit(alloc);
+    try std.testing.expect(tool_projection.containsName(supported.advertised_names, "web_search"));
+    try std.testing.expect(std.mem.find(u8, supported.custom_guidance, "Search the current public web") != null);
+    try std.testing.expect(!tool_projection.containsName(unsupported.advertised_names, "web_search"));
+    try std.testing.expectEqual(@as(usize, 0), unsupported.custom_guidance.len);
 }

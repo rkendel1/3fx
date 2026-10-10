@@ -11,7 +11,6 @@ const header =
     "A listed server is not a reason to use MCP. Use capability_search only when the task clearly needs a capability not already available locally. Pass the task and an optional exact server name. Call tools advertised after search directly. Use mcp_select_tool when a relevant result is not yet callable. Use returned identities and refine the query when needed.\n" ++
     "<mcp_servers>\n";
 const footer = "</mcp_servers>\n";
-const empty_entry = "  <none />\n";
 
 pub const Availability = enum {
     ready,
@@ -33,6 +32,19 @@ pub const ServerSummary = struct {
 
 pub const Snapshot = struct {
     servers: []ServerSummary,
+
+    /// Whether any configured server could serve this request: configured and
+    /// not disabled. This is the one MCP availability decision. The prompt
+    /// guidance (`render`) and the tool projection both read it, so FX never
+    /// describes or advertises MCP for a request that has no MCP server.
+    /// Failed, unavailable and authentication-required servers still count:
+    /// the model needs to see their state, and they may recover mid-run.
+    pub fn hasEnabledServer(self: Snapshot) bool {
+        for (self.servers) |server| {
+            if (server.availability != .disabled) return true;
+        }
+        return false;
+    }
 
     /// Returns an owned empty snapshot. The caller releases it with `deinit`.
     pub fn empty(alloc: Allocator) !Snapshot {
@@ -206,12 +218,8 @@ pub fn render(alloc: Allocator, snapshot: Snapshot) Allocator.Error!PromptSectio
 }
 
 fn renderWithLimit(alloc: Allocator, snapshot: Snapshot, limit: usize) Allocator.Error!PromptSection {
-    if (snapshot.servers.len == 0) {
-        if (!partsFit(limit, &.{ header, empty_entry, footer })) {
-            return .{ .text = try alloc.dupe(u8, "") };
-        }
-        return .{ .text = try std.mem.concat(alloc, u8, &.{ header, empty_entry, footer }) };
-    }
+    // No MCP server could serve this request: say nothing about MCP.
+    if (!snapshot.hasEnabledServer()) return .{ .text = try alloc.dupe(u8, "") };
 
     const sorted = try alloc.alloc(*const ServerSummary, snapshot.servers.len);
     defer alloc.free(sorted);
@@ -296,14 +304,6 @@ fn entriesFit(limit: usize, entries: []const []const u8, marker: ?[]const u8) bo
         if (!consume(&remaining, value.len)) return false;
     }
     return consume(&remaining, footer.len);
-}
-
-fn partsFit(limit: usize, parts: []const []const u8) bool {
-    var remaining = limit;
-    for (parts) |part| {
-        if (!consume(&remaining, part.len)) return false;
-    }
-    return true;
 }
 
 fn consume(remaining: *usize, bytes: usize) bool {
@@ -434,16 +434,33 @@ test "render encodes names and bounds omissions without revealing omitted aliase
     try std.testing.expect(std.mem.find(u8, section.text, "hidden<&\"") == null);
 }
 
-test "render explicitly reports an empty catalog" {
+test "render says nothing about MCP when no server could serve the request" {
     const alloc = std.testing.allocator;
-    var snapshot = try ownedSnapshot(alloc, &.{});
-    defer snapshot.deinit(alloc);
-
-    var section = try render(alloc, snapshot);
+    var empty = try ownedSnapshot(alloc, &.{});
+    defer empty.deinit(alloc);
+    try std.testing.expect(!empty.hasEnabledServer());
+    var section = try render(alloc, empty);
     defer section.deinit(alloc);
-
-    try std.testing.expect(std.mem.find(u8, section.text, "<none />") != null);
+    try std.testing.expectEqual(@as(usize, 0), section.text.len);
     try std.testing.expectEqual(@as(?[]u8, null), section.notice);
+
+    // Configured but disabled is not available.
+    var disabled = try ownedSnapshot(alloc, &.{.{ .name = "off", .availability = .disabled }});
+    defer disabled.deinit(alloc);
+    try std.testing.expect(!disabled.hasEnabledServer());
+    var disabled_section = try render(alloc, disabled);
+    defer disabled_section.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 0), disabled_section.text.len);
+
+    // Any non-disabled state keeps the guidance so the model can see and re-check it.
+    for ([_]Availability{ .ready, .discovering, .available_on_demand, .authentication_required, .failed, .unavailable }) |state| {
+        var one = try ownedSnapshot(alloc, &.{.{ .name = "s", .availability = state }});
+        defer one.deinit(alloc);
+        try std.testing.expect(one.hasEnabledServer());
+        var shown = try render(alloc, one);
+        defer shown.deinit(alloc);
+        try std.testing.expect(std.mem.find(u8, shown.text, "<mcp_servers>") != null);
+    }
 }
 
 fn checkRenderAllocationFailures(alloc: Allocator) !void {

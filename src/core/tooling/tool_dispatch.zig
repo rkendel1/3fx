@@ -444,6 +444,9 @@ pub const Tool = struct {
     name: []const u8,
     description: []const u8,
     model_schema: model_tool_schema.FunctionSchema,
+    /// Schema advertised instead of `model_schema` when no MCP server could
+    /// serve the request, for tools that also have a non-MCP purpose.
+    model_schema_without_mcp: ?model_tool_schema.FunctionSchema = null,
     model_visible: bool = true,
     /// fx's own discovery or bookkeeping step rather than work the user asked
     /// for. Hosts may hide these calls.

@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { execFileSync } from "node:child_process";
-import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { FX_BIN, runFx } from "../evals/eval-helpers";
 import { completion, toolCompletion, createConfiguredProviderFixture as fixture } from "./fixtures/chat-completions";
@@ -984,7 +984,9 @@ describe("runtime sequencing", () => {
 describe("request context accounting", () => {
   const task = (id: string) => tasks.find(t => t.id === id)!;
   const scenario = (id: string) => scenarios.find(t => t.id === id)!;
-  const BASE_TOOLS = ["read_file", "glob_files", "grep_files", "edit_file", "write_file", "shell", "capability_search", "skill", "install_skill", "mcp_select_tool", "mcp_features", "ask_user_question", "web_fetch", "read_tool_result"];
+  // What a configured chat-completions provider with no MCP server is actually offered.
+  const BASE_TOOLS = ["read_file", "glob_files", "grep_files", "edit_file", "write_file", "shell", "capability_search", "skill", "install_skill", "ask_user_question", "web_fetch", "read_tool_result"];
+  const MCP_TOOLS = ["mcp_select_tool", "mcp_features"];
 
   function pairingValid(messages: any[]) {
     for (let i = 0; i < messages.length; i++) {
@@ -1022,10 +1024,10 @@ describe("request context accounting", () => {
     expect(await purposes("S14")).toEqual(["initial", "reviewer", "after_tools", "reviewer", "after_tools"]);
   }, 120000);
 
-  test("the default request is the full schema set and the experiment variables are inert when empty or off", async () => {
+  test("the default request is the full set the execution path supports and the allowlist is inert when empty", async () => {
     const base = await runTask(task("C2"), "baseline");
     expect(base.advertised).toEqual(BASE_TOOLS);
-    for (const env of [{ FX_EXPERIMENTAL_TOOL_ALLOWLIST: "" }, { FX_EXPERIMENTAL_OMIT_UNEXECUTABLE_TOOLS: "0" }]) {
+    for (const env of [{ FX_EXPERIMENTAL_TOOL_ALLOWLIST: "" }]) {
       const r = await runScenario(task("C2"), { env });
       expect(r.advertised).toEqual(BASE_TOOLS);
       expect(r.requests[0].tools_bytes).toBe(base.requests[0].tools_bytes);
@@ -1034,7 +1036,7 @@ describe("request context accounting", () => {
   }, 60000);
 
   test("the experimental allowlist advertises exactly the selected schemas, in the original order", async () => {
-    for (const cond of ["no_mcp", "core6", "min4"]) {
+    for (const cond of ["core6", "min4"]) {
       const want = BASE_TOOLS.filter(name => CONDITIONS[cond].FX_EXPERIMENTAL_TOOL_ALLOWLIST.split(",").includes(name));
       const r = await runTask(task("C3"), cond);
       for (const q of r.requests.filter(x => x.purpose !== "reviewer")) expect([cond, q.tools_count]).toEqual([cond, want.length]);
@@ -1054,17 +1056,10 @@ describe("request context accounting", () => {
     expect(b.requests[0].instruction_bytes).toBeLessThanOrEqual(a.requests[0].instruction_bytes);
     expect(b.output).toBe(a.output);
     expect(b.success && a.success).toBe(true);
-    // The omit-unexecutable candidate keeps every schema; only the unusable web_search guidance goes.
-    const c = await runTask(task("C2"), "omit_unexecutable");
-    expect(c.advertised).toEqual(a.advertised);
-    expect(c.requests[0].tools_bytes).toBe(a.requests[0].tools_bytes);
-    expect(c.requests[0].instruction_bytes).toBeLessThan(a.requests[0].instruction_bytes);
-    expect(c.requests[0].messages).toBe(a.requests[0].messages - 1);
-    expect(c.bodies[0].messages.filter((m: any) => m.role !== "system")).toEqual(a.bodies[0].messages.filter((m: any) => m.role !== "system"));
   }, 60000);
 
   test("tool-call and result pairing and message order stay valid and append-only under a candidate", async () => {
-    for (const cond of ["baseline", "core6", "omit_unexecutable"]) {
+    for (const cond of ["baseline", "core6"]) {
       const r = await runTask(task("C3"), cond);
       expect([cond, r.success]).toEqual([cond, true]);
       expect([cond, r.prefix_stable]).toEqual([cond, true]);
@@ -1126,6 +1121,106 @@ describe("request context accounting", () => {
       expect(last).toContain("provider_output_tokens=0");
     } finally { f.close(); }
   }, 45000);
+});
+
+// Tool advertisements and tool-specific guidance follow the execution path (docs/capability-consistent-requests.md).
+describe("capability-consistent requests", () => {
+  const MCP_FIXTURE = join(import.meta.dirname, "fixtures", "mcp-modern-stdio.mjs");
+  const MCP_TOOLS = ["mcp_select_tool", "mcp_features"];
+  const FORBIDDEN_WITHOUT_MCP = ["mcp_select_tool", "mcp_features", "<mcp_servers>", "Configured MCP servers"];
+  const FORBIDDEN_WITHOUT_SEARCH = ["web_search", "Search the current public web"];
+
+  /** One request through the real binary; returns the first serialized request body and its text. */
+  async function firstRequest(configure?: (home: string) => void, args: string[] = []) {
+    const f = fixture(body => completion(body.model, "ok", 5));
+    try {
+      configure?.(f.home);
+      const result = await runFx(["ask", "--json", "--no-save", ...args, "hello"], { cwd: f.workspace, env: f.env, timeoutMs: 30000 });
+      if (result.code !== 0) throw new Error(result.stdout + result.stderr);
+      const body = f.requests[0].body;
+      const tools = (body.tools as any[]).map(t => t.function.name as string);
+      return { body, tools, text: JSON.stringify(body), bytes: f.requests[0].bytes, capabilitySearch: (body.tools as any[]).find(t => t.function.name === "capability_search")?.function.description as string };
+    } finally { f.close(); }
+  }
+
+  const writeMcp = (enabled: boolean) => (home: string) => {
+    mkdirSync(join(home, ".fx"), { recursive: true });
+    writeFileSync(join(home, ".fx", "mcp.json"), JSON.stringify({ mcp: { fixture: { type: "local", command: [process.execPath, MCP_FIXTURE], enabled } } }));
+  };
+
+  test("a provider that cannot execute web search gets no web-search tool or guidance", async () => {
+    const r = await firstRequest();
+    for (const needle of FORBIDDEN_WITHOUT_SEARCH) expect([needle, r.text.includes(needle)]).toEqual([needle, false]);
+    expect(r.tools).not.toContain("web_search");
+    expect(r.body.messages.filter((m: any) => m.role === "system").length).toBeGreaterThan(0);
+  }, 45000);
+
+  test("MCP support compiled into FX does not make MCP available", async () => {
+    const r = await firstRequest();
+    for (const needle of FORBIDDEN_WITHOUT_MCP) expect([needle, r.text.includes(needle)]).toEqual([needle, false]);
+    for (const name of MCP_TOOLS) expect(r.tools).not.toContain(name);
+    // capability_search stays for skills, with no MCP wording or properties.
+    expect(r.tools).toContain("capability_search");
+    expect(r.capabilitySearch).not.toMatch(/MCP|mcp_/);
+    const schema = (r.body.tools as any[]).find(t => t.function.name === "capability_search").function.parameters;
+    expect(Object.keys(schema.properties)).toEqual(["query"]);
+  }, 45000);
+
+  test("a configured MCP server that is disabled does not count as available", async () => {
+    const r = await firstRequest(writeMcp(false));
+    for (const needle of FORBIDDEN_WITHOUT_MCP) expect([needle, r.text.includes(needle)]).toEqual([needle, false]);
+    for (const name of MCP_TOOLS) expect(r.tools).not.toContain(name);
+  }, 45000);
+
+  test("a configured and enabled MCP server keeps the MCP guidance and tools", async () => {
+    const r = await firstRequest(writeMcp(true));
+    expect(r.text).toContain("<mcp_servers>");
+    expect(r.text).toContain('name=\\"fixture\\"');
+    for (const name of MCP_TOOLS) expect(r.tools).toContain(name);
+    expect(r.capabilitySearch).toContain("mcp_select_tool");
+    const schema = (r.body.tools as any[]).find(t => t.function.name === "capability_search").function.parameters;
+    expect(Object.keys(schema.properties)).toEqual(["query", "server"]);
+    // Nothing else about web search changes for a provider that cannot run it.
+    expect(r.tools).not.toContain("web_search");
+  }, 45000);
+
+  test("tools that are not advertised cannot be executed through another path", async () => {
+    for (const [tool, args] of [["web_search", { query: "fx" }], ["mcp_select_tool", { name: "mcp_fixture_echo" }], ["mcp_features", { action: "list_resources", server: "fixture" }]] as const) {
+      let calls = 0;
+      const f = fixture(body => { calls++; return calls === 1 ? toolCompletion(body.model, tool, args) : completion(body.model, "Found it.", 5); });
+      try {
+        const result = await runFx(["ask", "--json", "--no-save", "--full-access", "use it"], { cwd: f.workspace, env: f.env, timeoutMs: 30000 });
+        const json = JSON.parse(result.stdout || "{}");
+        // Truthful failure: non-zero exit, nothing executed, no success claim from the model's follow-up.
+        expect([tool, result.code]).not.toEqual([tool, 0]);
+        expect([tool, (json.tool_calls ?? []).length]).toEqual([tool, 0]);
+        expect([tool, String(json.final_output ?? "")]).not.toEqual([tool, "Found it."]);
+        expect([tool, f.requests.length]).toEqual([tool, 1]);
+      } finally { f.close(); }
+    }
+  }, 90000);
+
+  test("the request mentions no capability the execution path lacks, and messages stay valid", async () => {
+    let n = 0;
+    const g = fixture(body => { n++; return n === 1 ? toolCompletion(body.model, "read_file", { path: "a.txt" }) : completion(body.model, "done", 5); });
+    try {
+      writeFileSync(join(g.workspace, "a.txt"), "alpha\n");
+      const result = await runFx(["ask", "--json", "--no-save", "read it"], { cwd: g.workspace, env: g.env, timeoutMs: 30000 });
+      if (result.code !== 0) throw new Error(result.stdout + result.stderr);
+      expect(g.requests).toHaveLength(2);
+      for (const request of g.requests) {
+        const text = JSON.stringify(request.body);
+        for (const needle of [...FORBIDDEN_WITHOUT_SEARCH, ...FORBIDDEN_WITHOUT_MCP]) expect([needle, text.includes(needle)]).toEqual([needle, false]);
+        const messages = request.body.messages as any[];
+        for (let i = 0; i < messages.length; i++) {
+          const calls = messages[i].role === "assistant" ? messages[i].tool_calls ?? [] : [];
+          calls.forEach((call: any, k: number) => expect(messages[i + 1 + k]?.tool_call_id).toBe(call.id));
+        }
+      }
+      // Tool-call/result pairing and order are as before: request two extends request one.
+      expect(g.requests[1].body.messages.length).toBe(g.requests[0].body.messages.length + 2);
+    } finally { g.close(); }
+  }, 60000);
 });
 
 describe("neutral model contract architecture", () => {

@@ -11,12 +11,13 @@ import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { toolCompletion, completion } from "../../tests/e2e/fixtures/chat-completions";
 import { runScenario, type Scenario } from "./lib";
 
-const NO_MCP = "read_file,glob_files,grep_files,edit_file,write_file,shell,capability_search,skill,install_skill,ask_user_question,web_fetch,read_tool_result";
-/** Experimental environment per condition. `baseline` sets nothing: the production request. */
+/**
+ * Experimental environment per condition. `baseline` sets nothing: the production request, which now
+ * advertises only what the execution path can run (no web search for a provider that cannot execute it,
+ * no MCP tools or guidance without an MCP server). The allowlist conditions are separate experiments.
+ */
 export const CONDITIONS: Record<string, Record<string, string>> = {
   baseline: {},
-  omit_unexecutable: { FX_EXPERIMENTAL_OMIT_UNEXECUTABLE_TOOLS: "1" },
-  no_mcp: { FX_EXPERIMENTAL_TOOL_ALLOWLIST: NO_MCP },
   core6: { FX_EXPERIMENTAL_TOOL_ALLOWLIST: "read_file,glob_files,grep_files,edit_file,write_file,shell" },
   min4: { FX_EXPERIMENTAL_TOOL_ALLOWLIST: "read_file,edit_file,write_file,shell" },
 };
