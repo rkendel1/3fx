@@ -15,6 +15,7 @@ const streamable_http = @import("../core/mcp/streamable_http.zig");
 const slack_preset = @import("../core/mcp/slack_preset.zig");
 const profile_paths = @import("../core/shared/profile_paths.zig");
 const text_utils = @import("../core/shared/text_utils.zig");
+const appboundry_provider = @import("appboundry.zig");
 
 const Allocator = std.mem.Allocator;
 const CommandRequest = command_provider_contract.Request;
@@ -558,6 +559,8 @@ pub fn loadRuntime(
         defer alloc.free(config_path);
         profile = try loadConfigFromPath(alloc, config_path);
     }
+    // Optional AppBoundry provider: discovered servers are runtime-only and never persisted.
+    try appboundry_provider.appendDiscoveredServers(alloc, &profile);
 
     var choice_load = config_runtime.loadProjectMcpChoices(alloc, workspace_root) catch |err| {
         if (err == error.OutOfMemory) return error.OutOfMemory;

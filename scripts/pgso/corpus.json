@@ -1,6 +1,7 @@
 {
   "version": 1,
   "intentional_exclusions": {
+    "appboundry-live.test.ts": "The suite requires a live AppBoundry host, an authorized token, and explicit opt-in.",
     "ci-shards.test.ts": "The suite validates the E2E shard planner rather than fx runtime behavior.",
     "context-limits-live.test.ts": "The suite requires a real model credential and live provider responses.",
     "notifications.test.ts": "Sound-related tests are prohibited on the production training host.",
@@ -109,6 +110,7 @@
     {"name": "verify-auto-mode-reliability", "argv": ["bun", "test", "--max-concurrency", "1", "./auto-mode-reliability.test.ts"], "test_file": "auto-mode-reliability.test.ts"},
     {"name": "verify-sessions-v2", "argv": ["bun", "test", "--max-concurrency", "1", "./sessions-v2.test.ts"], "test_file": "sessions-v2.test.ts"},
     {"name": "verify-review-model-override", "argv": ["bun", "test", "--max-concurrency", "1", "./review-model-override.test.ts"], "test_file": "review-model-override.test.ts", "requires_tmux": false},
+    {"name": "verify-appboundry", "argv": ["bun", "test", "--max-concurrency", "1", "./appboundry.test.ts"], "test_file": "appboundry.test.ts", "requires_tmux": false},
     {"name": "verify-configured-providers", "argv": ["bun", "test", "--max-concurrency", "1", "./configured-providers.test.ts"], "test_file": "configured-providers.test.ts", "requires_tmux": false},
     {"name": "verify-oauth-keychain-migration", "argv": ["bun", "test", "--max-concurrency", "1", "./oauth-keychain-migration.test.ts"], "test_file": "oauth-keychain-migration.test.ts", "allow_keychain": true},
     {"name": "verify-tui-auth-source-selection", "argv": ["bun", "test", "--max-concurrency", "1", "./tui-auth-source-selection.test.ts"], "test_file": "tui-auth-source-selection.test.ts"},

@@ -186,6 +186,15 @@ ACP clients can keep their MCP tools loaded on every turn, steer a running turn,
 
 The SDK is published to npm as [libfx](https://www.npmjs.com/package/libfx). See the [WebAssembly SDK](sdk/README.md) and the runnable Node.js, browser, Next.js, and Nuxt [examples](examples/README.md). The WebAssembly SDK is experimental.
 
+## AppBoundry capabilities
+
+fx can discover and call governed capabilities published by an AppBoundry host.
+Set `FX_APPBOUNDRY_URL` and `FX_APPBOUNDRY_TOKEN`, and each running application
+appears as an `appboundry_<selector>` MCP server whose tools the model selects
+and loads on demand. AppBoundry keeps authentication, scopes, and execution; fx
+sends the token only to the configured host. See
+[AppBoundry capability provider](docs/appboundry-provider.md).
+
 ## Connect your Slack account
 
 Run `/mcp add slack` in an fx session, or `fx mcp add slack` from your terminal.
