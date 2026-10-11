@@ -57,6 +57,7 @@ VERIFICATION_E2E_TESTS = (
     "auto-mode-reliability.test.ts",
     "sessions-v2.test.ts",
     "review-model-override.test.ts",
+    "appboundry.test.ts",
     "configured-providers.test.ts",
     "oauth-keychain-migration.test.ts",
     "tui-auth-source-selection.test.ts",
@@ -80,6 +81,7 @@ VERIFICATION_E2E_TESTS = (
 )
 
 EXCLUDED_E2E_TESTS = (
+    "appboundry-live.test.ts",
     "ci-shards.test.ts",
     "context-limits-live.test.ts",
     "notifications.test.ts",
@@ -372,7 +374,7 @@ class PgsoCorpusTests(unittest.TestCase):
             tuple(test_file for test_file, _ in corpus.intentional_exclusions),
         )
         self.assertEqual(35, len(corpus.scenarios))
-        self.assertEqual(59, len(corpus.candidate_scenarios))
+        self.assertEqual(60, len(corpus.candidate_scenarios))
         self.assertEqual(
             {
                 "direct-help": 100,

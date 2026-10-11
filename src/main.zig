@@ -4909,6 +4909,8 @@ test {
     _ = @import("core/tooling/tool_specs.zig");
     _ = @import("builtins/commands.zig");
     _ = @import("builtins/mcp.zig");
+    _ = @import("builtins/appboundry.zig");
+    _ = @import("core/mcp/appboundry.zig");
     _ = @import("builtins/modes.zig");
     _ = @import("builtins/tools.zig");
     _ = @import("tools/agent/ask_user_question.zig");
