@@ -1184,6 +1184,25 @@ test "chat completions cumulative usage advances to final counts without double 
     try std.testing.expectEqualStrings("hello world", result.completed.completion.content.?);
 }
 
+test "chat completions leaked textual tool-call markup stays plain content and never becomes a call" {
+    // Captured from Ollama qwen3-coder: the model omitted the opening
+    // <tool_call> tag, so Ollama's parser passed the block through as content
+    // with finish_reason "stop" and no tool_calls.
+    const alloc = std.testing.allocator;
+    var reducer = try Reducer.init(alloc, test_tool_request(), .{});
+    defer reducer.deinit();
+    const text = "I'll inspect the current workspace.\\n\\n<function=shell>\\n<parameter=request>\\n{\\\"action\\\": \\\"run\\\", \\\"command\\\": \\\"git branch --show-current\\\"}\\n</parameter>\\n</function>\\n</tool_call>";
+    const chunk = try std.fmt.allocPrint(alloc, "{{\"choices\":[{{\"index\":0,\"delta\":{{\"role\":\"assistant\",\"content\":\"{s}\"}},\"finish_reason\":null}}]}}", .{text});
+    defer alloc.free(chunk);
+    try test_accept(&reducer, chunk);
+    var result = try test_finish(&reducer, test_stop);
+    defer result.deinit(alloc);
+    const completion = result.completed.completion;
+    try std.testing.expectEqual(@as(usize, 0), completion.tool_calls.len);
+    try std.testing.expect(completion.finish_reason == .stop);
+    try std.testing.expect(std.mem.indexOf(u8, completion.content.?, "<function=shell>") != null);
+}
+
 test "chat completions reasoning deltas own decoded text and preserve null empty aliases" {
     const alloc = std.testing.allocator;
     var reducer = try Reducer.init(alloc, test_request(), .{});

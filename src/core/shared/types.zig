@@ -1595,6 +1595,13 @@ pub const ProviderFailureCause = enum {
     gateway_stream_timeout,
     non_retryable,
     rate_limited,
+    /// The model wrote a tool call as plain text instead of a structured call.
+    /// Terminal like `non_retryable`; the text is never executed.
+    malformed_tool_call,
+
+    pub fn isTerminal(cause: ?ProviderFailureCause) bool {
+        return cause == .non_retryable or cause == .malformed_tool_call;
+    }
 };
 
 pub const ProviderServiceTier = enum {

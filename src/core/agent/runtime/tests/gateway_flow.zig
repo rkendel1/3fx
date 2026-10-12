@@ -8155,6 +8155,33 @@ test "processQueuedPrompt stops nonretryable provider outcomes without releasing
     try std.testing.expectEqual(@as(usize, 0), interrupted.execution.tool_steps.len);
 }
 
+test "processQueuedPrompt fails a malformed textual tool call without retry or execution" {
+    const alloc = std.testing.allocator;
+    const markup = "<function=shell>\n<parameter=request>\n{\"action\":\"run\",\"command\":\"git status\"}\n</parameter>\n</function>";
+    const chunks = [_][]const u8{markup};
+    const completions = [_]FakeCompletion{
+        .{ .chunks = &chunks, .content = markup, .finish_reason = .provider_error, .provider_failure_cause = .malformed_tool_call, .provider_failure_detail = "malformed_tool_call: model wrote a call to shell as plain text instead of a structured tool call; nothing was executed" },
+        .{ .content = "must not be requested" },
+    };
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+    var fixture = PromptFixture{};
+    var config = fixture.config();
+    config.max_provider_attempts = 2;
+
+    try std.testing.expectError(error.MalformedToolCall, runFakePrompt(&gateway, &hooks, config, fixture.job()));
+    try std.testing.expectEqual(@as(usize, 1), gateway.request_models.items.len);
+    try std.testing.expectEqual(@as(usize, 0), hooks.executed_names.items.len);
+    try std.testing.expectEqual(@as(usize, 1), hooks.system_notices.items.len);
+    try std.testing.expect(std.mem.find(u8, hooks.system_notices.items[0], "malformed_tool_call") != null);
+    try std.testing.expectEqual(@as(usize, 1), hooks.history_turns.items.len);
+    const interrupted = hooks.history_turns.items[0].interrupted;
+    try std.testing.expectEqualStrings(markup, interrupted.assistant.?);
+    try std.testing.expectEqual(@as(usize, 0), interrupted.execution.tool_steps.len);
+}
+
 test "processQueuedPrompt spacer newline is skipped for ask first tool" {
     const alloc = std.testing.allocator;
     const chunks = [_][]const u8{"Using tool"};

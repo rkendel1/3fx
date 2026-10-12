@@ -71,6 +71,10 @@ For a named provider that needs a shell-schema compatibility projection, set `to
 
 The default `canonical` mode is unchanged. `flatten_unions` omits `oneOf` only from the recognized built-in `shell` schema; it advertises `run`, `interact`, and `stop` through one broader request object. FX still validates every shell request against the canonical action-specific contract before execution. This setting is an opt-in compatibility measure for a provider/model combination that does not return structured tool calls for the canonical schema; it does not imply that all Ollama models or compatible endpoints need it.
 
+### Tool calls written as plain text
+
+Some local models intermittently write a tool call as ordinary text, for example `<function=shell>` followed by `<parameter=request>` and `</function>`, instead of returning a structured `tool_calls` entry. When a turn ends normally with tools advertised, no structured calls, and text that opens such a block for an advertised tool outside a fenced code block, fx fails the run with the `MalformedToolCall` error and exits nonzero. The response text is kept in the output, `steps` and `tool_calls` count only real structured execution, and fx never executes or parses commands from that text. Prose or fenced examples that only mention the syntax remain normal answers. fx does not retry automatically; rerun the request, or choose a model whose server returns structured calls reliably.
+
 ## Inspect configuration
 
 ```bash
