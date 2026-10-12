@@ -325,6 +325,29 @@ fn render_input_required_fallible(
     return try out.toOwnedSlice();
 }
 
+/// Largest `_meta` object kept verbatim when a result is truncated. Evidence
+/// such as AppBoundry's `appboundry/authorization` and `appboundry/evidence`
+/// travels in `_meta`, separately from the user-facing text that the cap
+/// shortens. Anything larger is reported as omitted, never partially kept.
+const max_truncated_meta_bytes: usize = 8 * 1024;
+
+const TruncatedMeta = struct {
+    /// Sanitized JSON of `_meta`, or null when absent or omitted.
+    json: ?[]const u8 = null,
+    /// `_meta` existed but was too large to keep.
+    omitted: bool = false,
+};
+
+fn project_truncated_meta(arena: Allocator, result: std.json.Value) !TruncatedMeta {
+    if (result != .object) return .{};
+    const meta = result.object.get("_meta") orelse return .{};
+    var out = std.Io.Writer.Allocating.init(arena);
+    try writeJsonProjection(arena, &out.writer, meta, false);
+    const json = out.writer.buffered();
+    if (json.len > max_truncated_meta_bytes) return .{ .omitted = true };
+    return .{ .json = json };
+}
+
 fn serialize_capped(
     alloc: Allocator,
     server_name: []const u8,
@@ -344,6 +367,7 @@ fn serialize_capped(
     }
 
     const combined = try collect_result_text(arena, result);
+    const meta = try project_truncated_meta(arena, result);
     const marker = try std.fmt.allocPrint(
         arena,
         "\n... [mcp tool result truncated for {s}/{s}: original {d} bytes; cap is {d} bytes]\n",
@@ -351,36 +375,44 @@ fn serialize_capped(
     );
 
     const truncation_source = if (combined.len == 0) marker else combined;
-    var low: usize = 0;
-    var high: usize = @min(
-        truncation_source.len + marker.len,
-        max_tool_result_bytes,
-    );
     var best: []const u8 = "";
-    while (low <= high) {
-        const mid = low + (high - low) / 2;
-        const inner = try tool_result_limits.truncateText(arena, .{
-            .text = truncation_source,
-            .max_bytes = mid,
-            .marker = marker,
-            .trace_scope = "mcp",
-            .trace_label = tool_name,
-        });
-        const candidate = try build_truncated_envelope(
-            arena,
-            server_name,
-            tool_name,
-            inner,
-            full_output.len,
+    // Keep `_meta` when it fits beside some text. If even the smallest text
+    // cannot share the cap with it, the text wins and `_meta` is reported omitted.
+    var attempt_meta = meta;
+    while (true) {
+        var low: usize = 0;
+        var high: usize = @min(
+            truncation_source.len + marker.len,
             max_tool_result_bytes,
         );
-        if (candidate.len <= max_tool_result_bytes) {
-            best = candidate;
-            low = mid + 1;
-        } else {
-            if (mid == 0) break;
-            high = mid - 1;
+        while (low <= high) {
+            const mid = low + (high - low) / 2;
+            const inner = try tool_result_limits.truncateText(arena, .{
+                .text = truncation_source,
+                .max_bytes = mid,
+                .marker = marker,
+                .trace_scope = "mcp",
+                .trace_label = tool_name,
+            });
+            const candidate = try build_truncated_envelope(
+                arena,
+                server_name,
+                tool_name,
+                inner,
+                full_output.len,
+                max_tool_result_bytes,
+                attempt_meta,
+            );
+            if (candidate.len <= max_tool_result_bytes) {
+                best = candidate;
+                low = mid + 1;
+            } else {
+                if (mid == 0) break;
+                high = mid - 1;
+            }
         }
+        if (best.len != 0 or attempt_meta.json == null) break;
+        attempt_meta = .{ .omitted = true };
     }
 
     if (best.len == 0) {
@@ -391,6 +423,7 @@ fn serialize_capped(
             marker,
             full_output.len,
             max_tool_result_bytes,
+            .{ .omitted = meta.json != null or meta.omitted },
         );
     }
     return try alloc.dupe(u8, best);
@@ -505,6 +538,7 @@ fn build_truncated_envelope(
     text: []const u8,
     original_bytes: usize,
     cap_bytes: usize,
+    meta: TruncatedMeta,
 ) ![]const u8 {
     var out: std.Io.Writer.Allocating = .init(alloc);
     try out.writer.writeAll("{\"server\":");
@@ -517,6 +551,12 @@ fn build_truncated_envelope(
     try out.writer.print("{d}", .{original_bytes});
     try out.writer.writeAll(",\"cap_bytes\":");
     try out.writer.print("{d}", .{cap_bytes});
+    if (meta.json) |json| {
+        try out.writer.writeAll(",\"_meta\":");
+        try out.writer.writeAll(json);
+    } else if (meta.omitted) {
+        try out.writer.writeAll(",\"meta_omitted\":true");
+    }
     try out.writer.writeAll("}}");
     return try out.toOwnedSlice();
 }
@@ -692,6 +732,46 @@ test "invalid tool responses retain bounded protocol failures" {
             result.status,
         );
     }
+}
+
+test "truncation keeps _meta evidence beside the shortened text" {
+    const alloc = std.testing.allocator;
+    const meta = "{\"appboundry/evidence\":{\"executionUnitId\":\"unit-1\",\"outcome\":\"succeeded\"},\"appboundry/authorization\":{\"decisions\":[{\"decisionId\":\"dec-1\"}]}}";
+    const response = "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"content\":[{\"type\":\"text\",\"text\":\"" ++ ("x" ** 4000) ++ "\"}],\"_meta\":" ++ meta ++ "}}";
+    var result = try extract(alloc, .{
+        .server_name = "appboundry_app",
+        .tool_name = "mcp_appboundry_app_run",
+        .response = response,
+        .max_tool_result_bytes = 1024,
+        .protocol = .legacy,
+    });
+    defer result.deinit(alloc);
+    try std.testing.expect(result.model_output.len <= 1024);
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, result.model_output, .{});
+    defer parsed.deinit();
+    const out = parsed.value.object.get("result").?.object;
+    try std.testing.expect(out.get("truncated").?.bool);
+    try std.testing.expect(out.get("meta_omitted") == null);
+    const evidence = out.get("_meta").?.object.get("appboundry/evidence").?.object;
+    try std.testing.expectEqualStrings("unit-1", evidence.get("executionUnitId").?.string);
+}
+
+test "truncation reports oversized _meta as omitted instead of cutting it" {
+    const alloc = std.testing.allocator;
+    const response = "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"content\":[{\"type\":\"text\",\"text\":\"" ++ ("x" ** 4000) ++ "\"}],\"_meta\":{\"big\":\"" ++ ("m" ** 9000) ++ "\"}}}";
+    var result = try extract(alloc, .{
+        .server_name = "s",
+        .tool_name = "t",
+        .response = response,
+        .max_tool_result_bytes = 2048,
+        .protocol = .legacy,
+    });
+    defer result.deinit(alloc);
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, result.model_output, .{});
+    defer parsed.deinit();
+    const out = parsed.value.object.get("result").?.object;
+    try std.testing.expect(out.get("_meta") == null);
+    try std.testing.expect(out.get("meta_omitted").?.bool);
 }
 
 test "large tool results stay valid, bounded, and verbatim" {
