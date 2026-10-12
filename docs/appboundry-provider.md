@@ -92,18 +92,20 @@ bodies.
 
 ## Credentials and authority
 
-Two different credentials exist in an AuthBoundry-governed AppBoundry
-deployment. fx only ever handles the first.
+Three different AuthBoundry credentials exist. fx only ever handles the first.
 
 | Credential | Shape | Held by | Purpose |
 | --- | --- | --- | --- |
-| Caller session credential | `apt_<tenant>.<session>` | The person or process running fx | Authenticates the caller. AppBoundry resolves it with `GET /auth/session`. |
-| AppBoundry check credential | `abc_...` | AppBoundry's server | AppBoundry uses it to submit per-permission authorization checks to AuthBoundry. |
+| Caller session credential | `apt_<tenant>.<session>` | The person or process running fx | Authenticates the caller. AppBoundry resolves it with `GET /auth/session`. This is the only credential `FX_APPBOUNDRY_TOKEN` accepts. |
+| AppBoundry check credential | `abc_<id>.<secret>` | AppBoundry's server | Authenticates AppBoundry, as the enforcement point, to AuthBoundry when it submits per-permission authorization checks. It is not a caller credential. |
+| AuthBoundry agent credential | `aga_<id>.<secret>` | An operator provisions it; the enforcement point presents it | Proves which agent principal a check is about. Per the AuthBoundry contract, the enforcement point sends it in `x-authboundry-agent-credential` beside the check credential on an authorization check. AuthBoundry owns issuance, renewal, expiry, and revocation. |
 
-`FX_APPBOUNDRY_TOKEN` must hold the caller's session credential. Never put the
-`abc_` check credential there. fx treats the value as an opaque bearer token and
-does not validate its prefix, so it cannot tell the two apart; that guard is the
-operator's responsibility.
+`FX_APPBOUNDRY_TOKEN` must hold the caller's session credential. Never put an
+`abc_` check credential or an `aga_` agent credential there. fx treats the value
+as an opaque bearer token. It refuses to start the provider when the value
+begins with `abc_`, but it does not recognize `aga_` and cannot validate an
+`apt_` session, so keeping the other credential types out of this variable is
+the operator's responsibility.
 
 Credential behavior, as implemented:
 
@@ -127,34 +129,61 @@ Credential behavior, as implemented:
   restart fx with a fresh credential. fx does not retry without credentials,
   does not downgrade to another mode, and does not cache a decision.
 
-### Machine-agent identity: audited, and not available
+### Machine-agent identity: blocked on the AppBoundry host
 
-Audit of AuthBoundry `44f6059` (read from source and documentation, then
-exercised by the real-service tests below):
+Status: not implemented and not verified. fx does not support agent
+credentials, and nothing in this document describes agent authentication,
+renewal, rotation, or restart recovery as working.
 
-- Callers authenticate with a session credential, `apt_<tenant>.<session>`,
-  accepted as `Authorization: Bearer`, the `authboundry_session` cookie, or the
-  `x-authboundry-session` header. The tenant segment is re-checked against
-  stored state on every request. A session lives for 3600 seconds and is revoked
-  by sign-out or by an administrator.
-- The only way this work found to obtain a session without a browser is
-  `POST /_authboundry/browser/credentials`, a username and password sign-in for
-  a human account. It is how the test harness signs in generated test accounts.
-  It is not a machine credential, and fx does not call it.
-- There is no OAuth client-credentials grant, token exchange, or API-key flow
-  that mints an `apt_` session. Agents, delegations, and service principals
-  exist as principals and policy subjects, not as credentials. AppBoundry's
-  contract records the same gap (limitation L14).
-- The `abc_<id>.<secret>` check credential is bound to one application, resolves
-  to no principal, can only ask authorization questions, and is stored hashed.
-  The audit found no expiry field. It belongs to AppBoundry's server.
+What AuthBoundry now defines (rkendel1/authboundry#127,
+`docs/AGENT-CREDENTIALS.md`, merged at `7813b62`): a non-interactive `aga_`
+credential for an agent principal, with a bounded lifetime, renewal that
+supersedes the previous secret, and family revocation on replay. The contract
+places the credential at the enforcement point: it is presented beside the
+application's `abc_` check credential on an authorization check, and the
+principal in the check must match the credential's principal.
 
-Consequence: an unattended fx agent has no supported way to acquire or renew a
-credential. Owner: AuthBoundry. Required: a documented non-interactive agent
-credential flow covering issuance, scope, lifetime, revocation, and audit
-identity. fx adds none and does not treat a human session as a durable machine
-credential. fx refuses to start the provider when `FX_APPBOUNDRY_TOKEN` begins
-with `abc_`, so a check credential is never sent to a host by mistake.
+What the AppBoundry host does today (audited at `b3b4a8d`,
+`packages/cli/src/authority.ts`):
+
+- It authenticates a caller only with an `apt_<tenant>.<session>` credential
+  through `GET /auth/session`. An `aga_` bearer is not recognized as a caller
+  credential.
+- Its authorization check sends only the check credential, with the principal
+  taken from the caller's session. It does not accept an agent credential from
+  a caller and does not forward one to AuthBoundry.
+
+Consequence: the host-side contract for an agent caller is missing. There is no
+supported path for an fx process to present an agent credential so that
+AppBoundry authenticates it and passes it to AuthBoundry's authorization check.
+Agent-required authorization, and the guarantee that it never falls back to
+check-credential-only or session authentication, cannot exist until the host
+defines it.
+
+fx therefore does none of the following, and operators should not attempt it:
+
+- It does not read, store, send, or renew an `aga_` credential.
+- It does not hold the `abc_` check credential. That belongs to AppBoundry's
+  server, and fx refuses to start the provider when `FX_APPBOUNDRY_TOKEN`
+  begins with `abc_`.
+- It does not treat a human `apt_` session as a durable machine credential. An
+  unattended process still has to be given an `apt_` session by other means,
+  and that session expires after its lifetime (3600 seconds by default in the
+  audited AuthBoundry).
+
+Tracking: [rkendel1/appboundry#34](https://github.com/rkendel1/appboundry/issues/34)
+is the authoritative issue for the missing host contract: how an agent
+authenticates to the host, forwarding of the agent credential to AuthBoundry, an
+agent-required mode with no fallback, and where the renewed credential is
+stored. The fx implementation, including any credential store, remains blocked
+on that contract.
+
+Earlier audit notes, still accurate for the `apt_` and `abc_` credentials
+(AuthBoundry `44f6059`): the only browser-free way found to obtain an `apt_`
+session is the username and password sign-in for a human account, which is how
+the test harness signs in generated accounts; fx does not call it. The `abc_`
+credential is bound to one application, resolves to no principal, and is stored
+hashed.
 
 ## Discovery is metadata, not authority
 
@@ -282,7 +311,7 @@ as observed, but the double is not evidence about the real service.
 
 - A hosted AuthBoundry or AppBoundry tenant, hosted tenant isolation, and
   anything over a network rather than loopback.
-- Non-interactive credential acquisition (it does not exist yet).
+- Agent-credential authentication, renewal, rotation, and restart recovery (not implemented; see B1).
 - Revocation of an execution that is already running (AppBoundry documents that
   it is not interrupted).
 - PAX observation of these records.
@@ -360,7 +389,7 @@ stands.
 
 | # | Gap | Owner |
 | --- | --- | --- |
-| B1 | No non-interactive agent credential flow (issuance, scope, lifetime, revocation, audit identity). An unattended agent cannot acquire or renew an `apt_` session. | AuthBoundry |
+| B1 | AuthBoundry now defines `aga_` agent credentials, but the AppBoundry host neither accepts one from a caller nor forwards one to AuthBoundry's authorization check. fx cannot authenticate, renew, or rotate an agent credential end to end, and an agent-required mode does not exist. Tracked in [rkendel1/appboundry#34](https://github.com/rkendel1/appboundry/issues/34). | AppBoundry (host contract), then fx |
 | B2 | No verification against a hosted AuthBoundry or AppBoundry tenant, including hosted tenant isolation (AppBoundry limitation L16). | AuthBoundry, AppBoundry |
 | B3 | Check credentials show no expiry or rotation in the audit; whether a leaked one can be bounded is unverified. | AuthBoundry |
 
