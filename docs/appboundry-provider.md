@@ -16,18 +16,23 @@ Set two environment variables before starting fx:
 
 ```sh
 export FX_APPBOUNDRY_URL=https://appboundry.example   # the trusted host origin
-export FX_APPBOUNDRY_TOKEN=...                        # bearer token for that host
+export FX_APPBOUNDRY_TOKEN=apt_...                    # caller-session credential, never abc_ or aga_
 fx
 ```
 
 | Variable | Meaning |
 | --- | --- |
 | `FX_APPBOUNDRY_URL` | Host origin. A path, query, fragment, or credentials in the URL are rejected. Setting it enables the provider. |
-| `FX_APPBOUNDRY_TOKEN` | Bearer token. Read from the environment on each request; never stored. |
+| `FX_APPBOUNDRY_TOKEN` | Bearer credential sent to the configured AppBoundry host. The current integration uses an `apt_<tenant>.<session>` caller-session credential. It does not support `aga_` agent credentials. The value is read from the process environment on each request and is never stored in generated configuration. |
 | `FX_APPBOUNDRY_APPS` | Optional comma-separated allowlist matched against each application's `selector` or `id`. |
 | `FX_APPBOUNDRY_TIMEOUT_MS` | Optional bound for discovery, each connection, and each call. Default 5000, maximum 60000. |
 | `FX_APPBOUNDRY_ALLOW_LOCAL_HTTP` | Set to `1` to permit plain `http://` for a loopback host (`127.0.0.1`, `localhost`, `[::1]`) with an explicit port. Any other plain-HTTP host is refused. |
 | `FX_APPBOUNDRY_DISABLE` | Set to `1` to disable the provider without unsetting the URL. |
+
+See [Credentials and authority](#credentials-and-authority) for the three
+credential types. Agent credentials are not supported; that work is blocked on
+the AppBoundry host contract tracked in
+[rkendel1/appboundry#34](https://github.com/rkendel1/appboundry/issues/34).
 
 Keep the token in your shell profile, a secret manager, or a credentials file
 that you source. Do not put it in `.fx.json`; project configuration cannot set
@@ -64,6 +69,8 @@ changed endpoints. Cached discovery is never treated as proof of authorization.
 
 ```sh
 # in an AppBoundry checkout, with APPPORT_MCP_TOKEN and APPPORT_MCP_SCOPES set
+# (a host without AuthBoundry authority mode; this is that host's own MCP token,
+# not an AuthBoundry abc_ check credential or aga_ agent credential)
 appport app deploy --artifact sha256:... --alias change-context --port 4400
 
 export FX_APPBOUNDRY_URL=http://127.0.0.1:4400
