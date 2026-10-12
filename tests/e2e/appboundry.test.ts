@@ -147,7 +147,7 @@ describe("AppBoundry capability provider", () => {
     const result = await runTask(provider, host);
     expect(result.code).toBe(0);
     expect(host.requests.filter((request) => request.body?.method === "tools/call")).toHaveLength(1);
-    expect(lastToolResult(provider.requests.at(-1)!.body)).toContain("SYNAPSE_SKILL_TRAP");
+    expect(lastToolResult(provider.requests.at(-1)!.body)).toContain("SYNAPSE_TRAP");
   }, 45_000);
 
   test("stopped applications are not callable", async () => {
