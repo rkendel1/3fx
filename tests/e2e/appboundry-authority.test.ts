@@ -138,10 +138,10 @@ describe("AppBoundry authority: authorized path", () => {
     expect(authorization).toEqual({
       authority: "authboundry",
       principal: "alice",
-      decisions: [{ permission: "image.resize", effect: "allow", decisionId: r.host.decisions[0].decisionId }],
+      decisions: [{ permission: "image.resize", capability: "image.resize@1", decision: "allow", decisionId: r.host.decisions[0].decisionId, reason: null }],
     });
     expect(evidence.executionUnitId).toBe("unit-1");
-    expect(evidence.outcome).toBe("succeeded");
+    expect(evidence.outcome).toBe("success");
     expect(evidence.artifactHash).toMatch(/^sha256:/);
     expect(evidence.contractFingerprint).toMatch(/^sha256:/);
     expect(outcome.result.result.structuredContent).toEqual({ width: 4, height: 2, ranBy: "image-resizer" });
@@ -166,7 +166,7 @@ describe("AppBoundry authority: authorized path", () => {
     expect(r.host.executions).toBe(0);
     const [outcome] = r.outcomes;
     expect(outcome.raw).toContain("FORBIDDEN");
-    expect(meta(outcome)["appboundry/authorization"].decisions[0].effect).toBe("deny");
+    expect(meta(outcome)["appboundry/authorization"].decisions[0].decision).toBe("deny");
     // A refusal has authorization evidence and no execution evidence.
     expect(meta(outcome)["appboundry/evidence"]).toBeUndefined();
     expect(r.host.invocations).toHaveLength(0);
@@ -188,7 +188,7 @@ describe("AppBoundry authority: revocation in one fx process", () => {
     expect(r.host.requests.filter((request) => request.body?.method === "tools/list")).toHaveLength(1);
     expect(toolCalls(r.host)).toHaveLength(2);
 
-    expect(meta(r.outcomes[0])["appboundry/evidence"].outcome).toBe("succeeded");
+    expect(meta(r.outcomes[0])["appboundry/evidence"].outcome).toBe("success");
     expect(r.outcomes[1].raw).toContain("FORBIDDEN");
     expect(meta(r.outcomes[1])["appboundry/evidence"]).toBeUndefined();
     expect(r.host.executions).toBe(1);
@@ -206,7 +206,7 @@ describe("AppBoundry authority: revocation in one fx process", () => {
     expect(r.outcomes.length).toBeGreaterThanOrEqual(1);
     const second = toolCalls(r.host).at(-1)!;
     expect(second.headers["authorization"]).toBe(`Bearer ${r.session}`);
-    expect(JSON.stringify(r.outcomes.at(-1))).not.toContain('"effect":"allow"');
+    expect(JSON.stringify(r.outcomes.at(-1))).not.toContain('"decision":"allow"');
     expect(JSON.stringify(r.outcomes.at(-1))).not.toContain("unit-2");
     // Every request used the same credential; none went out anonymously.
     for (const request of r.host.requests) expect(request.headers["authorization"]).toBe(`Bearer ${r.session}`);
@@ -234,6 +234,15 @@ describe("AppBoundry authority: revocation in one fx process", () => {
     expect(denied.decisionId).not.toBe(decisionId);
     expect(denied.executionContext).toBeUndefined();
     expect(r.host.invocations.map((record) => record.decisionId)).not.toContain(denied.decisionId);
+  }, 45_000);
+});
+
+describe("AppBoundry authority: credential kinds", () => {
+  test("a server-side check credential is never sent to the host", async () => {
+    const r = await run({}, () => [{ match: "image_resize", args: ARGS }], { token: () => CHECK_CREDENTIAL });
+    expect(r.result.code).toBe(0);
+    expect(r.host.requests).toHaveLength(0);
+    expect(r.result.stdout + r.result.stderr).not.toContain(CHECK_CREDENTIAL);
   }, 45_000);
 });
 
@@ -268,7 +277,7 @@ describe("AppBoundry authority: fail closed", () => {
       const [outcome] = r.outcomes;
       expect(outcome.raw).toContain("AUTHORITY_UNAVAILABLE");
       expect(meta(outcome)["appboundry/evidence"]).toBeUndefined();
-      expect(meta(outcome)["appboundry/authorization"].decisions[0].effect).toBe("unavailable");
+      expect(meta(outcome)["appboundry/authorization"].decisions[0].decision).toBe("deny");
       expect(toolCalls(r.host)).toHaveLength(1);
       expect(callKinds(r.result).slice(-1)).toEqual(["error"]);
     }, 45_000);
@@ -302,10 +311,10 @@ describe("AppBoundry authority: fail closed", () => {
     const r = await run({ apps: [{ ...DEFAULT_APP, trap: true }] }, () => [{ match: "image_resize", args: ARGS }]);
     expect(r.result.code).toBe(0);
     const [outcome] = r.outcomes;
-    expect(outcome.raw).toContain("SYNAPSE_SKILL_TRAP");
-    expect(meta(outcome)["appboundry/authorization"].decisions[0].effect).toBe("allow");
-    expect(meta(outcome)["appboundry/evidence"].outcome).toBe("failed");
-    expect(r.host.invocations[0].outcome).toBe("failed");
+    expect(outcome.raw).toContain("SYNAPSE_TRAP");
+    expect(meta(outcome)["appboundry/authorization"].decisions[0].decision).toBe("allow");
+    expect(meta(outcome)["appboundry/evidence"].outcome).toBe("failure");
+    expect(r.host.invocations[0].outcome).toBe("failure");
     expect(callKinds(r.result).slice(-1)).toEqual(["error"]);
   }, 45_000);
 
@@ -347,13 +356,15 @@ describe("AppBoundry authority: fail closed", () => {
 });
 
 describe("AppBoundry authority: result size", () => {
-  test("an oversized result is marked truncated and carries no structured evidence", async () => {
+  test("an oversized result is marked truncated and keeps its authorization and execution evidence", async () => {
     const r = await run({ apps: [{ ...DEFAULT_APP, padding: 20_000 }] }, () => [{ match: "image_resize", args: ARGS }], { fxJson: { max_tool_result_bytes: 2000 } });
     expect(r.result.code).toBe(0);
     expect(r.host.executions).toBe(1);
     const result = r.outcomes[0].result.result;
     expect(result.truncated).toBe(true);
-    expect(result._meta).toBeUndefined();
+    expect(result.meta_omitted).toBeUndefined();
+    expect(result._meta["appboundry/evidence"].executionUnitId).toBe("unit-1");
+    expect(result._meta["appboundry/authorization"].decisions[0].decisionId).toBe(r.host.decisions[0].decisionId);
   }, 45_000);
 });
 

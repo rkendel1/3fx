@@ -84,6 +84,7 @@ VERIFICATION_E2E_TESTS = (
 EXCLUDED_E2E_TESTS = (
     "appboundry-authority-live.test.ts",
     "appboundry-live.test.ts",
+    "appboundry-real-stack.test.ts",
     "ci-shards.test.ts",
     "context-limits-live.test.ts",
     "notifications.test.ts",

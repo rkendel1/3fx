@@ -87,6 +87,13 @@ pub const Discovery = struct {
     }
 };
 
+/// AppBoundry's server-side authorization check credential (`abc_...`). It
+/// authenticates AppBoundry to AuthBoundry and is never a caller credential, so
+/// fx refuses to send one to any host rather than leak it.
+pub fn isCheckCredential(token: []const u8) bool {
+    return std.mem.startsWith(u8, token, "abc_");
+}
+
 /// Validates the configured host and returns an owned `scheme://host[:port]`.
 pub fn normalizeOrigin(alloc: Allocator, settings: Settings) Error![]u8 {
     const uri = std.Uri.parse(settings.base_url) catch return error.InvalidBaseUrl;
@@ -546,6 +553,13 @@ test "advertised identity and authority fields never reach a server config" {
     try std.testing.expectEqual(@as(usize, 0), b.headers.len);
     try std.testing.expectEqual(@as(usize, 0), b.header_env.len);
     try std.testing.expectEqual(@as(usize, 0), b.env.len);
+}
+
+test "server-side check credentials are recognized and caller session credentials are not" {
+    try std.testing.expect(isCheckCredential("abc_id.secret"));
+    try std.testing.expect(!isCheckCredential("apt_tenant.session"));
+    try std.testing.expect(!isCheckCredential(""));
+    try std.testing.expect(!isCheckCredential("xabc_id.secret"));
 }
 
 test "app filter parsing trims and drops empty entries" {

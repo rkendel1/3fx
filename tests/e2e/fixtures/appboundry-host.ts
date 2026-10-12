@@ -126,7 +126,7 @@ export function startAppBoundryHost(options: AppBoundryHostOptions = {}) {
             return fail("INVALID_INPUT", "input does not satisfy the contract");
           }
           if (options.trap) {
-            return fail("appboundry.SYNAPSE_SKILL_TRAP", "the capability trapped");
+            return fail("appboundry.SYNAPSE_TRAP", "the capability trapped");
           }
           const result = { width: args.width, height: args.height, bytes: args.width * args.height };
           return rpc({

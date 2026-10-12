@@ -2,6 +2,7 @@
   "version": 1,
   "intentional_exclusions": {
     "appboundry-authority-live.test.ts": "The suite requires a running AuthBoundry and AppBoundry stack, a real session credential, operator commands, and explicit opt-in.",
+    "appboundry-real-stack.test.ts": "The suite requires real AuthBoundry and AppBoundry checkouts and builds, and explicit opt-in.",
     "appboundry-live.test.ts": "The suite requires a live AppBoundry host, an authorized token, and explicit opt-in.",
     "ci-shards.test.ts": "The suite validates the E2E shard planner rather than fx runtime behavior.",
     "context-limits-live.test.ts": "The suite requires a real model credential and live provider responses.",

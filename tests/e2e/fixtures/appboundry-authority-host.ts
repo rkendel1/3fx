@@ -31,7 +31,7 @@ export type InvocationRecord = {
   executionUnitId: string;
   application: string;
   capability: string;
-  outcome: "succeeded" | "failed";
+  outcome: "success" | "failure";
   decisionId: string;
 };
 
@@ -217,7 +217,7 @@ export function startAuthorityHost(options: AuthorityHostOptions = {}) {
           const authorization = {
             authority: "authboundry",
             principal,
-            decisions: [{ permission: app.permission, effect: decision.effect, decisionId: decision.decisionId }],
+            decisions: [{ permission: app.permission, capability: app.capability, decision: decision.effect === "unavailable" ? "deny" : decision.effect, decisionId: decision.decisionId, reason: null }],
           };
           const fail = (code: string, message: string) =>
             rpc({
@@ -239,7 +239,7 @@ export function startAuthorityHost(options: AuthorityHostOptions = {}) {
           executions += 1;
           const executionUnitId = `unit-${executions}`;
           decision.executionContext = { executionUnitId };
-          const outcome = app.trap ? "failed" : "succeeded";
+          const outcome = app.trap ? "failure" : "success";
           invocations.push({
             executionUnitId,
             application: app.selector,
@@ -258,7 +258,7 @@ export function startAuthorityHost(options: AuthorityHostOptions = {}) {
           if (app.trap) {
             return rpc({
               isError: true,
-              content: [{ type: "text", text: "appboundry.SYNAPSE_SKILL_TRAP: the capability trapped" }],
+              content: [{ type: "text", text: "appboundry.SYNAPSE_TRAP: the capability trapped" }],
               _meta: { "appboundry/authorization": authorization, "appboundry/evidence": evidence },
             });
           }

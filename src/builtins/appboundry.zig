@@ -35,6 +35,11 @@ pub fn appendDiscoveredServers(
         .timeout_ms = timeoutFromEnv(),
     };
     const bearer = io_mod.getenv(appboundry.token_env);
+    if (bearer) |token| if (appboundry.isCheckCredential(token)) {
+        // A server-side check credential must never be presented as a caller session.
+        debug_trace.logf("mcp", "appboundry token is a server-side check credential; provider disabled", .{});
+        return;
+    };
     var context = FetchContext{ .timeout_ms = settings.timeout_ms };
     var found = appboundry.discover(alloc, settings, bearer, &context, fetch) catch |err| {
         if (err == error.OutOfMemory) return error.OutOfMemory;
