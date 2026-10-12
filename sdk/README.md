@@ -370,16 +370,28 @@ without a tool call. Events, `turn.result`, `steer()`, cancellation, and
 - `maxSteps` (default 100) bounds model requests per prompt; reaching it ends
   the turn with `stopReason: "max_turn_requests"`. `maxOutputTokens` is
   optional.
-- `stopReason` is `end_turn`, `cancelled`, `max_tokens` (the model hit its
-  length limit), `refused` (the provider's content filter fired), or
-  `max_turn_requests`. A provider failure, such as a model that
-  writes a tool call as plain text, rejects the turn with an Error whose `code`
-  is `LIBFX_MODEL_FAILED` and `kind` is the failure kind; the failed prompt is
-  not added to history.
+- `stopReason` is `end_turn`, `cancelled`, or `max_turn_requests`. A provider
+  failure rejects the turn: an HTTP error or a model that writes a tool call as
+  plain text rejects with `code: "LIBFX_MODEL_FAILED"` and the failure `kind`
+  (for example `server_error`, `rate_limited`, `malformed_tool_call`), and
+  failures without a provider response, including a truncated or filtered
+  output, an unadvertised tool name, or invalid tool-argument JSON, reject with
+  the model's `LIBFX_MODEL_REQUEST_FAILED` error. The failed prompt is not added
+  to history. A hand-written model object that reports `finish_reason` `length`
+  or `content_filter` ends the turn with `max_tokens` or `refused`.
+- A tool that throws, returns an error, or is not registered returns an error
+  result to the model, and the turn continues.
+- `breaking` out of the event loop, `turn.cancel()`, an aborted `signal`, and
+  `agent.close()` abort the in-flight provider request and settle
+  `turn.result` as `cancelled`; a cancelled turn is removed from history.
+- `onEvent` receives `model.request` and `model.response` diagnostics. The
+  transport events of the Gateway agent do not exist on this path.
+- `checkpoint()` rejects while a prompt is running.
 - Prompts are text only (image blocks throw), and tool results reach the model
   as text.
 - A checkpoint made by a direct agent restores only into a direct agent. It
   holds the model-visible messages, not Gateway session state.
+- Verification: the protocol and loop are covered by deterministic tests with a scripted provider; real-model tool quality and live MCP endpoints are not. See [the certification report](https://github.com/rkendel1/3fx/blob/main/sdk/CERTIFICATION.md).
 - The loop does not run fx's permission review or built-in tools; your `tools`
   carry their own authority, as for the Gateway agent.
 

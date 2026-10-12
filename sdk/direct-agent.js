@@ -70,6 +70,9 @@ export function createDirectAgent(options, helpers) {
   }
   const model = options.model;
   const maxSteps = options.maxSteps ?? defaultMaxSteps;
+  if (options.maxOutputTokens !== undefined && (!Number.isSafeInteger(options.maxOutputTokens) || options.maxOutputTokens < 1)) {
+    throw new TypeError("maxOutputTokens must be a positive integer");
+  }
   if (!Number.isSafeInteger(maxSteps) || maxSteps < 1) throw new TypeError("maxSteps must be a positive integer");
   const hostTools = helpers.normalizeHostTools(options.tools);
   if (hostTools.descriptors.some((tool) => tool.providerExecuted)) {
@@ -130,6 +133,7 @@ export function createDirectAgent(options, helpers) {
       };
       let completion;
       let failure;
+      onEvent({ type: "model.request", step: steps, messages: request.messages.length });
       const iterator = model.stream(request, { signal })[Symbol.asyncIterator]();
       try {
         for (let next = await iterator.next(); !next.done; next = await iterator.next()) {
@@ -153,6 +157,7 @@ export function createDirectAgent(options, helpers) {
         throw error;
       }
       if (!completion) throw new Error("model stream ended without a completion");
+      onEvent({ type: "model.response", step: steps, finishReason: completion.finish_reason ?? null, toolCalls: (completion.tool_calls ?? []).length });
       addUsage(usage, usageFrom(completion));
       const calls = completion.tool_calls ?? [];
       messages.push({
@@ -188,25 +193,39 @@ export function createDirectAgent(options, helpers) {
       }
       const text = blocks.map((block) => block.type === "text" ? block.text : block.resource?.text ?? "").join("\n");
       const controller = new AbortController();
-      const turn = { steering: [], controller, finished: false, taken: false };
+      const turn = { steering: [], controller, finished: false, taken: false, started: false };
       activeTurn = turn;
       const outerSignal = promptOptions.signal;
-      const abort = () => controller.abort();
-      if (outerSignal?.aborted) controller.abort();
-      else outerSignal?.addEventListener("abort", abort, { once: true });
-
+      const abort = () => cancel();
       let resolveResult;
       let rejectResult;
       const result = new Promise((resolve, reject) => { resolveResult = resolve; rejectResult = reject; });
       void result.catch(() => {});
-      const finish = () => {
+      // Exactly one of these runs, whichever way the turn ends: completion,
+      // failure, cancel(), an early `break` out of the event loop, or close().
+      const settle = (outcome, error) => {
+        if (turn.finished) return;
         turn.finished = true;
         outerSignal?.removeEventListener("abort", abort);
         if (activeTurn === turn) activeTurn = null;
+        if (error) rejectResult(error);
+        else resolveResult(outcome);
       };
-      const settle = async function* () {
+      // A turn that has not started has no history to undo and no generator
+      // to unwind, so it settles immediately.
+      function cancel() {
+        controller.abort();
+        if (!turn.started) settle({ stopReason: "cancelled", usage: {} });
+      }
+      turn.cancel = cancel;
+      turn.settled = result;
+      if (outerSignal?.aborted) cancel();
+      else outerSignal?.addEventListener("abort", abort, { once: true });
+      const run = async function* () {
+        if (turn.finished) return;
+        turn.started = true;
         // An already-aborted prompt changes no history.
-        if (controller.signal.aborted) { finish(); resolveResult({ stopReason: "cancelled", usage: {} }); return; }
+        if (controller.signal.aborted) { settle({ stopReason: "cancelled", usage: {} }); return; }
         const rollback = messages.length;
         messages.push({ role: "user", content: text });
         try {
@@ -214,16 +233,20 @@ export function createDirectAgent(options, helpers) {
           // A cancelled turn is dropped whole so history never holds a tool
           // call without its result.
           if (outcome.stopReason === "cancelled") messages.length = rollback;
-          finish();
-          resolveResult(outcome);
+          settle(outcome);
         } catch (error) {
           messages.length = rollback;
-          finish();
-          rejectResult(error);
+          settle(undefined, error);
           throw error;
+        } finally {
+          if (!turn.finished) {
+            controller.abort();
+            messages.length = rollback;
+            settle({ stopReason: "cancelled", usage: {} });
+          }
         }
       };
-      const source = settle();
+      const source = run();
       // Awaiting only `result` must still run the turn, so the first `then`
       // drains the events when nobody has taken the iterator.
       const drainUnread = () => {
@@ -237,7 +260,7 @@ export function createDirectAgent(options, helpers) {
         finally(onFinally) { drainUnread(); return result.finally(onFinally); },
       };
       return {
-        cancel() { controller.abort(); },
+        cancel,
         steer(steerInput) {
           if (turn.finished) return Promise.reject(new Error("no prompt is running"));
           const steerBlocks = helpers.normalizePromptInput(steerInput);
@@ -252,8 +275,8 @@ export function createDirectAgent(options, helpers) {
           turn.taken = true;
           return {
             next: () => source.next(),
-            return: (value) => { controller.abort(); return source.return(value); },
-            throw: (error) => { controller.abort(); return source.throw(error); },
+            return: (value) => { cancel(); return source.return(value); },
+            throw: (error) => { cancel(); return source.throw(error); },
             [Symbol.asyncIterator]() { return this; },
           };
         },
@@ -262,13 +285,18 @@ export function createDirectAgent(options, helpers) {
     },
     async checkpoint() {
       if (closed) throw new Error("fx agent is closed");
+      // Mid-turn history can hold a tool call without its result.
+      if (activeTurn) throw new Error("a checkpoint cannot be taken while a prompt is in progress");
       return encoder.encode(JSON.stringify({ format: checkpointMagic, messages }));
     },
     async close() {
       if (closed) return;
       const turn = activeTurn;
-      turn?.controller.abort();
       closed = true;
+      if (turn) {
+        turn.cancel();
+        await turn.settled.catch(() => {});
+      }
     },
   };
 }

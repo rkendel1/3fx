@@ -207,6 +207,54 @@ await assert.rejects(createFxAgent({ model: "some/model" }), /createFxModel/);
   await assert.rejects(createFxAgent({ model, checkpoint: new TextEncoder().encode("{}") }), /direct-model agent/);
 }
 
+// Lifecycle parity without a native addon: cancel before consumption, early break,
+// close() waiting for the turn, and checkpoint refusal mid-turn.
+{
+  const hang = (signals) => ({
+    requests: [],
+    id: "hang",
+    model: "hang",
+    async chat() { throw new Error("unused"); },
+    stream(_request, { signal } = {}) {
+      signals.push(signal);
+      return (async function* () {
+        yield { type: "text_delta", text: "partial" };
+        await new Promise((resolveHang) => signal.addEventListener("abort", resolveHang, { once: true }));
+        throw Object.assign(new Error("aborted"), { name: "AbortError" });
+      })();
+    },
+  });
+  const signals = [];
+  const agent = await createFxAgent({ model: hang(signals) });
+  const unread = agent.prompt("never read");
+  unread.cancel();
+  assert.equal((await unread.result).stopReason, "cancelled");
+  assert.equal(signals.length, 0, "no provider call for an unconsumed cancelled turn");
+  const broken = agent.prompt("break early");
+  for await (const _ of broken) break;
+  assert.equal((await broken.result).stopReason, "cancelled");
+  assert.equal(signals.length, 1);
+  assert.ok(signals[0].aborted, "break aborted the provider request");
+  const closing = agent.prompt("close mid-turn");
+  const seen = [];
+  const reader = (async () => { for await (const event of closing) seen.push(event); })();
+  while (seen.length === 0) await new Promise((r) => setTimeout(r, 1));
+  await assert.rejects(agent.checkpoint(), /in progress/);
+  assert.throws(() => agent.prompt("second"), /already in progress/);
+  await agent.close();
+  await reader;
+  assert.equal((await closing.result).stopReason, "cancelled");
+  assert.equal(signals.length, 2);
+  assert.ok(signals[1].aborted, "close aborted the provider request");
+  await assert.rejects(agent.checkpoint(), /closed/);
+}
+
+// Selection is by interface: model option objects and strings keep the Gateway path.
+await assert.rejects(createFxAgent({ model: { id: "vendor/model", effort: "low" } }), /apiKey is required/);
+await assert.rejects(createFxAgent({ model: { chat() {} } }), /unsupported model option|apiKey/);
+await assert.rejects(createFxAgent({ model: scriptedModel([]), maxSteps: 0 }), /maxSteps/);
+await assert.rejects(createFxAgent({ model: scriptedModel([]), maxOutputTokens: 0 }), /maxOutputTokens/);
+
 // A real createFxModel() against a local OpenAI-compatible server: the provider
 // is called directly with no gateway URL, no credential, and no fx core.
 const scriptDir = dirname(fileURLToPath(import.meta.url));
