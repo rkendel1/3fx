@@ -90,12 +90,169 @@ Set `FX_TRACE_LOG=/path/to/log FX_TRACE_SCOPES=mcp` for diagnostic traces. They
 record counts and error names only, never the token, the URL, or response
 bodies.
 
+## Credentials and authority
+
+Two different credentials exist in an AuthBoundry-governed AppBoundry
+deployment. fx only ever handles the first.
+
+| Credential | Shape | Held by | Purpose |
+| --- | --- | --- | --- |
+| Caller session credential | `apt_<tenant>.<session>` | The person or process running fx | Authenticates the caller. AppBoundry resolves it with `GET /auth/session`. |
+| AppBoundry check credential | `abc_...` | AppBoundry's server | AppBoundry uses it to submit per-permission authorization checks to AuthBoundry. |
+
+`FX_APPBOUNDRY_TOKEN` must hold the caller's session credential. Never put the
+`abc_` check credential there. fx treats the value as an opaque bearer token and
+does not validate its prefix, so it cannot tell the two apart; that guard is the
+operator's responsibility.
+
+Credential behavior, as implemented:
+
+- The variable name is stored in the generated server config
+  (`bearer_token_env`); the value is read from the process environment on each
+  request and is never written to configuration, sessions, logs, traces, tool
+  results, or the model prompt. Stored OAuth credentials are not used for
+  discovered servers.
+- The same credential is sent to discovery and to every discovered application.
+  Both go only to the configured origin: advertised paths must be absolute
+  paths on that origin, and redirects are never followed by discovery or by the
+  MCP transport, so a 3xx response ends the request without re-sending the
+  credential.
+- The model supplies only tool arguments. Arguments travel in the JSON-RPC body;
+  they cannot set headers or replace the credential. Discovery fields such as
+  `principal`, `scopes`, `authorization`, or `headers` are ignored: the
+  generated config carries only a name, an endpoint, and the environment
+  variable name.
+- Credential lifetime belongs to AuthBoundry. fx has no refresh flow. When the
+  session expires or is signed out, the host answers 401 and the call fails;
+  restart fx with a fresh credential. fx does not retry without credentials,
+  does not downgrade to another mode, and does not cache a decision.
+
+### Non-interactive credential acquisition: not verified
+
+A session credential is currently obtained through a human sign-in. This work
+found no documented AuthBoundry machine-identity or token-exchange contract that
+fx can call, and it adds none. A human session is not a durable machine
+credential: it can expire or be revoked mid-task. Follow-up for the owning
+AuthBoundry repository: define and document a non-interactive agent credential
+flow (issuance, scope, lifetime, revocation, and audit identity). Until then fx
+accepts whatever `apt_` credential the operator supplies.
+
+## Discovery is metadata, not authority
+
+- `GET /.well-known/appport` and `tools/list` describe what exists. A tool
+  appearing in a list is never a grant, and fx never records one as such.
+- Every `tools/call` is a new request that AppBoundry authorizes against the
+  caller's current AuthBoundry state. fx keeps no allow-list, decision cache,
+  or policy copy, so a tool list discovered earlier does not survive
+  revocation: the next call is refused by the host.
+- Discovery is read once per MCP load and refreshed on `/mcp` reload. Revocation
+  does not require a reload and does not require restarting AppBoundry.
+- Descriptions, schemas, tool output, error messages, and `_meta` are untrusted
+  input. They reach the model as tool output.
+- Applications are namespaced as `mcp_appboundry_<selector>_<tool>`. Two
+  applications exposing the same tool name stay distinct tools and are checked
+  against their own permission. Two selectors that normalize to the same server
+  name (`a.b` and `a_b`) keep only the first; the other is counted as rejected
+  in the `mcp` trace.
+
+## Errors and revocation
+
+fx does not translate host decisions. A refusal is an error result with the
+host's own code:
+
+| Code | Meaning | Execution evidence |
+| --- | --- | --- |
+| HTTP 401 / server `needs_auth` | The session credential is missing, expired, or signed out. | None |
+| `FORBIDDEN` | The caller lacks the declared permission, including after revocation. | None |
+| `AUTHORITY_UNAVAILABLE` | AuthBoundry timed out, was unreachable, or answered unreadably. AppBoundry fails closed. | None |
+| `INVALID_INPUT` | Arguments did not satisfy the contract. | None |
+| `appboundry.SYNAPSE_*` | The capability ran and failed or trapped. | Present, with a failure outcome |
+| Unknown tool or malformed response | The host did not recognize the call, or the response was not valid MCP. | None |
+
+Every failure is a failed tool call (`status: "error"` in `fx ask --json`); fx
+does not report any of them as success and does not retry.
+
+## Evidence
+
+AppBoundry attaches structured evidence in `_meta`, and fx forwards the result
+to the model unchanged apart from fx's normal text sanitization:
+
+- `appboundry/authorization`: authority, principal, and per-permission
+  decisions with a `decisionId`. Present for allowed and refused calls.
+- `appboundry/evidence`: capability, package identity, artifact hash, contract
+  fingerprint, outcome, and `executionUnitId`. Present only when execution was
+  attempted.
+
+A refusal therefore has authorization evidence and no execution evidence; an
+execution failure has execution evidence with a failure outcome. fx neither
+creates, upgrades, nor verifies these records: they are claims made by the
+host, and a result without them, or with malformed ones, carries no proof.
+They are not proof that the user's goal was achieved.
+
+Correlation is done outside fx. `executionUnitId` joins the execution evidence
+to AppBoundry's invocation and usage records, and `decisionId` joins the
+authorization evidence to AuthBoundry's durable decision and its recorded
+execution context.
+
+Known limit: when a result exceeds `max_tool_result_bytes`, the existing MCP
+result cap replaces it with truncated text and `"truncated":true`, and the
+structured `_meta` is not carried. Treat a truncated result as having no
+evidence, and raise the cap or have the capability return less output. This is
+existing MCP behavior and was left unchanged.
+
+## Verification status
+
+**Verified locally (ordinary CI, no external services).** `appboundry-authority.test.ts`
+runs the built binary against a double of AppBoundry in authority mode
+(`tests/e2e/fixtures/appboundry-authority-host.ts`) and proves: an authorized
+call; invalid-session rejection; denial without a grant and without running the
+module; a previously discovered tool list that does not bypass a later denial; revocation and sign-out taking effect on the next call in the same
+process; forged arguments and discovery claims having no effect; fail-closed
+behavior for `AUTHORITY_UNAVAILABLE` (unavailable, malformed, timeout);
+execution failures; credentials never reaching another origin or a redirect
+target; per-application separation; evidence preserved verbatim, correlated
+across decision, invocation, and execution unit, and not invented when absent.
+The double encodes the contract described above; it is not AuthBoundry or
+AppBoundry, so these results do not show that the real services behave this way.
+
+**Verified against the real service: not yet.** No AuthBoundry or AppBoundry
+binary was available when this was written, so `appboundry-authority-live.test.ts`
+has not been run. A skipped run means "not verified", never "verified".
+
+**Not verified in a hosted tenant.** Hosted AuthBoundry API behavior, tenant
+isolation, non-interactive credential acquisition, and production readiness are
+all unproven.
+
 ## Tests
 
 - Unit tests: `zig build test` (the `core/mcp/appboundry.zig` and
   `builtins/appboundry.zig` tests).
 - Deterministic integration: `cd tests/e2e && bun test appboundry.test.ts` runs the built
   binary against an AppBoundry-shaped host that enforces tokens and scopes.
+- Authority and revocation: `cd tests/e2e && bun test appboundry-authority.test.ts`
+  (needs `zig build` first; uses the double described above).
+- Real stack (opt-in): `appboundry-authority-live.test.ts` drives one fx process
+  through an authorized call, a revocation, and a second call, against services
+  you run yourself. It starts nothing and assumes no AuthBoundry endpoints.
+  Prerequisites: a running AuthBoundry (serve, backed by FeltDB) and an
+  AppBoundry host in authority mode with a packaged capability that declares a
+  permission; an existing `apt_` session for a principal granted that
+  permission; and a command that revokes the grant or signs the session out.
+
+  ```sh
+  cd tests/e2e
+  FX_AUTHORITY_E2E_URL=http://127.0.0.1:4400 \
+  FX_AUTHORITY_E2E_ALLOW_HTTP=1 \
+  FX_AUTHORITY_E2E_SESSION='apt_<tenant>.<session>' \
+  FX_AUTHORITY_E2E_QUERY='words from the capability description or tool name' \
+  FX_AUTHORITY_E2E_ARGS='{"...":"..."}' \
+  FX_AUTHORITY_E2E_REVOKE_CMD='<command that revokes the grant or signs out the session>' \
+  FX_AUTHORITY_E2E_CORRELATE_CMD='<optional; reads FX_DECISION_ID and FX_EXECUTION_UNIT_ID, exits 0 if the AuthBoundry decision and AppBoundry record agree>' \
+  bun test appboundry-authority-live.test.ts
+  ```
+
+  Without `FX_AUTHORITY_E2E_CORRELATE_CMD`, correlation against the durable
+  records is reported as not verified.
 - Live host: `appboundry-live.test.ts` is opt-in. Set `FX_APPBOUNDRY_E2E_URL`,
   `FX_APPBOUNDRY_E2E_TOKEN`, `FX_APPBOUNDRY_E2E_QUERY`, and
   `FX_APPBOUNDRY_E2E_ARGS` (plus `FX_APPBOUNDRY_E2E_ALLOW_HTTP=1` for loopback).
