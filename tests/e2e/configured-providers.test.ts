@@ -436,6 +436,43 @@ describe("configured providers", () => {
     } finally { f.close(); }
   }, 15000);
 
+  test("a tool call written as plain text fails the run and executes nothing", async () => {
+    const markup = `I'll check.\n\n<function=shell>\n<parameter=request>\n{"action": "run", "command": "touch must-not-exist.txt"}\n</parameter>\n</function>\n</tool_call>`;
+    const f = fixture(body => completion(body.model, markup));
+    try {
+      // Full access removes the permission prompt, so any execution would succeed.
+      f.settings.permission_mode = "full-access";
+      (f.settings as any).yolo_acknowledged = true;
+      f.save();
+      const result = await runFx(["ask", "--json", "--no-save", "Check the branch"], { cwd: f.workspace, env: f.env, timeoutMs: 20000 });
+      expect(result.code).toBe(1);
+      const parsed = JSON.parse(result.stdout);
+      expect(parsed.exit_code).toBe(1);
+      expect(parsed.error).toBe("MalformedToolCall");
+      expect(parsed.steps).toBe(0);
+      expect(parsed.tool_calls).toEqual([]);
+      expect(parsed.output).toBe(markup);
+      expect(result.stderr).toContain("malformed_tool_call");
+      expect(existsSync(join(f.workspace, "must-not-exist.txt"))).toBe(false);
+      expect(f.requests).toHaveLength(1);
+    } finally { f.close(); }
+  }, 25000);
+
+  test.each([
+    ["prose", "Tool calls use a <function=shell> tag with <parameter=request> and </function>."],
+    ["fenced example", "Format:\n```\n<function=shell>\n<parameter=request>{}</parameter>\n</function>\n```"],
+  ])("a text answer that only mentions tool syntax (%s) is still a successful final answer", async (_name, text) => {
+    const f = fixture(body => completion(body.model, text));
+    try {
+      const result = await runFx(["ask", "--json", "--no-save", "Explain the tool format"], { cwd: f.workspace, env: f.env, timeoutMs: 20000 });
+      if (result.code !== 0) throw new Error(result.stdout + result.stderr);
+      const parsed = JSON.parse(result.stdout);
+      expect(parsed.exit_code).toBe(0);
+      expect(parsed.error).toBeUndefined();
+      expect(parsed.output).toBe(text);
+    } finally { f.close(); }
+  }, 25000);
+
   test.each(["headers", "stream"])("cancellation stops stalled custom %s without replaying the POST", async phase => {
     const f = fixture(() => phase === "headers" ? new Promise<Response>(() => {}) : new Response(new ReadableStream({ start(controller) { controller.enqueue(new TextEncoder().encode('data: {"choices":[{"index":0,"delta":{"content":"partial"}}]}\n\n')); } }), { headers: { "content-type": "text/event-stream" } }));
     const env: Record<string, string | undefined> = { ...process.env };

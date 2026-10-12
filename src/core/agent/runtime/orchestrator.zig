@@ -8394,7 +8394,7 @@ fn processQueuedPromptLoop(
                 );
                 attempt_failure_diagnostic = diagnostic;
                 latest_recovery_diagnostic = diagnostic;
-                const non_retryable = attempt_completion.provider_failure_cause == .non_retryable;
+                const non_retryable = types.ProviderFailureCause.isTerminal(attempt_completion.provider_failure_cause);
                 // Interrupted streams and provider-error completions carry
                 // progress evidence; bare HTTP status failures (5xx, 429) and
                 // gateway timeout metadata are exempt from the stall detector.
@@ -8616,7 +8616,7 @@ fn processQueuedPromptLoop(
                     completionContentBytes(attempt_completion),
                     attempt_completion.tool_calls.len,
                 });
-                if (attempt_completion.provider_failure_cause == .non_retryable) {
+                if (types.ProviderFailureCause.isTerminal(attempt_completion.provider_failure_cause)) {
                     try deps.push_system_notice(deps.ctx, diagnostic.view());
                     restorePromptAfterTerminalFailure(deps, job, config);
                     const failed_assistant_source = stream_ctx.interruption_source_or("");
@@ -8680,6 +8680,10 @@ fn processQueuedPromptLoop(
                             .disable_fast => {},
                         }
                     }
+                }
+                if (attempt_completion.provider_failure_cause == .malformed_tool_call) {
+                    finish_trace.finish("malformed_tool_call");
+                    return error.MalformedToolCall;
                 }
                 finish_trace.finish(if (finish_reason == .provider_error) "provider_error" else "content_filter");
                 return error.ModelError;
