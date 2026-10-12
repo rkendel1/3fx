@@ -19,7 +19,7 @@ on:
         default: true
 
 concurrency:
-  group: release-sdk
+  group: release
   cancel-in-progress: false
 
 permissions:
@@ -48,12 +48,11 @@ jobs:
 
       - name: Build, verify, and publish @appport/fx
         env:
-          # Publishing uses npm trusted publishing (OIDC): configure a trusted
-          # publisher for @appport/fx on npmjs.com (repository rkendel1/3fx,
-          # workflow release-sdk.yml) and no token is needed. A classic or
-          # 2FA-gated token fails here with EOTP, so NPM_TOKEN is only a
-          # fallback and must be a granular token with 2FA bypass.
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          # Publishing uses npm trusted publishing (OIDC). The trusted publisher
+          # for @appport/fx on npmjs.com must name repository rkendel1/3fx and
+          # workflow filename release.yml exactly. No npm token is used: a
+          # token that is present takes over from OIDC and fails with EOTP
+          # unless it is a granular token with 2FA bypass.
           DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run }}
         run: |
           if [ "$DRY_RUN" = "true" ]; then
