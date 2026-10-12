@@ -37,7 +37,11 @@ const checkpoint = await agent.checkpoint();
 await agent.close();
 ```
 
-`apiKey` is required. `model` is optional and defaults to fx's built-in model.
+With a string `model` or no `model`, the agent uses the Vercel AI Gateway:
+`apiKey` is required and `model` defaults to fx's built-in model. To use Ollama
+or another OpenAI-compatible provider instead, pass a `createFxModel()` handle
+as `model`; no Gateway account, key, or URL is involved. See
+[Local and direct providers](#local-and-direct-providers).
 Agent configuration uses named options; `env` is reserved for
 `createFxTerminal()`. The canonical model configuration groups the model ID
 and model-specific options:
@@ -324,6 +328,60 @@ const models = await listModels({
 `listModels()` performs one bounded Gateway request and returns sorted, unique
 language-model IDs. It accepts the same optional `fetch` override as the Agent
 API.
+
+## Local and direct providers
+
+`createFxAgent()` selects its provider from `model`:
+
+| `model` | Provider | Credential |
+| --- | --- | --- |
+| A string, a `{ id, effort, fast, ultrafast }` object, or omitted | Vercel AI Gateway (the default) | `apiKey` is required |
+| A `createFxModel()` handle | The endpoint you configured, called directly | None from fx; use `apiKeyEnv` on the model if the endpoint needs one |
+
+```js
+import { createFxAgent, createFxModel } from "@appport/fx";
+import { createMcpAdapter } from "@appport/fx/mcp";
+
+const model = await createFxModel({
+  baseUrl: "http://localhost:11434/v1", // Ollama
+  model: "qwen3-coder",
+});
+const mcp = await createMcpAdapter(mcpClient); // for example the AppBoundry MCP server
+const agent = await createFxAgent({ model, tools: mcp.tools, instructions: mcp.instructions });
+
+const turn = agent.prompt("Which capabilities are enabled?");
+for await (const event of turn) {
+  if (event.type === "text_delta") process.stdout.write(event.delta);
+}
+console.log(await turn.result); // { stopReason, usage }
+```
+
+With a model handle, fx runs the agent loop in JavaScript: it streams one model
+request, executes the structured tool calls through your `tools` (including MCP
+tools), returns each result to the model, and repeats until the model answers
+without a tool call. Events, `turn.result`, `steer()`, cancellation, and
+`checkpoint()` behave as documented above, with these differences:
+
+- No request goes to the Gateway, and `fetch` is not used. The model handle's
+  native provider makes the requests, so this path needs the Node addon.
+- `apiKey`, `gatewayChatUrl`, `fetch`, and the `effort`, `fast`, and `ultrafast`
+  options are rejected, so a stale Gateway setting is never silently ignored.
+  Provider-executed tools are also rejected.
+- `maxSteps` (default 100) bounds model requests per prompt; reaching it ends
+  the turn with `stopReason: "max_turn_requests"`. `maxOutputTokens` is
+  optional.
+- `stopReason` is `end_turn`, `cancelled`, `max_tokens` (the model hit its
+  length limit), `refused` (the provider's content filter fired), or
+  `max_turn_requests`. A provider failure, such as a model that
+  writes a tool call as plain text, rejects the turn with an Error whose `code`
+  is `LIBFX_MODEL_FAILED` and `kind` is the failure kind; the failed prompt is
+  not added to history.
+- Prompts are text only (image blocks throw), and tool results reach the model
+  as text.
+- A checkpoint made by a direct agent restores only into a direct agent. It
+  holds the model-visible messages, not Gateway session state.
+- The loop does not run fx's permission review or built-in tools; your `tools`
+  carry their own authority, as for the Gateway agent.
 
 ## Direct model calls
 

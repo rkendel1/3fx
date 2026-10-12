@@ -1,6 +1,6 @@
 {
   "name": "@appport/fx",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Embed fx agents and terminals in JavaScript hosts",
   "type": "module",
   "repository": {
@@ -15,7 +15,9 @@
     "test:node-napi": "node tests/test-node-napi.mjs",
     "test:browser-wasm": "node tests/test-browser-wasm.mjs",
     "test:packed-consumer": "node tests/test-packed-consumer.mjs",
-    "test:live-ollama": "node tests/test-live-ollama.mjs"
+    "test:direct-agent": "node tests/test-direct-agent.mjs",
+    "test:live-ollama": "node tests/test-live-ollama.mjs",
+    "test:live-ollama-agent": "node tests/test-live-ollama-agent.mjs"
   },
   "exports": {
     ".": {
@@ -43,6 +45,7 @@
     "fx-sdk.js",
     "wasm-module.js",
     "core-output.js",
+    "direct-agent.js",
     "mcp.js",
     "skills.js",
     "skills-node.js",

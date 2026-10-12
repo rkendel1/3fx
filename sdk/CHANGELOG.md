@@ -3,6 +3,20 @@
 Release notes for the `@appport/fx` npm package. The fx command line has its own
 changelog at the repository root.
 
+## 0.1.2
+
+### New Features
+
+- **Gateway-free agents:** `createFxAgent({ model })` accepts a `createFxModel()` handle and runs the agent loop against that provider directly. Ollama and other OpenAI-compatible endpoints work with streaming, structured tool calls, MCP tools, steering, cancellation, and checkpoints, and need no Vercel AI Gateway account, API key, or URL.
+
+### Improvements
+
+- **Clearer missing key error:** `createFxAgent()` without `apiKey` now explains that the key is for the Vercel AI Gateway and points to `createFxModel()` for other providers.
+
+### Migration
+
+Existing code is unaffected: a string or object `model`, or no `model`, still uses the Vercel AI Gateway and still requires `apiKey`. To leave the Gateway, replace `apiKey` and the model string with a model handle, and remove `apiKey`, `gatewayChatUrl`, `fetch`, `effort`, `fast`, and `ultrafast`, which a model handle rejects. Checkpoints do not move between the two kinds of agent.
+
 ## 0.1.1
 
 ### Bug Fixes

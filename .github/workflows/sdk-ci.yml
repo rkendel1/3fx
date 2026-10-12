@@ -49,5 +49,8 @@ jobs:
       - name: Direct model API tests
         run: node --expose-gc sdk/tests/test-native-model.mjs
 
+      - name: Direct agent tests (no Vercel AI Gateway)
+        run: node sdk/tests/test-direct-agent.mjs
+
       - name: Packed tarball consumer smoke test
         run: node sdk/tests/test-packed-consumer.mjs

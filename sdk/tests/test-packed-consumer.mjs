@@ -110,7 +110,7 @@ try {
 
   // The artifact itself: what ships, and nothing that only exists in a working tree.
   const files = run("tar", ["-tzf", tarball]).split("\n").filter(Boolean).map((name) => name.replace(/^package\//, ""));
-  for (const required of ["package.json", "README.md", "LICENSE", "node.js", "node.cjs", "browser.js", hostAddon]) {
+  for (const required of ["package.json", "README.md", "LICENSE", "node.js", "node.cjs", "browser.js", "direct-agent.js", hostAddon]) {
     assert.ok(files.includes(required), `tarball is missing ${required}`);
   }
   if (expectAllAddons) for (const addon of releaseAddons) assert.ok(files.includes(addon), `tarball is missing ${addon}`);
@@ -176,6 +176,22 @@ try {
       assert.ok(!String(error.stack).includes(process.env.${SECRET_ENV}));
       return true;
     });
+    // createFxAgent({ model }) drives the same provider directly: no apiKey, no gateway.
+    const agentTools = [{ name: "shell", description: "Run a command", inputSchema: { type: "object" }, execute: () => "success" }];
+    const agent = await sdk.createFxAgent({ model });
+    const answer = agent.prompt("success");
+    for await (const _ of answer) {}
+    assert.equal((await answer.result).stopReason, "end_turn");
+    await agent.close();
+    // The tool result ("success") makes the fixture answer, so the loop ends after one tool step.
+    const toolAgent = await sdk.createFxAgent({ model, tools: agentTools });
+    const withTool = toolAgent.prompt("structured-call");
+    const toolEvents = [];
+    for await (const event of withTool) toolEvents.push(event.type);
+    assert.deepEqual(toolEvents, ["tool_start", "tool_end", "text_delta"]);
+    assert.equal((await withTool.result).stopReason, "end_turn");
+    await toolAgent.close();
+    await assert.rejects(sdk.createFxAgent({ model: "some/model" }), /createFxModel/);
     console.log("consumer-ok");
   `;
   const prelude = "const { createFxModel } = sdk;\n";

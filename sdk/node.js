@@ -6,8 +6,10 @@ import { homedir } from "node:os";
 import { isAbsolute, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { CoreOutput } from "./core-output.js";
+import { isDirectModel } from "./direct-agent.js";
 import { loadModule, withModuleFailure } from "./wasm-module.js";
 import {
+  createDirectFxAgent,
   createFxAgent as createWasmAgent,
   createFxTerminal as createWasmTerminal,
   encodeXtermKeyEvent,
@@ -565,6 +567,11 @@ async function createWithFallback(surface, nativeMethod, wasmFactory, defaultWas
 }
 
 export async function createFxAgent(options = {}) {
+  // A createFxModel() handle runs the agent loop against that provider directly.
+  if (isDirectModel(options?.model)) {
+    const { nativeAddon: _nativeAddon, backend: _backend, ...direct } = options;
+    return createDirectFxAgent(direct);
+  }
   return createWithFallback(
     "agent",
     "createCore",
