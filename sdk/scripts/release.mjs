@@ -12,7 +12,8 @@
  *   node sdk/scripts/release.mjs [--dry-run] [--provenance]
  *
  * Publishing uses inherited stdio so npm can prompt for a one-time password
- * locally; CI authenticates with NODE_AUTH_TOKEN.
+ * locally; CI authenticates with npm trusted publishing (OIDC) or, as a
+ * fallback, a 2FA-bypass NODE_AUTH_TOKEN.
  */
 import { spawnSync } from "node:child_process";
 import { existsSync } from "node:fs";
