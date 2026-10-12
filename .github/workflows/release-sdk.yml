@@ -48,8 +48,11 @@ jobs:
 
       - name: Build, verify, and publish @appport/fx
         env:
-          # An npm automation token (or granular token with 2FA bypass);
-          # a token that requires a one-time password cannot publish from CI.
+          # Publishing uses npm trusted publishing (OIDC): configure a trusted
+          # publisher for @appport/fx on npmjs.com (repository rkendel1/3fx,
+          # workflow release-sdk.yml) and no token is needed. A classic or
+          # 2FA-gated token fails here with EOTP, so NPM_TOKEN is only a
+          # fallback and must be a granular token with 2FA bypass.
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
           DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run }}
         run: |
