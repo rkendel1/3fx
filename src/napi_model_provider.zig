@@ -5,6 +5,7 @@
 const std = @import("std");
 const model_provider = @import("core/agent/model_provider.zig");
 const openai_provider = @import("gateway/openai_compatible_model_provider.zig");
+const malformed_tool_call = @import("gateway/malformed_tool_call.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -78,7 +79,7 @@ pub const ModelHandle = struct {
         events: ?model_provider.EventSink,
     ) !model_provider.ChatStream {
         var delivery: model_provider.Delivery = .{};
-        return self.openai.provider().chat(alloc, .{
+        var result = try self.openai.provider().chat(alloc, .{
             .messages = request.messages,
             .tools = request.tools,
             .tool_choice = request.tool_choice,
@@ -87,8 +88,26 @@ pub const ModelHandle = struct {
             .cancel_flag = &call.cancelled,
             .delivery = &delivery,
         });
+        errdefer result.deinit(alloc);
+        return failMalformedToolCall(alloc, result, request);
     }
 };
+
+/// A tool call written as plain text is a failed model response, not a final
+/// answer. The text is never parsed into a call; it is returned unchanged as the
+/// failure detail so the caller can diagnose it. Any other result passes through.
+fn failMalformedToolCall(alloc: Allocator, result: model_provider.ChatStream, request: *const Request) !model_provider.ChatStream {
+    switch (result) {
+        .failed => return result,
+        .completed => |completion| {
+            if (malformed_tool_call.inCompletion(completion, request.tools, request.tool_choice != .none) == null) return result;
+            const detail = try alloc.dupe(u8, completion.content.?);
+            var owned = result;
+            owned.deinit(alloc);
+            return .{ .failed = .{ .kind = .malformed_tool_call, .detail = detail } };
+        },
+    }
+}
 
 /// Cancellation state shared by the JavaScript caller and the worker thread.
 pub const Call = struct {
@@ -188,6 +207,53 @@ test "cancelled call is observed before the provider is contacted" {
     request.messages = try request.arena.allocator().dupe(model_provider.Message, &.{.{ .role = .user, .content = "hi" }});
     call.cancel();
     try std.testing.expectError(error.Cancelled, handle.run(alloc, &request, call, null));
+}
+
+const textual_call = "<function=shell>\n<parameter=request>\n{\"action\":\"run\",\"command\":\"id\"}\n</parameter>\n</function>\n</tool_call>";
+const shell_tool = [_]model_provider.Tool{.{ .name = "shell", .description = "", .input_schema = .null }};
+
+fn completedStream(alloc: Allocator, content: []const u8, calls: []const model_provider.ToolCall, finish: model_provider.FinishReason) !model_provider.ChatStream {
+    const owned = try alloc.alloc(model_provider.ToolCall, calls.len);
+    for (calls, owned) |source, *destination| destination.* = .{
+        .id = try alloc.dupe(u8, source.id),
+        .name = try alloc.dupe(u8, source.name),
+        .arguments_json = try alloc.dupe(u8, source.arguments_json),
+    };
+    return .{ .completed = .{ .content = try alloc.dupe(u8, content), .tool_calls = owned, .finish_reason = finish } };
+}
+
+test "textual tool call becomes a malformed_tool_call failure that keeps the original text" {
+    const alloc = std.testing.allocator;
+    var request = Request.init(alloc);
+    defer request.deinit();
+    request.tools = &shell_tool;
+    var result = try failMalformedToolCall(alloc, try completedStream(alloc, textual_call, &.{}, .stop), &request);
+    defer result.deinit(alloc);
+    try std.testing.expectEqual(.malformed_tool_call, result.failed.kind);
+    try std.testing.expectEqualStrings(textual_call, result.failed.detail.?);
+}
+
+test "structured calls, prose, fenced examples, and disabled tools pass through unchanged" {
+    const alloc = std.testing.allocator;
+    var request = Request.init(alloc);
+    defer request.deinit();
+    request.tools = &shell_tool;
+    const call = model_provider.ToolCall{ .id = "c1", .name = "shell", .arguments_json = "{}" };
+    const cases = [_]struct { content: []const u8, calls: []const model_provider.ToolCall, finish: model_provider.FinishReason }{
+        .{ .content = textual_call, .calls = &.{call}, .finish = .tool_calls },
+        .{ .content = "Use a <function=shell> tag with <parameter=request> and </function>.", .calls = &.{}, .finish = .stop },
+        .{ .content = "```\n" ++ textual_call ++ "\n```", .calls = &.{}, .finish = .stop },
+        .{ .content = textual_call, .calls = &.{}, .finish = .length },
+    };
+    for (cases) |case| {
+        var result = try failMalformedToolCall(alloc, try completedStream(alloc, case.content, case.calls, case.finish), &request);
+        defer result.deinit(alloc);
+        try std.testing.expectEqualStrings(case.content, result.completed.content.?);
+    }
+    request.tool_choice = .none;
+    var disabled = try failMalformedToolCall(alloc, try completedStream(alloc, textual_call, &.{}, .stop), &request);
+    defer disabled.deinit(alloc);
+    try std.testing.expect(disabled == .completed);
 }
 
 test "roles and tool choices parse only their neutral names" {

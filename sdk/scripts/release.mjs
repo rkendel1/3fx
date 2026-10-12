@@ -118,6 +118,9 @@ run("npm", ["pack", "--pack-destination", outputRoot], { cwd: packageDir });
 const tarball = (await readdir(outputRoot)).find((entry) => entry.endsWith(`-${version}.tgz`));
 if (tarball === undefined) throw new Error(`Expected a packed ${name}@${version} tarball in ${outputRoot}.`);
 
+// The tarball that will be published must itself install and work in a clean consumer project.
+run(process.execPath, [join(repoRoot, "sdk", "tests", "test-packed-consumer.mjs"), join(outputRoot, tarball), "--expect-all-addons"]);
+
 // npm rejects a dry run of a published version, so a rehearsal stops after packing.
 if (alreadyPublished) {
   console.log(`Dry run: ${name}@${version} is already on npm; built and verified ${tarball}.`);

@@ -1,4 +1,5 @@
 const std = @import("std");
+const models = @import("../core/agent/model_provider.zig");
 
 /// Detects a tool call that the model wrote as plain assistant text instead of
 /// a structured `tool_calls` entry, for example the Qwen style
@@ -39,6 +40,15 @@ pub fn find(content: []const u8, tools: anytype) ?[]const u8 {
         return advertised;
     }
     return null;
+}
+
+/// A normal stop with tools in play, no structured calls, and text that is a
+/// textual call to an advertised tool. Returns that tool's name, else null.
+/// Every other turn, including a valid structured call, is left untouched.
+pub fn inCompletion(completion: models.Completion, advertised: []const models.Tool, tools_allowed: bool) ?[]const u8 {
+    if (!tools_allowed or advertised.len == 0) return null;
+    if (completion.finish_reason != .stop or completion.tool_calls.len != 0) return null;
+    return find(completion.content orelse return null, advertised);
 }
 
 const Tool = struct { name: []const u8 };

@@ -168,6 +168,63 @@ await test("generated tool calls return with id, name, arguments, and finish rea
   assert.equal(events.at(-1).completion.finish_reason, "tool_calls");
 });
 
+const textualCall = "I'll check.\n\n<function=shell>\n<parameter=request>\n{\"action\": \"run\", \"command\": \"git branch --show-current\"}\n</parameter>\n</function>\n</tool_call>";
+const shellTools = [{ name: "shell", input_schema: { type: "object", properties: { request: { type: "object" } } } }];
+
+await test("a tool call written as plain text is a failure, never a completion or a tool call", async () => {
+  handler = (_, response) => text(response, textualCall);
+  const request = { messages: [{ role: "user", content: "Which branch?" }], tools: shellTools };
+  const result = await model.chat(request);
+  assert.equal(result.completed, undefined, "textual markup must not be a successful completion");
+  assert.deepEqual(result.failed, { kind: "malformed_tool_call", detail: textualCall, retry_after_seconds: null });
+  // The stream surfaces the same failure as its single terminal event, after the text it already delivered.
+  const events = await collect(model.stream(request));
+  assert.equal(events.at(-1).type, "failure");
+  assert.equal(events.at(-1).failure.kind, "malformed_tool_call");
+  assert.equal(events.at(-1).failure.detail, textualCall);
+  assert.equal(events.filter((event) => event.type === "completion").length, 0);
+});
+
+await test("text that only mentions tool syntax stays a normal completion", async () => {
+  const samples = [
+    "Tool calls use a <function=shell> tag with <parameter=request> and </function>.",
+    `Format:\n\`\`\`\n${textualCall}\n\`\`\``,
+  ];
+  for (const sample of samples) {
+    handler = (_, response) => text(response, sample);
+    const result = await model.chat({ messages: [{ role: "user", content: "Explain" }], tools: shellTools });
+    assert.equal(result.failed, undefined);
+    assert.equal(result.completed.content, sample);
+    assert.equal(result.completed.finish_reason, "stop");
+  }
+  // Without advertised tools the same markup is just text.
+  handler = (_, response) => text(response, textualCall);
+  const plain = await model.chat({ messages: [{ role: "user", content: "Which branch?" }] });
+  assert.equal(plain.completed.content, textualCall);
+  const disabled = await model.chat({ messages: [{ role: "user", content: "Which branch?" }], tools: shellTools, tool_choice: "none" });
+  assert.equal(disabled.completed.content, textualCall);
+});
+
+await test("a structured call alongside markup text is still a tool call", async () => {
+  handler = (_, response) => {
+    response.writeHead(200, { "content-type": "text/event-stream" });
+    chunk(response, { delta: { role: "assistant", content: textualCall } });
+    chunk(response, { delta: { tool_calls: [{ index: 0, id: "call_9", type: "function", function: { name: "shell", arguments: "{\"request\":{\"action\":\"run\",\"command\":\"pwd\"}}" } }] } });
+    finish(response, "tool_calls");
+  };
+  const { completed, failed } = await model.chat({ messages: [{ role: "user", content: "pwd" }], tools: shellTools });
+  assert.equal(failed, undefined);
+  assert.deepEqual(completed.tool_calls, [{ id: "call_9", name: "shell", arguments_json: "{\"request\":{\"action\":\"run\",\"command\":\"pwd\"}}" }]);
+});
+
+await test("required tool choice rejects a textual call instead of reporting success", async () => {
+  handler = (_, response) => text(response, textualCall);
+  await assert.rejects(
+    model.chat({ messages: [{ role: "user", content: "Which branch?" }], tools: shellTools, tool_choice: "required" }),
+    { code: "LIBFX_MODEL_REQUEST_FAILED", message: "RequiredToolMissing" },
+  );
+});
+
 await test("stream delivers each provider delta before the provider sends the next", async () => {
   const gates = [gate(), gate()];
   handler = async (_, response) => {

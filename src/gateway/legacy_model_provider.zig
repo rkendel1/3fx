@@ -116,10 +116,7 @@ fn malformedToolCallDetail(
     advertised: []const models.Tool,
     tools_allowed: bool,
 ) Allocator.Error!?[]const u8 {
-    if (!tools_allowed or advertised.len == 0) return null;
-    if (completion.finish_reason != .stop or completion.tool_calls.len != 0) return null;
-    const content = completion.content orelse return null;
-    const name = malformed_tool_call.find(content, advertised) orelse return null;
+    const name = malformed_tool_call.inCompletion(completion, advertised, tools_allowed) orelse return null;
     return try std.fmt.allocPrint(arena, "malformed_tool_call: model wrote a call to {s} as plain text instead of a structured tool call; nothing was executed", .{name});
 }
 
