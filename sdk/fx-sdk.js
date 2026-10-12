@@ -1,4 +1,5 @@
 import { CoreOutput, maxCoreMessageBytes } from "./core-output.js";
+import { createDirectAgent, isDirectModel } from "./direct-agent.js";
 import { loadModule } from "./wasm-module.js";
 
 const encoder = new TextEncoder();
@@ -44,6 +45,16 @@ const maxSteeringQueueBytes = 1024 * 1024;
 // tool_start events carry a bounded preview of the tool input; larger inputs
 // are marked truncated instead of dropped or sent whole.
 const maxToolStartInputBytes = 64 * 1024;
+
+export function createDirectFxAgent(options) {
+  return createDirectAgent(options, {
+    normalizeHostTools,
+    normalizeInstructions,
+    normalizePromptInput,
+    hostToolContent,
+    checkpointBytes,
+  });
+}
 
 function boundedString(value, name, maxBytes, required) {
   if (value === undefined && !required) return undefined;
@@ -108,6 +119,9 @@ export function normalizeAgentOptions(value) {
   const options = { ...value };
   if (Object.hasOwn(options, "env")) {
     throw new TypeError("createFxAgent() does not accept env; pass apiKey and model directly");
+  }
+  if (options.apiKey === undefined) {
+    throw new TypeError("apiKey is required for the Vercel AI Gateway agent; to use Ollama or another provider, pass model: await createFxModel({ baseUrl, model })");
   }
   options.apiKey = boundedString(options.apiKey, "apiKey", maxApiKeyBytes, true);
   if (options.model !== null && typeof options.model === "object" && !Array.isArray(options.model)) {
@@ -1723,6 +1737,9 @@ function base64ToBytes(value) {
 }
 
 export async function createFxAgent(options = {}) {
+  // A createFxModel() handle selects its provider directly; the fx core and
+  // the Vercel AI Gateway are not involved.
+  if (isDirectModel(options?.model)) return createDirectFxAgent(options);
   options = normalizeAgentOptions(options);
   const hostTools = normalizeHostTools(options.tools);
   const instructions = normalizeInstructions(options.instructions);

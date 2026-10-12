@@ -11,14 +11,16 @@ const htmlPath = resolve(repoRoot, "sdk/term-demo.html");
 const browserPath = resolve(repoRoot, "sdk/browser.js");
 const sdkPath = resolve(repoRoot, "sdk/fx-sdk.js");
 const coreOutputPath = resolve(repoRoot, "sdk/core-output.js");
+const directAgentPath = resolve(repoRoot, "sdk/direct-agent.js");
 const wasmModulePath = resolve(repoRoot, "sdk/wasm-module.js");
 const wasmPath = resolve(repoRoot, "zig-out/bin/fx-term.wasm");
 
-const [htmlSource, browserBytes, sdkSource, coreOutputBytes, wasmModuleBytes, wasmBytes] = await Promise.all([
+const [htmlSource, browserBytes, sdkSource, coreOutputBytes, directAgentBytes, wasmModuleBytes, wasmBytes] = await Promise.all([
   readFile(htmlPath, "utf8"),
   readFile(browserPath),
   readFile(sdkPath),
   readFile(coreOutputPath),
+  readFile(directAgentPath),
   readFile(wasmModulePath),
   readFile(wasmPath),
 ]);
@@ -27,10 +29,13 @@ const digest = (bytes) => createHash("sha256").update(bytes).digest("hex");
 const integrity = (bytes) => `sha256-${createHash("sha256").update(bytes).digest("base64")}`;
 const coreOutputHash = digest(coreOutputBytes);
 const coreOutputName = `core-output.${coreOutputHash}.js`;
+const directAgentHash = digest(directAgentBytes);
+const directAgentName = `direct-agent.${directAgentHash}.js`;
 const wasmModuleHash = digest(wasmModuleBytes);
 const wasmModuleName = `wasm-module.${wasmModuleHash}.js`;
 const sdkBytes = Buffer.from(sdkSource.toString()
   .replace('from "./core-output.js";', `from "./${coreOutputName}";`)
+  .replace('from "./direct-agent.js";', `from "./${directAgentName}";`)
   .replace('from "./wasm-module.js";', `from "./${wasmModuleName}";`));
 const sdkHash = digest(sdkBytes);
 const wasmHash = digest(wasmBytes);
@@ -81,6 +86,10 @@ const vercelConfig = {
       headers: [{ key: "Cache-Control", value: "public, max-age=31536000, immutable" }],
     },
     {
+      source: `/${directAgentName}`,
+      headers: [{ key: "Cache-Control", value: "public, max-age=31536000, immutable" }],
+    },
+    {
       source: `/${wasmModuleName}`,
       headers: [{ key: "Cache-Control", value: "public, max-age=31536000, immutable" }],
     },
@@ -99,6 +108,7 @@ await Promise.all([
   writeFile(resolve(outputDir, browserName), packagedBrowser),
   writeFile(resolve(outputDir, sdkName), sdkBytes),
   writeFile(resolve(outputDir, coreOutputName), coreOutputBytes),
+  writeFile(resolve(outputDir, directAgentName), directAgentBytes),
   writeFile(resolve(outputDir, wasmModuleName), wasmModuleBytes),
   writeFile(resolve(outputDir, wasmName), wasmBytes),
   writeFile(resolve(outputDir, "vercel.json"), `${JSON.stringify(vercelConfig, null, 2)}\n`),
@@ -109,6 +119,7 @@ const manifest = {
   browser: { file: browserName, sha256: digest(packagedBrowser), bytes: packagedBrowser.byteLength },
   sdk: { file: sdkName, sha256: sdkHash, bytes: sdkBytes.byteLength },
   coreOutput: { file: coreOutputName, sha256: coreOutputHash, bytes: coreOutputBytes.byteLength },
+  directAgent: { file: directAgentName, sha256: directAgentHash, bytes: directAgentBytes.byteLength },
   wasmModule: { file: wasmModuleName, sha256: wasmModuleHash, bytes: wasmModuleBytes.byteLength },
   wasm: { file: wasmName, sha256: wasmHash, integrity: integrity(wasmBytes), bytes: wasmBytes.byteLength },
 };
