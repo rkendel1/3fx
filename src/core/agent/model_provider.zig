@@ -117,6 +117,9 @@ pub const FailureKind = enum {
     unavailable,
     gateway_timeout,
     provider_error,
+    /// The model wrote a tool call as plain text instead of a structured call.
+    /// Produced only by the direct model API; `detail` is the original text.
+    malformed_tool_call,
 };
 
 pub const Failure = struct {

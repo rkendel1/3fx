@@ -393,10 +393,21 @@ const result = await model.chat({
   `content_filter`, or `null`), `response_id`, and `usage` with
   `input_tokens`, `output_tokens`, `cache_read_tokens`, `cache_write_tokens`,
   and `reasoning_tokens`. A field the provider did not report is `null`.
-- `{ failed }` reports an HTTP error from the provider. It contains `kind`
-  (such as `rate_limited` or `server_error`), the response body as `detail`
-  with any credential redacted, and `retry_after_seconds` from a `Retry-After`
-  header or `null`.
+- `{ failed }` reports a response that cannot be used. For an HTTP error it
+  contains `kind` (such as `rate_limited` or `server_error`), the response body
+  as `detail` with any credential redacted, and `retry_after_seconds` from a
+  `Retry-After` header or `null`. The kind `malformed_tool_call` means the model
+  wrote a tool call as plain text instead of returning a structured one; see
+  below.
+
+A tool call is real only when it arrives in `completed.tool_calls`. When tools
+are advertised and `tool_choice` is not `"none"`, a normal `stop` with no
+structured calls whose text opens `<function=NAME>` on its own line for an
+advertised tool, followed by `<parameter=` and `</function>`, outside a fenced
+code block, resolves `{ failed: { kind: "malformed_tool_call", detail } }`.
+`detail` is the model's original text. fx never parses or runs it, and does not
+retry. Text that only mentions the syntax, fenced examples, and replies with
+structured tool calls are unaffected.
 
 `chat()` rejects with an Error whose `code` identifies failures that produced no
 provider response: `LIBFX_MODEL_CANCELLED` (also named `AbortError`),
@@ -635,7 +646,11 @@ to an HTTP(S) URL string, a `Response`, Wasm bytes, or a compiled
 `WebAssembly.Module`. Asset resolver failures propagate from factories and
 appear as `LIBFX_WASM_LOAD_FAILED` in diagnostics.
 
-Node.js 20+ is supported. Browser WebAssembly requires a JSPI-capable browser.
+Node.js 20+ is supported. The npm package ships native addons for
+darwin-arm64, darwin-x64, linux-arm64, and linux-x64. The packed tarball is installed and exercised from ESM and
+CommonJS by `tests/test-packed-consumer.mjs` on every release, on the platform
+that builds it; the other addons are built and checked in the release but not
+loaded there. Windows has no native addon. Browser WebAssembly requires a JSPI-capable browser.
 The Linux x64 and arm64 native addons require glibc 2.34 or newer. Native
 agents do not require JSPI or experimental Node flags.
 Some Node versions require `--experimental-wasm-jspi`.

@@ -25,6 +25,7 @@ const localNativeName = {
 const files = [
   ["sdk/package.json", "package.json"],
   ["sdk/README.md", "README.md"],
+  ["sdk/CHANGELOG.md", "CHANGELOG.md"],
   ["LICENSE", "LICENSE"],
   ["sdk/browser.js", "browser.js"],
   ["sdk/node.js", "node.js"],
@@ -75,6 +76,8 @@ for (const addon of nativeAddons) {
 
 const manifest = JSON.parse(await readFile(resolve(outputDir, "package.json"), "utf8"));
 manifest.files = undefined;
+// The scripts exercise repository test files that are not in the package.
+manifest.scripts = undefined;
 await writeFile(resolve(outputDir, "package.json"), `${JSON.stringify(manifest, null, 2)}\n`);
 
 console.log(`packaged ${manifest.name} in ${outputDir}`);
