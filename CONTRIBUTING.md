@@ -201,6 +201,11 @@ reference sources it follows. Adopting a new AppPort release means updating
 those pins, reviewing the reference changes, updating the port, and recording
 new digests together. See [AppPort contract knowledge](docs/appport-knowledge.md).
 
+`tests/appport-effectiveness/` measures whether the AppPort context changes
+agent results. Run its self-tests with `bun test` after changing the context
+builder, and see its [README](tests/appport-effectiveness/README.md) for model
+runs.
+
 `tests/e2e/appport.test.ts` is verification-only in the PGSO corpus because it
 covers contract correctness and an opt-in prompt path rather than common
 interactive behavior.

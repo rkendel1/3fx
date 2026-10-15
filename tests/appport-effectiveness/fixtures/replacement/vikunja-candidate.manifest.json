@@ -1,0 +1,785 @@
+{
+ "protocol": "appport/1",
+ "application": {
+  "id": "io.vikunja",
+  "name": "Vikunja",
+  "version": "replacement-candidate-1",
+  "description": "Vikunja projects and tasks, through Vikunja's own API with the caller's own API token."
+ },
+ "capabilities": [
+  {
+   "name": "appport.manifest",
+   "versions": [
+    1
+   ],
+   "latestVersion": 1,
+   "description": "Returns the application manifest for this deployment.",
+   "kind": "request",
+   "inputSchema": {
+    "type": "object",
+    "properties": {},
+    "additionalProperties": false
+   },
+   "outputSchema": {
+    "type": "object",
+    "properties": {
+     "protocol": {
+      "type": "string"
+     },
+     "application": {
+      "type": "object",
+      "properties": {
+       "id": {
+        "type": "string"
+       },
+       "name": {
+        "type": "string"
+       },
+       "version": {
+        "type": "string"
+       }
+      },
+      "additionalProperties": true,
+      "required": [
+       "id",
+       "name",
+       "version"
+      ]
+     },
+     "capabilities": {
+      "type": "array",
+      "items": {
+       "type": "object",
+       "additionalProperties": {}
+      }
+     },
+     "events": {
+      "type": "array",
+      "items": {
+       "type": "object",
+       "additionalProperties": {}
+      }
+     },
+     "transports": {
+      "type": "array",
+      "items": {
+       "type": "object",
+       "additionalProperties": {}
+      }
+     }
+    },
+    "additionalProperties": true,
+    "required": [
+     "protocol",
+     "application",
+     "capabilities",
+     "events",
+     "transports"
+    ],
+    "title": "AppPortManifest"
+   },
+   "authorization": [],
+   "authorizationContract": {
+    "required": false,
+    "public": true
+   },
+   "authorizationVersion": 1,
+   "idempotency": "unsupported",
+   "concurrency": {
+    "mode": "parallel"
+   },
+   "definitions": [
+    {
+     "version": 1,
+     "description": "Returns the application manifest for this deployment.",
+     "kind": "request",
+     "inputSchema": {
+      "type": "object",
+      "properties": {},
+      "additionalProperties": false
+     },
+     "outputSchema": {
+      "type": "object",
+      "properties": {
+       "protocol": {
+        "type": "string"
+       },
+       "application": {
+        "type": "object",
+        "properties": {
+         "id": {
+          "type": "string"
+         },
+         "name": {
+          "type": "string"
+         },
+         "version": {
+          "type": "string"
+         }
+        },
+        "additionalProperties": true,
+        "required": [
+         "id",
+         "name",
+         "version"
+        ]
+       },
+       "capabilities": {
+        "type": "array",
+        "items": {
+         "type": "object",
+         "additionalProperties": {}
+        }
+       },
+       "events": {
+        "type": "array",
+        "items": {
+         "type": "object",
+         "additionalProperties": {}
+        }
+       },
+       "transports": {
+        "type": "array",
+        "items": {
+         "type": "object",
+         "additionalProperties": {}
+        }
+       }
+      },
+      "additionalProperties": true,
+      "required": [
+       "protocol",
+       "application",
+       "capabilities",
+       "events",
+       "transports"
+      ],
+      "title": "AppPortManifest"
+     },
+     "authorization": [],
+     "authorizationContract": {
+      "required": false,
+      "public": true
+     },
+     "authorizationVersion": 1,
+     "idempotency": "unsupported",
+     "concurrency": {
+      "mode": "parallel"
+     }
+    }
+   ]
+  },
+  {
+   "name": "appport.ping",
+   "versions": [
+    1
+   ],
+   "latestVersion": 1,
+   "description": "Liveness probe. Returns the server time.",
+   "kind": "request",
+   "inputSchema": {
+    "type": "object",
+    "properties": {},
+    "additionalProperties": false
+   },
+   "outputSchema": {
+    "type": "object",
+    "properties": {
+     "timestamp": {
+      "type": "string",
+      "description": "ISO-8601 timestamp",
+      "format": "date-time"
+     }
+    },
+    "additionalProperties": false,
+    "required": [
+     "timestamp"
+    ]
+   },
+   "authorization": [],
+   "authorizationContract": {
+    "required": false,
+    "public": true
+   },
+   "authorizationVersion": 1,
+   "idempotency": "unsupported",
+   "concurrency": {
+    "mode": "parallel"
+   },
+   "definitions": [
+    {
+     "version": 1,
+     "description": "Liveness probe. Returns the server time.",
+     "kind": "request",
+     "inputSchema": {
+      "type": "object",
+      "properties": {},
+      "additionalProperties": false
+     },
+     "outputSchema": {
+      "type": "object",
+      "properties": {
+       "timestamp": {
+        "type": "string",
+        "description": "ISO-8601 timestamp",
+        "format": "date-time"
+       }
+      },
+      "additionalProperties": false,
+      "required": [
+       "timestamp"
+      ]
+     },
+     "authorization": [],
+     "authorizationContract": {
+      "required": false,
+      "public": true
+     },
+     "authorizationVersion": 1,
+     "idempotency": "unsupported",
+     "concurrency": {
+      "mode": "parallel"
+     }
+    }
+   ]
+  },
+  {
+   "name": "vikunja.projects.list",
+   "versions": [
+    1
+   ],
+   "latestVersion": 1,
+   "description": "List the projects Vikunja lets the caller see.",
+   "kind": "request",
+   "inputSchema": {
+    "type": "object",
+    "properties": {
+     "includeArchived": {
+      "type": "boolean"
+     }
+    },
+    "additionalProperties": false
+   },
+   "outputSchema": {
+    "type": "object",
+    "properties": {
+     "projects": {
+      "type": "array",
+      "items": {
+       "type": "object",
+       "properties": {
+        "id": {
+         "type": "integer",
+         "description": "Negative ids are Vikunja's virtual projects (saved filters), not stored projects"
+        },
+        "title": {
+         "type": "string"
+        },
+        "description": {
+         "type": "string"
+        },
+        "parentProjectId": {
+         "type": "integer"
+        },
+        "isArchived": {
+         "type": "boolean"
+        },
+        "owner": {
+         "anyOf": [
+          {
+           "type": "string"
+          },
+          {
+           "type": "null"
+          }
+         ]
+        },
+        "virtual": {
+         "type": "boolean"
+        }
+       },
+       "additionalProperties": false,
+       "required": [
+        "id",
+        "title",
+        "description",
+        "parentProjectId",
+        "isArchived",
+        "owner",
+        "virtual"
+       ]
+      }
+     }
+    },
+    "additionalProperties": false,
+    "required": [
+     "projects"
+    ]
+   },
+   "authorization": [
+    "vikunja.read"
+   ],
+   "effect": "observation",
+   "authorizationContract": {
+    "required": true,
+    "scopes": [
+     "vikunja.read"
+    ]
+   },
+   "authorizationVersion": 1,
+   "idempotency": "unsupported",
+   "concurrency": {
+    "mode": "parallel"
+   },
+   "definitions": [
+    {
+     "version": 1,
+     "description": "List the projects Vikunja lets the caller see.",
+     "kind": "request",
+     "inputSchema": {
+      "type": "object",
+      "properties": {
+       "includeArchived": {
+        "type": "boolean"
+       }
+      },
+      "additionalProperties": false
+     },
+     "outputSchema": {
+      "type": "object",
+      "properties": {
+       "projects": {
+        "type": "array",
+        "items": {
+         "type": "object",
+         "properties": {
+          "id": {
+           "type": "integer",
+           "description": "Negative ids are Vikunja's virtual projects (saved filters), not stored projects"
+          },
+          "title": {
+           "type": "string"
+          },
+          "description": {
+           "type": "string"
+          },
+          "parentProjectId": {
+           "type": "integer"
+          },
+          "isArchived": {
+           "type": "boolean"
+          },
+          "owner": {
+           "anyOf": [
+            {
+             "type": "string"
+            },
+            {
+             "type": "null"
+            }
+           ]
+          },
+          "virtual": {
+           "type": "boolean"
+          }
+         },
+         "additionalProperties": false,
+         "required": [
+          "id",
+          "title",
+          "description",
+          "parentProjectId",
+          "isArchived",
+          "owner",
+          "virtual"
+         ]
+        }
+       }
+      },
+      "additionalProperties": false,
+      "required": [
+       "projects"
+      ]
+     },
+     "authorization": [
+      "vikunja.read"
+     ],
+     "effect": "observation",
+     "authorizationContract": {
+      "required": true,
+      "scopes": [
+       "vikunja.read"
+      ]
+     },
+     "authorizationVersion": 1,
+     "idempotency": "unsupported",
+     "concurrency": {
+      "mode": "parallel"
+     }
+    }
+   ]
+  },
+  {
+   "name": "vikunja.tasks.setdone",
+   "versions": [
+    1
+   ],
+   "latestVersion": 1,
+   "description": "Mark a task done or not done. Vikunja checks that the caller may update the task.",
+   "kind": "request",
+   "inputSchema": {
+    "type": "object",
+    "properties": {
+     "id": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 9007199254740991
+     },
+     "done": {
+      "type": "boolean"
+     },
+     "projectId": {
+      "type": "integer",
+      "minimum": 1
+     }
+    },
+    "additionalProperties": false,
+    "required": [
+     "id",
+     "done",
+     "projectId"
+    ]
+   },
+   "outputSchema": {
+    "type": "object",
+    "properties": {
+     "id": {
+      "type": "integer"
+     },
+     "title": {
+      "type": "string"
+     },
+     "description": {
+      "type": "string"
+     },
+     "projectId": {
+      "type": "integer"
+     },
+     "done": {
+      "type": "boolean"
+     },
+     "doneAt": {
+      "anyOf": [
+       {
+        "type": "string"
+       },
+       {
+        "type": "null"
+       }
+      ]
+     },
+     "dueDate": {
+      "anyOf": [
+       {
+        "type": "string"
+       },
+       {
+        "type": "null"
+       }
+      ]
+     },
+     "priority": {
+      "type": "integer"
+     },
+     "percentDone": {
+      "type": "number"
+     },
+     "identifier": {
+      "type": "string"
+     },
+     "createdBy": {
+      "anyOf": [
+       {
+        "type": "string"
+       },
+       {
+        "type": "null"
+       }
+      ]
+     },
+     "created": {
+      "type": "string"
+     },
+     "updated": {
+      "type": "string"
+     }
+    },
+    "additionalProperties": false,
+    "required": [
+     "id",
+     "title",
+     "description",
+     "projectId",
+     "done",
+     "doneAt",
+     "dueDate",
+     "priority",
+     "percentDone",
+     "identifier",
+     "createdBy",
+     "created",
+     "updated"
+    ]
+   },
+   "authorization": [
+    "vikunja.tasks.write"
+   ],
+   "effect": "consequential",
+   "authorizationContract": {
+    "required": true,
+    "scopes": [
+     "vikunja.tasks.write"
+    ]
+   },
+   "authorizationVersion": 1,
+   "idempotency": "unsupported",
+   "concurrency": {
+    "mode": "parallel"
+   },
+   "definitions": [
+    {
+     "version": 1,
+     "description": "Mark a task done or not done. Vikunja checks that the caller may update the task.",
+     "kind": "request",
+     "inputSchema": {
+      "type": "object",
+      "properties": {
+       "id": {
+        "type": "integer",
+        "minimum": 1,
+        "maximum": 9007199254740991
+       },
+       "done": {
+        "type": "boolean"
+       },
+       "projectId": {
+        "type": "integer",
+        "minimum": 1
+       }
+      },
+      "additionalProperties": false,
+      "required": [
+       "id",
+       "done",
+       "projectId"
+      ]
+     },
+     "outputSchema": {
+      "type": "object",
+      "properties": {
+       "id": {
+        "type": "integer"
+       },
+       "title": {
+        "type": "string"
+       },
+       "description": {
+        "type": "string"
+       },
+       "projectId": {
+        "type": "integer"
+       },
+       "done": {
+        "type": "boolean"
+       },
+       "doneAt": {
+        "anyOf": [
+         {
+          "type": "string"
+         },
+         {
+          "type": "null"
+         }
+        ]
+       },
+       "dueDate": {
+        "anyOf": [
+         {
+          "type": "string"
+         },
+         {
+          "type": "null"
+         }
+        ]
+       },
+       "priority": {
+        "type": "integer"
+       },
+       "percentDone": {
+        "type": "number"
+       },
+       "identifier": {
+        "type": "string"
+       },
+       "createdBy": {
+        "anyOf": [
+         {
+          "type": "string"
+         },
+         {
+          "type": "null"
+         }
+        ]
+       },
+       "created": {
+        "type": "string"
+       },
+       "updated": {
+        "type": "string"
+       }
+      },
+      "additionalProperties": false,
+      "required": [
+       "id",
+       "title",
+       "description",
+       "projectId",
+       "done",
+       "doneAt",
+       "dueDate",
+       "priority",
+       "percentDone",
+       "identifier",
+       "createdBy",
+       "created",
+       "updated"
+      ]
+     },
+     "authorization": [
+      "vikunja.tasks.write"
+     ],
+     "effect": "consequential",
+     "authorizationContract": {
+      "required": true,
+      "scopes": [
+       "vikunja.tasks.write"
+      ]
+     },
+     "authorizationVersion": 1,
+     "idempotency": "unsupported",
+     "concurrency": {
+      "mode": "parallel"
+     }
+    }
+   ]
+  }
+ ],
+ "events": [],
+ "transports": [
+  {
+   "kind": "http",
+   "endpoint": "/appport"
+  }
+ ],
+ "conformance": 1,
+ "extensions": [
+  "appport.integration/1"
+ ],
+ "attributes": {
+  "appport.integration/1": {
+   "capabilities": {
+    "vikunja.projects.list@1": {
+     "purpose": "List projects visible to the caller.",
+     "authority": "urn:appport:vikunja",
+     "access": [
+      {
+       "resource": "urn:appport:vikunja:projects",
+       "mode": "reads"
+      }
+     ],
+     "approval": {
+      "required": false
+     }
+    },
+    "vikunja.tasks.setdone@1": {
+     "purpose": "Set a task's done flag.",
+     "authority": "urn:appport:vikunja",
+     "effects": [
+      {
+       "type": "urn:appport:vikunja#task-done-changed",
+       "description": "The task's done flag (and Vikunja's done_at) change."
+      }
+     ],
+     "verify": [
+      {
+       "id": "task-done-stored",
+       "kind": "state",
+       "via": {
+        "capability": "vikunja.tasks.get",
+        "version": 1,
+        "input": {
+         "id": {
+          "$input": "/id"
+         }
+        }
+       },
+       "expect": [
+        {
+         "at": "/done",
+         "equals": {
+          "$input": "/done"
+         }
+        }
+       ]
+      }
+     ],
+     "access": [
+      {
+       "resource": "urn:appport:vikunja:tasks",
+       "mode": "changes",
+       "operations": [
+        "update"
+       ]
+      }
+     ],
+     "approval": {
+      "required": false
+     },
+     "failures": [
+      {
+       "code": "FORBIDDEN",
+       "retry": "unsafe",
+       "effect": "none",
+       "description": "Vikunja refused: the caller may not update this task."
+      },
+      {
+       "code": "NOT_FOUND",
+       "retry": "unsafe",
+       "effect": "none"
+      },
+      {
+       "code": "INTERNAL_ERROR",
+       "retry": "after-verification",
+       "effect": "unknown",
+       "description": "Read the task before trying again."
+      }
+     ]
+    }
+   },
+   "resources": [
+    {
+     "id": "urn:appport:vikunja:projects",
+     "kind": "collection",
+     "owner": "self",
+     "description": "Projects stored by this Vikunja instance."
+    },
+    {
+     "id": "urn:appport:vikunja:tasks",
+     "kind": "collection",
+     "owner": "self",
+     "description": "Tasks stored by this Vikunja instance."
+    }
+   ]
+  }
+ }
+}

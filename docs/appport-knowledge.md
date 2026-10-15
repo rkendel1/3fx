@@ -148,3 +148,11 @@ The suite fails when:
 To adopt a new AppPort release, update the pins in `package.json` and
 `appport.zig`, review the reference changes, update the native port, and then
 record the new digests.
+
+## Measuring the effect
+
+`tests/appport-effectiveness/` compares baseline fx with the two AppPort
+context configurations on the same tasks, provider, and limits, and reports
+verified completion, latency, model calls, tokens, and request size from the
+same trial records. See its
+[README](../tests/appport-effectiveness/README.md).
