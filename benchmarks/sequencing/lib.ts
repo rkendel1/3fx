@@ -63,6 +63,35 @@ export const scenarios: Scenario[] = [
     } },
 ];
 
+/**
+ * Metrics fx writes to its trace log (`FX_TRACE_LOG` with the agent, tool, and
+ * context scopes). Shared by the sequencing scenarios and the AppPort
+ * effectiveness benchmark so both read one definition. `field` returns "n/a"
+ * when the last measurement event omits a key.
+ */
+export function traceMetrics(log: string[]) {
+  const at = (needle: string) => log.filter(l => l.includes(needle)).map(l => Number(l.split(" ")[0]));
+  const meas = log.filter(l => l.includes("event=measurement")).at(-1) ?? "";
+  const field = (k: string) => meas.match(new RegExp(`${k}=(\\S+)`))?.[1] ?? "n/a";
+  // Per-call purpose from successive cumulative `measurement` events (main agent calls only).
+  const cum = log.filter(l => l.includes("event=measurement")).map(l => ["calls_initial", "calls_after_tools", "calls_after_failed_tools"].map(k => Number(l.match(new RegExp(`${k}=(\\d+)`))?.[1] ?? 0)));
+  const purposes: string[] = [];
+  for (let i = 0; i < cum.length; i++) {
+    const d = cum[i].map((v, k) => v - (cum[i - 1]?.[k] ?? 0));
+    purposes.push(["initial", "after_tools", "after_failed_tools"][d.findIndex(x => x > 0)] ?? "unknown");
+  }
+  const stamp = (l: string) => Number(l.split(" ")[0]);
+  let model_ms = 0, tool_ms = 0;
+  { let admitted: number | null = null; let started: number | null = null;
+    for (const l of log) {
+      if (l.includes("event=provider_admitted")) admitted = stamp(l);
+      else if (l.includes("event=measurement") && admitted !== null) { model_ms += stamp(l) - admitted; admitted = null; }
+      else if (l.includes("event=execution_start")) started = stamp(l);
+      else if (l.includes("event=execution_result") && started !== null) { tool_ms += stamp(l) - started; started = null; }
+    } }
+  return { at, field, purposes, model_ms, tool_ms, review_sends: log.filter(l => l.includes("auto_review_send")).length, has_measurement: meas !== "" };
+}
+
 const isReview = (body: any) => body.tools?.length === 1 && body.tools[0]?.function?.name === "permission_decision";
 
 export async function runScenario(s: Scenario, opts: { env?: Record<string, string> } = {}) {
@@ -82,9 +111,8 @@ export async function runScenario(s: Scenario, opts: { env?: Record<string, stri
     const wall = Date.now() - started;
     let json: any = {}; try { json = JSON.parse(r.stdout); } catch {}
     const log = existsSync(trace) ? readFileSync(trace, "utf8").split("\n") : [];
-    const at = (needle: string) => log.filter(l => l.includes(needle)).map(l => Number(l.split(" ")[0]));
-    const meas = log.filter(l => l.includes("event=measurement")).at(-1) ?? "";
-    const field = (k: string) => meas.match(new RegExp(`${k}=(\\S+)`))?.[1] ?? "n/a";
+    const t = traceMetrics(log);
+    const at = t.at, field = t.field;
     const reviews = f.requests.filter(q => isReview(q.body)).length;
     const main = f.requests.filter(q => !isReview(q.body));
     let prefixOk = true;
@@ -98,13 +126,7 @@ export async function runScenario(s: Scenario, opts: { env?: Record<string, stri
     const part = (o: unknown) => Buffer.byteLength(JSON.stringify(o ?? null));
     const tools = first ? part(first.tools) : 0;
     const msgs = first ? part(first.messages) : 0;
-    // Per-call purpose from successive cumulative `measurement` events (main agent calls only).
-    const cum = log.filter(l => l.includes("event=measurement")).map(l => ["calls_initial", "calls_after_tools", "calls_after_failed_tools"].map(k => Number(l.match(new RegExp(`${k}=(\\d+)`))?.[1] ?? 0)));
-    const mainPurposes: string[] = [];
-    for (let i = 0; i < cum.length; i++) {
-      const d = cum[i].map((v, k) => v - (cum[i - 1]?.[k] ?? 0));
-      mainPurposes.push(["initial", "after_tools", "after_failed_tools"][d.findIndex(x => x > 0)] ?? "unknown");
-    }
+    const mainPurposes = t.purposes;
     let mi = 0;
     const requests = f.requests.map(q => {
       const review = isReview(q.body);
@@ -115,16 +137,8 @@ export async function runScenario(s: Scenario, opts: { env?: Record<string, stri
         tools_count: q.body.tools?.length ?? 0, tools_bytes: part(q.body.tools), instruction_bytes: part(sys), conversation_bytes: part(conv), at: q.at,
       };
     });
-    const sends = log.filter(l => l.includes("auto_review_send")).length;
-    const stamp = (l: string) => Number(l.split(" ")[0]);
-    let model_ms = 0, tool_ms = 0;
-    { let admitted: number | null = null; let started: number | null = null;
-      for (const l of log) {
-        if (l.includes("event=provider_admitted")) admitted = stamp(l);
-        else if (l.includes("event=measurement") && admitted !== null) { model_ms += stamp(l) - admitted; admitted = null; }
-        else if (l.includes("event=execution_start")) started = stamp(l);
-        else if (l.includes("event=execution_result") && started !== null) { tool_ms += stamp(l) - started; started = null; }
-      } }
+    const sends = t.review_sends;
+    const model_ms = t.model_ms, tool_ms = t.tool_ms;
     const evidenceFiles = (() => { try { return readdirSync(f.workspace); } catch { return [] as string[]; } })();
     const result = {
       workspace: f.workspace, tools_used: calls.map((c: any) => c.name as string), workspace_files: evidenceFiles,

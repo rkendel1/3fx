@@ -1,0 +1,64 @@
+{
+ "comment": "Where the benchmark fixtures come from. The Memos and Vikunja manifests are the AppPort bridge manifests recorded live from the real applications; they are copied unmodified. Every derived fixture names its parent and the change made.",
+ "source": {
+  "repository": "https://github.com/rkendel1/appport",
+  "commit": "59b8a43932059bcf12015e596c9e66f9f411f1b9",
+  "license": "Apache-2.0",
+  "manifests": {
+   "path": "experiments/graph-guided-discovery/results/manifests.json",
+   "sha256": "6ea607922acd642fc004eb0cbee5ccd5517af93b05f6b6f35900c046bfeaede8",
+   "entries": [
+    "memos.manifest",
+    "vikunja.manifest"
+   ]
+  },
+  "workload": {
+   "path": "experiments/capability-reuse/workload/workload.v1.mjs",
+   "sha256": "b1d448e5ebdd2618c6c21f8f40f3b652ad1bac545fc077d7fdfbc8cc4ee8d881",
+   "used_for": "behaviours, the negative cases N1 (UNSUPPORTED) and N2 (INCOMPATIBLE), and task wording"
+  },
+  "behavior_capability": {
+   "path": "experiments/capability-reuse/lib/score.mjs",
+   "sha256": "f5521da83dd3cb915541e7cf1ab6d2496f1dca5e132295266f4502a3674fdf8e",
+   "used_for": "expected capability for each behaviour"
+  }
+ },
+ "applications": {
+  "memos": {
+   "repository": "https://github.com/rkendel1/memos",
+   "revision": "c0eeec7a260ee58e2ed1514a61bfff1fa013f42e",
+   "application_id": "com.usememos.memos"
+  },
+  "vikunja": {
+   "repository": "https://github.com/rkendel1/vikunja",
+   "revision": "c86c04e175a38f71ab4bf547225647058801e20b",
+   "application_id": "io.vikunja"
+  }
+ },
+ "files": {
+  "apps/memos.manifest.json": {
+   "sha256": "f05b90e4dea2d09fa62ec58e0eb328da92bf1266305bace0d1f8a36e7cc1f76f",
+   "origin": "copied unmodified from manifests.json memos.manifest"
+  },
+  "apps/vikunja.manifest.json": {
+   "sha256": "a44e67edc71df4e9e404f69a92602a327140bbe3dbc1b77bf2f84d388217d93a",
+   "origin": "copied unmodified from manifests.json vikunja.manifest"
+  },
+  "replacement/vikunja-candidate.manifest.json": {
+   "sha256": "49712a3c48c42f108a431a69e5d1984eecdff08f37d0370730c74bf28a74a981",
+   "origin": "vikunja.manifest with vikunja.tasks.get removed (manifest and integration entry) and a new required integer input projectId on vikunja.tasks.setdone"
+  },
+  "deterministic/incomplete.manifest.json": {
+   "sha256": "6a391133620d1e8a987c85846ddeef17162f4ca680acaf8dff5b92942bf31723",
+   "origin": "memos.manifest without events and application.version"
+  },
+  "deterministic/unsupported-extension.manifest.json": {
+   "sha256": "49a22fb7fe8aa6f1860e675cdb524cadf4e1708c5426908d9645319ee0a7c1d7",
+   "origin": "memos.manifest advertising the extra extension vendor.experimental/1"
+  },
+  "deterministic/malformed.manifest.json": {
+   "sha256": "56c14e1deb3ec0618a856b9201b63f491376a1c1c9858abd1881ba83f74a101b",
+   "origin": "the first half of memos.manifest serialized with one-space indentation (truncated JSON)"
+  }
+ }
+}

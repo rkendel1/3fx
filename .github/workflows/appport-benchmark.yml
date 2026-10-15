@@ -1,0 +1,62 @@
+name: AppPort benchmark
+
+# Checks the native AppPort knowledge against the published packages and
+# checks the effectiveness benchmark's harness, configurations, and oracles.
+# Deterministic: model-driven trials use a scripted provider, and nothing here
+# asserts timing or performance. Performance conclusions come from recorded
+# benchmark runs against a real provider, not from CI.
+on:
+  pull_request:
+    paths:
+      - "src/**"
+      - "build.zig"
+      - "build.zig.zon"
+      - "tests/appport-parity/**"
+      - "tests/appport-effectiveness/**"
+      - "benchmarks/sequencing/**"
+      - "tests/e2e/fixtures/chat-completions.ts"
+      - "tests/evals/eval-helpers.ts"
+      - ".github/workflows/appport-benchmark.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  appport:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
+        with:
+          version: 0.16.0
+
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+
+      - name: Build fx
+        run: zig build
+
+      - name: AppPort parity with the published packages
+        working-directory: tests/appport-parity
+        run: |
+          bun install
+          bun test --max-concurrency 1 ./parity.test.ts
+
+      - name: Benchmark self-tests
+        working-directory: tests/appport-effectiveness
+        run: |
+          bun install
+          bun test --max-concurrency 1 ./benchmark.test.ts
+
+      - name: Deterministic tier
+        working-directory: tests/appport-effectiveness
+        run: |
+          bun run.ts --no-model --det-repetitions 5 --out results/ci
+          cat results/ci/report.md >> "$GITHUB_STEP_SUMMARY"
