@@ -475,6 +475,8 @@ pub const StatusSnapshot = struct {
     update_channel: []const u8 = "stable",
     build_channel: []const u8 = "stable",
     build_revision: []const u8 = "",
+    /// Zig optimize mode of the binary. Omitted from output when empty.
+    build_mode: []const u8 = "",
     auth: auth_runtime.StatusSnapshot = .{},
     auth_help: ?[]const u8 = null,
     mcp: ?McpLocalSnapshot = null,
@@ -509,6 +511,9 @@ pub const StatusSnapshot = struct {
         try out.writer.print("[status] build_channel={s}\n", .{self.build_channel});
         if (self.build_revision.len > 0) {
             try out.writer.print("[status] build_revision={s}\n", .{self.build_revision});
+        }
+        if (self.build_mode.len > 0) {
+            try out.writer.print("[status] build_mode={s}\n", .{self.build_mode});
         }
         if (self.mcp_config_error) |error_name| {
             try out.writer.print("[status] mcp_config_error={s}\n", .{error_name});
@@ -564,6 +569,9 @@ pub const StatusSnapshot = struct {
         try out.writer.print("build_channel={s}\n", .{self.build_channel});
         if (self.build_revision.len > 0) {
             try out.writer.print("build_revision={s}\n", .{self.build_revision});
+        }
+        if (self.build_mode.len > 0) {
+            try out.writer.print("build_mode={s}\n", .{self.build_mode});
         }
         try out.writer.print("auth={s}\n", .{self.auth.activeSourceLabel()});
         if (self.provider != .gateway) {
@@ -621,6 +629,10 @@ pub const StatusSnapshot = struct {
         try std.json.Stringify.value(self.build_channel, .{}, writer);
         try writer.writeAll(",\"build_revision\":");
         try std.json.Stringify.value(self.build_revision, .{}, writer);
+        if (self.build_mode.len > 0) {
+            try writer.writeAll(",\"build_mode\":");
+            try std.json.Stringify.value(self.build_mode, .{}, writer);
+        }
         if (self.mcp_config_error) |error_name| {
             try writer.writeAll(",\"mcp_config_error\":");
             try std.json.Stringify.value(error_name, .{}, writer);
@@ -1936,6 +1948,21 @@ test "command failure snapshot renders stable escaped json" {
         "{\"kind\":\"models\",\"error\":\"could not list \\\"models\\\"\",\"code\":\"ConnectionRefused\"}",
         rendered,
     );
+}
+
+test "status snapshot reports the build mode only when known" {
+    const known = StatusSnapshot{ .model = "alpha", .build_revision = "abc", .build_mode = "ReleaseSafe", .permission_mode = .ask, .workspace_root = "/tmp/fx", .history_turns = 0, .session_permission_grants = 0, .agent_step_limit = 0 };
+    const json = try known.renderJson(std.testing.allocator);
+    defer std.testing.allocator.free(json);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"build_revision\":\"abc\",\"build_mode\":\"ReleaseSafe\"") != null);
+    const text = try known.renderText(std.testing.allocator);
+    defer std.testing.allocator.free(text);
+    try std.testing.expect(std.mem.indexOf(u8, text, "[status] build_mode=ReleaseSafe\n") != null);
+
+    const unknown = StatusSnapshot{ .model = "alpha", .permission_mode = .ask, .workspace_root = "/tmp/fx", .history_turns = 0, .session_permission_grants = 0, .agent_step_limit = 0 };
+    const unknown_json = try unknown.renderJson(std.testing.allocator);
+    defer std.testing.allocator.free(unknown_json);
+    try std.testing.expect(std.mem.indexOf(u8, unknown_json, "build_mode") == null);
 }
 
 test "core status snapshot text and json stay stable" {

@@ -211,6 +211,8 @@ const version_usage = "usage: fx --version\n";
 pub const Config = struct {
     version: []const u8 = "",
     revision: []const u8 = "",
+    /// Zig optimize mode of this binary, reported by `fx status`.
+    build_mode: []const u8 = "",
     build_channel: update_target.Channel = .stable,
     auth_mode: credentials.AuthMode = .local,
     command_catalog: CommandCatalog,
@@ -1443,6 +1445,7 @@ fn runNonInteractiveWithDeps(
                 .channel = cfg.build_channel,
                 .version = cfg.version,
                 .revision = cfg.revision,
+                .mode = cfg.build_mode,
             }, mcp_inspection.profile_diagnostic);
             snapshot.mcp = localMcpView(&mcp_inspection);
             snapshot.provider_endpoint = startup.provider_endpoint;
@@ -2352,6 +2355,7 @@ fn statusSnapshotFromStartupWithBuild(
         .update_channel = startup.update_channel.label(),
         .build_channel = build.channel.label(),
         .build_revision = build.revision,
+        .build_mode = build.mode,
         .mcp_config_error = switch (mcp_config_diagnostic) {
             .clear, .warning => null,
             .failed => |err| @errorName(err),

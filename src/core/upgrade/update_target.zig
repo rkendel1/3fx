@@ -26,6 +26,8 @@ pub const CurrentBuild = struct {
     channel: Channel,
     version: []const u8,
     revision: []const u8,
+    /// Zig optimize mode of this binary, such as "ReleaseSafe". Empty when unknown.
+    mode: []const u8 = "",
 };
 
 pub const Target = union(Channel) {

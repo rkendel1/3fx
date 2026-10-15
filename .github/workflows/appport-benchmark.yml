@@ -53,7 +53,7 @@ jobs:
         working-directory: tests/appport-effectiveness
         run: |
           bun install
-          bun test --max-concurrency 1 ./benchmark.test.ts
+          bun test --max-concurrency 1 ./benchmark.test.ts ./runner.test.ts
 
       - name: Deterministic tier
         working-directory: tests/appport-effectiveness

@@ -69,6 +69,7 @@ export const WRONG_BUT_CONFIDENT: Record<string, unknown> = {
 export type Behaviour = "correct" | "wrong" | "no-usage" | "request-error" | "provider-unavailable";
 
 export function taskForBody(body: any): ModelTask | undefined {
+  if (!body || !Array.isArray(body.messages)) return undefined;
   const user = [...body.messages].reverse().find((m: any) => m.role === "user");
   const text = typeof user?.content === "string" ? user.content : JSON.stringify(user?.content ?? "");
   return modelTasks.find(t => text.includes(t.prompt));

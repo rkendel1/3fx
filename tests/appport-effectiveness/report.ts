@@ -8,6 +8,132 @@
 
 import type { ConfigId, DeterministicTrial, ModelTrial, SolverTrial } from "./harness";
 import { CONFIGS } from "./harness";
+import type { Preflight } from "./preflight";
+
+export type RunType = "preflight" | "smoke" | "comparison";
+/**
+ * - preflight_only: readiness was checked; no trials were requested.
+ * - deterministic_only: the model tier was disabled with --no-model.
+ * - blocked: the model tier did not start, for the recorded reason.
+ * - provider_failed: model trials ran, but none got past provider or harness failures.
+ * - incomplete: the run stopped before every scheduled trial finished.
+ * - completed: every scheduled model trial finished and was graded.
+ */
+export type RunStatus = "preflight_only" | "deterministic_only" | "blocked" | "provider_failed" | "incomplete" | "completed";
+
+export interface RunSection {
+  type: RunType;
+  status: RunStatus;
+  status_detail: string;
+  git_commit: string;
+  git_dirty: boolean;
+  benchmark_version: string;
+  fixtures_digest: string;
+  fx_binary_sha256: string;
+  fx_build_mode: string | null;
+  provider: unknown;
+  preflight_state: string | null;
+  planned: { tasks: string[]; configurations: ConfigId[]; repetitions: number; max_trials: number; note: string };
+  scheduled_trials: number;
+  completed_trials: number;
+  provider_invocations: Record<string, { trials: number; trials_with_provider_calls: number; model_calls: number; review_calls: number; trials_without_call_data: number }>;
+  skipped_configurations: { config: ConfigId; reason: string }[];
+  connectivity_failures: { count: number; by_category: Record<string, number>; first: string | null };
+  oracle: { pass: number; partial: number; fail: number; unsupported: number; failure_categories: Record<string, number> };
+  tokens: { input_available_in: number; output_available_in: number; of: number };
+  cost: { available: boolean; reason: string };
+  smoke?: { tasks: string[]; verdict: "passed" | "failed"; detail: string };
+  statistical_comparison: { suitable: boolean; reason: string };
+}
+
+const CONNECTIVITY = new Set(["fx-error", "timeout", "harness-error"]);
+
+/** Derives the run section from the trial records. */
+export function runSection(results: Results, meta: {
+  type: RunType; planned_tasks: string[]; planned_configs: ConfigId[]; repetitions: number; planned_trials: number;
+  scheduled_trials: number; finished: boolean; no_model: boolean;
+}): RunSection {
+  const env = results.environment as any;
+  const trials = results.trials;
+  const invocations: RunSection["provider_invocations"] = {};
+  for (const c of meta.planned_configs) {
+    const xs = trials.filter(t => t.config === c);
+    invocations[c] = {
+      trials: xs.length,
+      trials_with_provider_calls: xs.filter(t => (t.model_calls.value ?? 0) > 0).length,
+      model_calls: xs.reduce((a, t) => a + (t.model_calls.value ?? 0), 0),
+      review_calls: xs.reduce((a, t) => a + (t.review_calls.value ?? 0), 0),
+      trials_without_call_data: xs.filter(t => !t.model_calls.available).length,
+    };
+  }
+  const byCategory: Record<string, number> = {};
+  const failures: Record<string, number> = {};
+  for (const t of trials) {
+    if (t.failure) failures[t.failure] = (failures[t.failure] ?? 0) + 1;
+    if (t.failure && CONNECTIVITY.has(t.failure)) byCategory[t.failure] = (byCategory[t.failure] ?? 0) + 1;
+  }
+  const connectivityCount = Object.values(byCategory).reduce((a, b) => a + b, 0);
+  const firstConnectivity = trials.find(t => t.failure && CONNECTIVITY.has(t.failure));
+
+  let status: RunStatus;
+  let detail: string;
+  if (meta.type === "preflight") { status = "preflight_only"; detail = `preflight state ${results.preflight?.state ?? "unknown"}; no trials requested`; }
+  else if (meta.scheduled_trials === 0) {
+    status = meta.no_model ? "deterministic_only" : "blocked";
+    detail = results.model_tier.skipped_reason ?? "no model trials were scheduled";
+  } else if (!meta.finished || trials.length < meta.scheduled_trials) { status = "incomplete"; detail = `${trials.length} of ${meta.scheduled_trials} scheduled trials finished`; }
+  else if (trials.every(t => t.failure && CONNECTIVITY.has(t.failure))) { status = "provider_failed"; detail = `all ${trials.length} trials failed before producing a gradable result (${Object.entries(byCategory).map(([k, v]) => `${k} ${v}`).join(", ")})`; }
+  else { status = "completed"; detail = `${trials.length} of ${meta.scheduled_trials} scheduled trials finished and were graded`; }
+
+  const skipped: RunSection["skipped_configurations"] = [];
+  for (const c of ["A", "B", "C"] as ConfigId[]) {
+    if (!meta.planned_configs.includes(c)) { if (meta.type !== "preflight") skipped.push({ config: c, reason: "not requested (--configs)" }); continue; }
+    if (meta.scheduled_trials === 0) skipped.push({ config: c, reason: results.model_tier.skipped_reason ?? "model tier did not run" });
+    else if (invocations[c].trials > 0 && invocations[c].trials_with_provider_calls === 0) {
+      skipped.push({ config: c, reason: `no trial reached the provider${invocations[c].trials_without_call_data ? " (no call data recorded)" : ""}` });
+    }
+  }
+
+  let smoke: RunSection["smoke"];
+  if (meta.type === "smoke") {
+    const missing = meta.planned_configs.filter(c => !invocations[c] || invocations[c].trials_with_provider_calls === 0);
+    const ok = status === "completed" && missing.length === 0 && connectivityCount === 0;
+    smoke = {
+      tasks: meta.planned_tasks,
+      verdict: ok ? "passed" : "failed",
+      detail: ok
+        ? "every configuration invoked the provider and every trial was graded by its oracle; oracle outcomes are below"
+        : status !== "completed" ? `run ${status}: ${detail}` : missing.length ? `configurations that never reached the provider: ${missing.join(", ")}` : `${connectivityCount} trials hit provider or harness failures`,
+    };
+  }
+
+  let statistical: RunSection["statistical_comparison"];
+  if (meta.type === "preflight") statistical = { suitable: false, reason: "preflight only: no trials" };
+  else if (meta.type === "smoke") statistical = { suitable: false, reason: "smoke test: a connectivity and pipeline check, not an effectiveness comparison" };
+  else if (status !== "completed") statistical = { suitable: false, reason: `the effectiveness comparison did not complete (${status})` };
+  else if (meta.planned_configs.length < 2) statistical = { suitable: false, reason: "fewer than two configurations" };
+  else if (skipped.some(s => meta.planned_configs.includes(s.config))) statistical = { suitable: false, reason: `configurations without provider calls: ${skipped.filter(s => meta.planned_configs.includes(s.config)).map(s => s.config).join(", ")}` };
+  else statistical = { suitable: true, reason: `${meta.repetitions} repetitions of ${meta.planned_tasks.length} tasks, paired across ${meta.planned_configs.join(", ")}; small samples still yield "inconclusive" verdicts` };
+
+  const count = (o: string) => trials.filter(t => t.outcome === o).length;
+  return {
+    type: meta.type, status, status_detail: detail,
+    git_commit: env.git_commit, git_dirty: env.git_dirty, benchmark_version: results.benchmark_version, fixtures_digest: env.fixtures_digest,
+    fx_binary_sha256: env.fx_binary_sha256, fx_build_mode: env.fx_build_mode ?? null,
+    provider: env.provider ?? null, preflight_state: results.preflight?.state ?? null,
+    planned: {
+      tasks: meta.planned_tasks, configurations: meta.planned_configs, repetitions: meta.repetitions, max_trials: meta.planned_trials,
+      note: "A trial is one fx ask run and can make several model and safety-review requests.",
+    },
+    scheduled_trials: meta.scheduled_trials, completed_trials: trials.length,
+    provider_invocations: invocations, skipped_configurations: skipped,
+    connectivity_failures: { count: connectivityCount, by_category: byCategory, first: firstConnectivity ? `${firstConnectivity.task_id} ${firstConnectivity.config}: ${firstConnectivity.detail}` : null },
+    oracle: { pass: count("pass"), partial: count("partial"), fail: count("fail"), unsupported: count("unsupported"), failure_categories: failures },
+    tokens: { input_available_in: trials.filter(t => t.input_tokens.available).length, output_available_in: trials.filter(t => t.output_tokens.available).length, of: trials.length },
+    cost: { available: trials.length > 0 && trials.every(t => t.cost.available), reason: "fx does not report provider cost; no estimate is made" },
+    smoke, statistical_comparison: statistical,
+  };
+}
 
 export interface Results {
   format: "fx.appport-effectiveness-results/1";
@@ -16,6 +142,10 @@ export interface Results {
   finished_at: string;
   environment: Record<string, unknown>;
   model_tier: { ran: boolean; skipped_reason: string | null };
+  /** Run type, status, plan, invocation counts, and statistical suitability, derived from the trials. */
+  run: RunSection;
+  /** Provider readiness, checked before any model trial. Null in results written before preflights existed. */
+  preflight: Preflight | null;
   trials: ModelTrial[];
   deterministic: DeterministicTrial[];
   solvers: SolverTrial[];
@@ -169,8 +299,13 @@ export function summarize(results: Results) {
     return { task: id, runs: xs.length, passed: xs.filter(x => x.outcome === "pass").length, latency_ms: distribution(xs.map(x => x.latency_ms)), commands: xs[0].commands, model_calls: 0 };
   });
   const modelTaskIds = results.tasks.filter(t => t.category !== "deterministic").map(t => t.id);
+  const suitable = results.run?.statistical_comparison.suitable ?? true;
   return {
-    configurations: per, comparisons, interpretation,
+    run: results.run ? { type: results.run.type, status: results.run.status, status_detail: results.run.status_detail, git_commit: results.run.git_commit, git_dirty: results.run.git_dirty, statistical_comparison: results.run.statistical_comparison, smoke: results.run.smoke ?? null } : null,
+    configurations: per,
+    // Significance tests appear only for a completed comparison run.
+    comparisons: suitable ? comparisons : [],
+    interpretation: suitable ? interpretation : [],
     deterministic: {
       tasks: detTasks, runs: det.length, passed: det.filter(d => d.outcome === "pass").length, latency_ms: distribution(det.map(d => d.latency_ms)),
       inference_calls: 0,
@@ -191,19 +326,54 @@ const pct = (v: number | null) => (v === null ? "n/a" : `${v > 0 ? "+" : ""}${v}
 export function renderMarkdown(results: Results, summary: ReturnType<typeof summarize>): string {
   const out: string[] = [];
   const env = results.environment as any;
+  const run = results.run;
   out.push(`# AppPort effectiveness benchmark`, "");
+  if (run) {
+    const title: Record<RunType, string> = { preflight: "Preflight", smoke: "Smoke test", comparison: "Comparison" };
+    out.push(`**Run type:** ${title[run.type]} · **Status:** \`${run.status}\` · **Commit:** \`${run.git_commit}\`${run.git_dirty ? " (uncommitted changes)" : ""}`, "");
+    out.push(`${run.status_detail.replace(/\.+$/, "")}.`, "");
+    out.push(`**Statistical comparison:** ${run.statistical_comparison.suitable ? "suitable" : "not suitable"}: ${run.statistical_comparison.reason}.`, "");
+    if (run.smoke) out.push(`**Smoke verdict:** ${run.smoke.verdict}: ${run.smoke.detail}. A smoke test checks connectivity and the pipeline; it is not evidence that AppPort context helps or hurts.`, "");
+    if (run.type !== "preflight" && run.completed_trials === 0) out.push("**The effectiveness comparison did not run.** Deterministic results below do not answer whether AppPort context improves model-driven work.", "");
+  }
   out.push(`- Benchmark: \`${results.benchmark_version}\``);
   out.push(`- Run: ${results.started_at} to ${results.finished_at}`);
   out.push(`- fx: ${env.fx_version} (commit ${env.git_commit}${env.git_dirty ? ", uncommitted changes" : ""}; binary sha256 ${String(env.fx_binary_sha256).slice(0, 16)}…, ${env.fx_binary_bytes} bytes)`);
   out.push(`- Fixtures: ${env.fixtures_digest ? `sha256 ${env.fixtures_digest}` : "n/a"} (see fixtures/PROVENANCE.json)`);
   out.push(`- Provider: ${results.model_tier.ran ? `${env.provider?.model ?? "unknown model"} via ${env.provider?.provider_endpoint ?? env.provider?.auth ?? "unknown"} (${env.provider_kind})` : "none"}`);
   out.push(`- Limits: ${env.limits ? `${env.limits.permission}, ${env.limits.max_agent_steps} agent steps, ${env.limits.timeout_ms} ms timeout` : "n/a"}; repetitions: ${env.repetitions ?? "n/a"}; seed: ${env.seed ?? "n/a"}`);
+  out.push(`- Build mode: ${env.fx_build_mode ?? "unknown"}${env.fx_build_mode && env.fx_build_mode !== "ReleaseSafe" ? " (use a ReleaseSafe build for latency comparisons)" : ""}`);
   out.push("");
+  if (results.preflight) {
+    const p = results.preflight;
+    out.push("## Provider readiness", "");
+    out.push(`State: \`${p.state}\`. ${p.note}`, "");
+    out.push(`- Provider: ${p.provider.endpoint ?? (p.provider.auth && p.provider.auth !== "missing" ? "Vercel AI Gateway" : "none")}; auth \`${p.provider.auth ?? "unknown"}\`; model \`${p.provider.model ?? "unknown"}\` (${p.provider.model_origin ?? "origin unknown"})${p.provider.requested_model ? `, requested \`${p.provider.requested_model}\`` : ""}`);
+    out.push(`- Model check: ${p.model_check.status}: ${p.model_check.detail}`);
+    out.push(`- Endpoint check: ${p.endpoint_check.status} (${p.endpoint_check.method}): ${p.endpoint_check.detail}`);
+    out.push(`- Deterministic tier: ${p.deterministic_ready ? "can run" : "cannot run"}`);
+    for (const c of p.checks.filter(c => c.status === "fail" || c.status === "warn")) out.push(`- ${c.status} ${c.name}: ${c.detail}`);
+    out.push("");
+  }
+  if (run && run.type !== "preflight") {
+    out.push("## Run accounting", "");
+    out.push(`Planned: ${run.planned.tasks.length} tasks (${run.planned.tasks.join(", ") || "none"}) x ${run.planned.configurations.length} configurations x ${run.planned.repetitions} repetitions = at most ${run.planned.max_trials} trials. Scheduled ${run.scheduled_trials}; completed ${run.completed_trials}. ${run.planned.note}`, "");
+    if (Object.keys(run.provider_invocations).length) {
+      out.push("| Configuration | Trials | Trials that called the provider | Model calls | Review calls |");
+      out.push("|---|---|---|---|---|");
+      for (const [c, v] of Object.entries(run.provider_invocations)) out.push(`| ${c} | ${v.trials} | ${v.trials_with_provider_calls} | ${v.model_calls} | ${v.review_calls} |`);
+      out.push("");
+    }
+    if (run.skipped_configurations.length) out.push(`Skipped configurations: ${run.skipped_configurations.map(s => `${s.config} (${s.reason})`).join("; ")}.`, "");
+    out.push(`Provider and harness failures: ${run.connectivity_failures.count}${run.connectivity_failures.count ? ` (${Object.entries(run.connectivity_failures.by_category).map(([k, v]) => `${k} ${v}`).join(", ")}; first: ${run.connectivity_failures.first})` : ""}.`, "");
+    out.push(`Token counts reported for ${run.tokens.input_available_in} of ${run.tokens.of} trials. Cost: ${run.cost.available ? "provider-reported" : `unavailable; ${run.cost.reason}`}.`, "");
+  }
 
   out.push("## Model-driven tasks", "");
   if (!results.model_tier.ran) {
-    out.push(`**Skipped:** ${results.model_tier.skipped_reason}`, "", "No effectiveness or efficiency conclusion can be drawn from this run.", "");
+    out.push(`**Not run:** ${results.model_tier.skipped_reason}`, "", "No effectiveness or efficiency conclusion can be drawn from this run.", "");
   } else {
+    if (run?.type === "smoke") out.push("> **Smoke test.** One repetition of three tasks per configuration. Outcomes and metrics are descriptive; no significance test applies.", "");
     if ((results.environment as any).provider_kind === "scripted") {
       out.push("> **Harness self-test.** These trials used a scripted provider. They validate the harness and oracles and say nothing about any model.", "");
     }
@@ -239,6 +409,9 @@ export function renderMarkdown(results: Results, summary: ReturnType<typeof summ
       const m = s.metrics;
       out.push(`| ${c} | ${cell(m.latency_ms)} | ${cell(m.model_ms)} | ${cell(m.tool_ms)} | ${cell(m.model_calls)} | ${cell(m.review_calls)} | ${cell(m.input_tokens)} | ${cell(m.output_tokens)} | ${cell(m.request_bytes_total)} | ${cell(m.request_bytes_first)} | ${cell(m.appport_context_bytes)} | ${s.cost_per_verified_success ?? s.cost_note} |`);
     }
+    if (!summary.comparisons.length) {
+      out.push("", "### Paired comparisons", "", `Not computed: ${run?.statistical_comparison.reason ?? "no paired trials"}.`, "");
+    } else {
     out.push("", "### Paired comparisons", "");
     out.push("| Comparison | Pairs | Completion (A / B, only-B, only-A, p) | Latency median diff (rel.) | Model calls median diff | Input tokens median diff | Request bytes median diff (rel.) |");
     out.push("|---|---|---|---|---|---|---|");
@@ -257,6 +430,7 @@ export function renderMarkdown(results: Results, summary: ReturnType<typeof summ
     }
     out.push(summary.interpretation[0]?.causality ?? "", "");
     out.push("Fewer model calls do not imply lower latency, and a larger prompt can raise success and token use at once; each row above is reported on its own.", "");
+    }
   }
 
   out.push("## Deterministic operations", "");

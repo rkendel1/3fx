@@ -1,0 +1,163 @@
+name: AppPort benchmark (live model)
+
+# Runs the AppPort effectiveness benchmark against a real model provider.
+# Manual dispatch only: nothing here runs on push or pull request, because
+# model trials cost money. The default profile is the smoke test (9 trials);
+# the full paired comparison needs both the "comparison" profile and the
+# confirmation box.
+#
+# Provider credentials come from repository or environment secrets you add:
+#   provider=gateway:  AI_GATEWAY_API_KEY, the Vercel AI Gateway key fx reads.
+#   provider=settings: FX_BENCHMARK_SETTINGS_JSON, a complete ~/.fx/settings.json
+#                      for a custom connection whose auth reads the environment
+#                      variable FX_BENCHMARK_PROVIDER_TOKEN, plus that token as the
+#                      secret FX_BENCHMARK_PROVIDER_TOKEN.
+# Secrets reach only the steps that run fx. Artifacts are uploaded even when the
+# run fails, so blocked and failed runs stay inspectable.
+on:
+  workflow_dispatch:
+    inputs:
+      profile:
+        description: "preflight (no model requests), smoke (9 trials), or comparison (13 tasks x 3 configurations x repetitions)"
+        type: choice
+        options: [smoke, preflight, comparison]
+        default: smoke
+      repetitions:
+        description: "Comparison repetitions per task and configuration (1-20). Ignored by preflight and smoke."
+        type: string
+        default: "3"
+      model:
+        description: "Model id passed as FX_MODEL to every trial. Empty uses the provider default."
+        type: string
+        default: ""
+      provider:
+        description: "gateway uses AI_GATEWAY_API_KEY; settings uses FX_BENCHMARK_SETTINGS_JSON and FX_BENCHMARK_PROVIDER_TOKEN"
+        type: choice
+        options: [gateway, settings]
+        default: gateway
+      confirm_comparison:
+        description: "Required for the comparison profile: I accept the provider cost of the full comparison"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: appport-benchmark-live
+  cancel-in-progress: false
+
+jobs:
+  live:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    env:
+      PROFILE: ${{ inputs.profile }}
+      REPETITIONS: ${{ inputs.repetitions }}
+      MODEL: ${{ inputs.model }}
+      PROVIDER: ${{ inputs.provider }}
+      CONFIRM: ${{ inputs.confirm_comparison }}
+      OUT: ${{ github.workspace }}/tests/appport-effectiveness/results/live
+    steps:
+      - name: Validate inputs
+        run: |
+          case "$REPETITIONS" in ''|*[!0-9]*) echo "::error::repetitions must be a whole number"; exit 1;; esac
+          if [ "$REPETITIONS" -lt 1 ] || [ "$REPETITIONS" -gt 20 ]; then echo "::error::repetitions must be between 1 and 20"; exit 1; fi
+          if [ "$PROFILE" = comparison ] && [ "$CONFIRM" != true ]; then
+            echo "::error::The comparison profile runs up to $((13 * 3 * REPETITIONS)) model trials. Re-run with confirm_comparison checked."
+            exit 1
+          fi
+          case "$MODEL" in *[!A-Za-z0-9._:/@-]*) echo "::error::model contains unsupported characters"; exit 1;; esac
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
+        with:
+          version: 0.16.0
+
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+
+      - name: Build fx (ReleaseSafe)
+        run: zig build -Doptimize=ReleaseSafe
+
+      - name: AppPort parity with the published packages
+        working-directory: tests/appport-parity
+        run: |
+          bun install
+          bun test --max-concurrency 1 ./parity.test.ts
+
+      - name: Benchmark self-tests
+        working-directory: tests/appport-effectiveness
+        run: |
+          bun install
+          bun test --max-concurrency 1 ./benchmark.test.ts ./runner.test.ts
+
+      - name: Configure a custom connection
+        if: inputs.provider == 'settings'
+        env:
+          FX_BENCHMARK_SETTINGS_JSON: ${{ secrets.FX_BENCHMARK_SETTINGS_JSON }}
+        run: |
+          if [ -z "$FX_BENCHMARK_SETTINGS_JSON" ]; then echo "::error::the FX_BENCHMARK_SETTINGS_JSON secret is not set"; exit 1; fi
+          umask 077
+          mkdir -p "$HOME/.fx"
+          printf '%s' "$FX_BENCHMARK_SETTINGS_JSON" > "$HOME/.fx/settings.json"
+          echo "wrote ~/.fx/settings.json ($(wc -c < "$HOME/.fx/settings.json") bytes)"
+
+      - name: Provider readiness
+        id: preflight
+        continue-on-error: true
+        working-directory: tests/appport-effectiveness
+        env:
+          AI_GATEWAY_API_KEY: ${{ inputs.provider == 'gateway' && secrets.AI_GATEWAY_API_KEY || '' }}
+          FX_BENCHMARK_PROVIDER_TOKEN: ${{ inputs.provider == 'settings' && secrets.FX_BENCHMARK_PROVIDER_TOKEN || '' }}
+        run: bun run.ts --preflight ${MODEL:+--model "$MODEL"} --out "$OUT/preflight"
+
+      - name: Run ${{ inputs.profile }}
+        id: run
+        if: inputs.profile != 'preflight' && steps.preflight.outcome == 'success'
+        working-directory: tests/appport-effectiveness
+        env:
+          AI_GATEWAY_API_KEY: ${{ inputs.provider == 'gateway' && secrets.AI_GATEWAY_API_KEY || '' }}
+          FX_BENCHMARK_PROVIDER_TOKEN: ${{ inputs.provider == 'settings' && secrets.FX_BENCHMARK_PROVIDER_TOKEN || '' }}
+        run: |
+          if [ "$PROFILE" = smoke ]; then
+            bun run.ts --smoke ${MODEL:+--model "$MODEL"} --out "$OUT/smoke"
+          else
+            bun run.ts --repetitions "$REPETITIONS" --require-model ${MODEL:+--model "$MODEL"} --out "$OUT/comparison"
+          fi
+
+      - name: Report
+        if: always()
+        run: |
+          {
+            echo "## AppPort benchmark: ${PROFILE}"
+            if [ "${{ steps.preflight.outcome }}" != success ]; then
+              echo
+              echo "**Blocked:** the provider was not ready, so no model trials ran and no experiment was completed."
+            elif [ "$PROFILE" != preflight ] && [ "${{ steps.run.outcome }}" != success ]; then
+              echo
+              echo "**Not completed:** the ${PROFILE} run did not finish successfully. See the report and artifacts."
+            fi
+            for f in "$OUT"/*/report.md; do [ -f "$f" ] && { echo; cat "$f"; }; done
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload artifacts
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: appport-benchmark-${{ inputs.profile }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: tests/appport-effectiveness/results/live
+          if-no-files-found: warn
+          retention-days: 90
+
+      - name: Fail a blocked run
+        if: steps.preflight.outcome != 'success'
+        run: |
+          echo "::error::provider not ready; see the preflight report in the artifacts"
+          exit 1
