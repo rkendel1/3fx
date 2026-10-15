@@ -1,0 +1,10 @@
+{
+  "comment": "SHA-256 of the reference sources the native port in src/core/appport/ follows. A mismatch means the authoritative behavior may have changed: review the port, then update these digests and the pins in src/core/appport/appport.zig together.",
+  "files": {
+    "@appport/protocol/dist/integration.js": "c726f606c41e53c0c71f7a68e9b9d998b31092ad8412b359a5cc9e5c1a94a884",
+    "@appport/protocol/dist/names.js": "6e649504e92578f4063cd98776bf75c625b2fe1225955ab094122faa222349d1",
+    "@appport/protocol/dist/version.js": "b7cde4f94b21a0da421a4d5fb185dfbe2f0f8ab3b70c496a531938cb97c17caf",
+    "@appport/integration/dist/graph.js": "779a4a5ba8f34d4c532dbd43110f585ca584b67cf26f4baae7c8a9cee9ea8f53",
+    "@appport/integration/dist/select.js": "7fbc767f13d87a2d89fc4f0c50e5701bf9b6e8fae1a93410f00a309877259963"
+  }
+}

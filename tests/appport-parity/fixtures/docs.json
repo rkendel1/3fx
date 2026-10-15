@@ -1,0 +1,471 @@
+{
+ "protocol": "appport/1",
+ "application": {
+  "id": "com.example.docs",
+  "name": "Docs",
+  "version": "2.1.0",
+  "description": "Document storage"
+ },
+ "capabilities": [
+  {
+   "name": "docs.get",
+   "versions": [
+    1
+   ],
+   "latestVersion": 1,
+   "kind": "request",
+   "inputSchema": {
+    "type": "object",
+    "properties": {
+     "id": {
+      "type": "string"
+     }
+    },
+    "required": [
+     "id"
+    ]
+   },
+   "outputSchema": {
+    "type": "object"
+   },
+   "authorization": [
+    "docs.read"
+   ],
+   "effect": "observation",
+   "definitions": [
+    {
+     "version": 1,
+     "kind": "request",
+     "inputSchema": {
+      "type": "object",
+      "properties": {
+       "id": {
+        "type": "string"
+       }
+      },
+      "required": [
+       "id"
+      ]
+     },
+     "outputSchema": {
+      "type": "object"
+     },
+     "authorization": [
+      "docs.read"
+     ],
+     "effect": "observation"
+    }
+   ]
+  },
+  {
+   "name": "docs.save",
+   "versions": [
+    1,
+    2
+   ],
+   "latestVersion": 2,
+   "kind": "request",
+   "inputSchema": {
+    "type": "object",
+    "properties": {
+     "id": {
+      "type": "string"
+     }
+    },
+    "required": [
+     "id"
+    ]
+   },
+   "outputSchema": {
+    "type": "object"
+   },
+   "authorization": [
+    "docs.write"
+   ],
+   "effect": "consequential",
+   "definitions": [
+    {
+     "version": 1,
+     "kind": "request",
+     "inputSchema": {
+      "type": "object",
+      "properties": {
+       "id": {
+        "type": "string"
+       }
+      },
+      "required": [
+       "id"
+      ]
+     },
+     "outputSchema": {
+      "type": "object"
+     },
+     "authorization": [
+      "docs.write"
+     ],
+     "effect": "consequential",
+     "deprecated": true
+    },
+    {
+     "version": 2,
+     "kind": "request",
+     "inputSchema": {
+      "type": "object",
+      "properties": {
+       "id": {
+        "type": "string"
+       }
+      },
+      "required": [
+       "id"
+      ]
+     },
+     "outputSchema": {
+      "type": "object"
+     },
+     "authorization": [
+      "docs.write"
+     ],
+     "effect": "consequential",
+     "emits": [
+      "docs.saved"
+     ]
+    }
+   ]
+  },
+  {
+   "name": "docs.search",
+   "versions": [
+    1
+   ],
+   "latestVersion": 1,
+   "kind": "request",
+   "inputSchema": {
+    "type": "object",
+    "properties": {
+     "id": {
+      "type": "string"
+     }
+    },
+    "required": [
+     "id"
+    ]
+   },
+   "outputSchema": {
+    "type": "object"
+   },
+   "authorization": [
+    "docs.read"
+   ],
+   "effect": "observation",
+   "definitions": [
+    {
+     "version": 1,
+     "kind": "request",
+     "inputSchema": {
+      "type": "object",
+      "properties": {
+       "id": {
+        "type": "string"
+       }
+      },
+      "required": [
+       "id"
+      ]
+     },
+     "outputSchema": {
+      "type": "object"
+     },
+     "authorization": [
+      "docs.read"
+     ],
+     "effect": "observation"
+    }
+   ]
+  },
+  {
+   "name": "docs.watch",
+   "versions": [
+    1
+   ],
+   "latestVersion": 1,
+   "kind": "stream",
+   "inputSchema": {
+    "type": "object",
+    "properties": {
+     "id": {
+      "type": "string"
+     }
+    },
+    "required": [
+     "id"
+    ]
+   },
+   "outputSchema": {
+    "type": "object"
+   },
+   "authorization": [
+    "docs.read"
+   ],
+   "effect": "observation",
+   "definitions": [
+    {
+     "version": 1,
+     "kind": "stream",
+     "inputSchema": {
+      "type": "object",
+      "properties": {
+       "id": {
+        "type": "string"
+       }
+      },
+      "required": [
+       "id"
+      ]
+     },
+     "outputSchema": {
+      "type": "object"
+     },
+     "authorization": [
+      "docs.read"
+     ],
+     "effect": "observation"
+    }
+   ]
+  }
+ ],
+ "events": [
+  {
+   "name": "docs.saved",
+   "versions": [
+    1
+   ],
+   "latestVersion": 1,
+   "payloadSchema": {
+    "type": "object"
+   },
+   "authorization": [
+    "docs.read"
+   ],
+   "definitions": [
+    {
+     "version": 1,
+     "payloadSchema": {
+      "type": "object"
+     },
+     "authorization": [
+      "docs.read"
+     ]
+    }
+   ]
+  }
+ ],
+ "transports": [
+  {
+   "kind": "http",
+   "endpoint": "/appport"
+  }
+ ],
+ "extensions": [
+  "appport.integration/1"
+ ],
+ "attributes": {
+  "appport.integration/1": {
+   "resources": [
+    {
+     "id": "urn:example:docs:document",
+     "kind": "document",
+     "concept": "https://schema.org/DigitalDocument",
+     "owner": "self"
+    },
+    {
+     "id": "urn:example:billing:invoice",
+     "kind": "entity",
+     "owner": {
+      "application": "com.example.billing"
+     }
+    },
+    {
+     "id": "urn:example:billing:ledger",
+     "kind": "collection"
+    }
+   ],
+   "requires": [
+    {
+     "id": "audit",
+     "relationship": "consumes-event",
+     "target": {
+      "application": "com.example.audit",
+      "event": "audit.recorded"
+     },
+     "required": false
+    }
+   ],
+   "capabilities": {
+    "docs.save@2": {
+     "purpose": "Save a document",
+     "authority": "urn:example:authority:docs",
+     "effects": [
+      {
+       "type": "urn:example:effect:document-saved"
+      }
+     ],
+     "requires": [
+      {
+       "id": "read",
+       "relationship": "observes",
+       "target": {
+        "capability": "docs.get@1"
+       },
+       "required": true
+      },
+      {
+       "id": "charge",
+       "relationship": "invokes",
+       "target": {
+        "application": "com.example.billing",
+        "capability": "billing.charge"
+       },
+       "versionConstraint": "^1",
+       "required": true
+      },
+      {
+       "id": "notify",
+       "relationship": "delegates",
+       "target": {
+        "application": "com.example.mail",
+        "capability": "mail.send@1"
+       },
+       "required": false
+      },
+      {
+       "id": "legacy",
+       "relationship": "invokes",
+       "target": {
+        "application": "com.example.legacy",
+        "capability": "legacy.store"
+       },
+       "versionConstraint": ">=3",
+       "required": false
+      }
+     ],
+     "access": [
+      {
+       "resource": "urn:example:docs:document",
+       "mode": "changes",
+       "operations": [
+        "create",
+        "update"
+       ]
+      },
+      {
+       "resource": "urn:example:billing:invoice",
+       "mode": "reads"
+      },
+      {
+       "resource": "urn:example:billing:ledger",
+       "mode": "changes",
+       "operations": [
+        "create"
+       ]
+      }
+     ],
+     "coverage": {
+      "requires": "complete",
+      "access": "partial"
+     },
+     "approval": {
+      "required": true,
+      "approver": "urn:example:role:editor"
+     },
+     "preconditions": [
+      {
+       "id": "no-duplicate",
+       "via": {
+        "capability": "docs.get",
+        "version": 1,
+        "input": {
+         "id": {
+          "$input": "/id"
+         }
+        }
+       },
+       "require": "not-found"
+      }
+     ],
+     "failures": [
+      {
+       "code": "CONFLICT",
+       "retry": "unsafe",
+       "effect": "none"
+      },
+      {
+       "code": "TIMEOUT",
+       "retry": "after-verification",
+       "effect": "possible"
+      }
+     ],
+     "verify": [
+      {
+       "id": "readback",
+       "kind": "state",
+       "via": {
+        "capability": "docs.get",
+        "version": 1,
+        "input": {
+         "id": {
+          "$input": "/id"
+         }
+        }
+       },
+       "expect": [
+        {
+         "at": "/id",
+         "exists": true
+        }
+       ]
+      },
+      {
+       "id": "saved-event",
+       "kind": "event",
+       "event": "docs.saved",
+       "match": {
+        "/id": {
+         "$input": "/id"
+        }
+       },
+       "strength": "corroborating"
+      }
+     ]
+    },
+    "docs.get@1": {
+     "purpose": "Read a document",
+     "access": [
+      {
+       "resource": "urn:example:docs:document",
+       "mode": "reads"
+      }
+     ],
+     "coverage": {
+      "requires": "complete",
+      "access": "complete"
+     }
+    },
+    "docs.search@1": {
+     "requires": [
+      {
+       "id": "get",
+       "relationship": "invokes",
+       "target": {
+        "capability": "docs.get"
+       },
+       "versionConstraint": ">=1",
+       "required": true
+      }
+     ]
+    }
+   }
+  }
+ }
+}

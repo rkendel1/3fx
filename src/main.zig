@@ -4911,6 +4911,8 @@ test {
     _ = @import("builtins/mcp.zig");
     _ = @import("builtins/appboundry.zig");
     _ = @import("core/mcp/appboundry.zig");
+    _ = @import("core/appport/appport.zig");
+    _ = @import("core/cli/appport_cli.zig");
     _ = @import("builtins/modes.zig");
     _ = @import("builtins/tools.zig");
     _ = @import("tools/agent/ask_user_question.zig");
