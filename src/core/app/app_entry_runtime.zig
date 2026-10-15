@@ -68,6 +68,7 @@ const GracefulExitSigintGuard = if (host_target.is_wasm) struct {
 pub const Config = struct {
     version: []const u8 = "",
     revision: []const u8 = "",
+    build_mode: []const u8 = "",
     build_channel: update_target.Channel = .stable,
     auth_mode: credentials.AuthMode = .local,
     command_catalog: command_specs.TopLevelRegistry,
@@ -473,6 +474,7 @@ fn cliSurfaceConfig(cfg: Config) cli_surface.Config {
     return .{
         .version = cfg.version,
         .revision = cfg.revision,
+        .build_mode = cfg.build_mode,
         .build_channel = cfg.build_channel,
         .auth_mode = cfg.auth_mode,
         .command_catalog = cfg.command_catalog,

@@ -12,6 +12,7 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { FX_BIN, runFx } from "../evals/eval-helpers";
 import { traceMetrics } from "../../benchmarks/sequencing/lib";
+import { scrubSecrets } from "./preflight";
 import {
   BENCHMARK_VERSION, CONTRACTS, MANIFEST_ENV, type DeterministicTask, type FxRunner, type Grade, type ModelTask,
   taskDigest, workspaceDigest, workspaceFiles,
@@ -253,7 +254,7 @@ export async function runModelTrial(task: ModelTask, config: ConfigId, provider:
       repetition: ctx.repetition, sequence: ctx.sequence, order_in_block: ctx.order_in_block, cold: ctx.cold,
       started_at: startedAt, ended_at: endedAt,
       workspace_digest_expected: expectedDigest, workspace_digest_before: beforeDigest, clean_start: beforeDigest === expectedDigest,
-      fx_exit: r.code, fx_timed_out: r.timedOut, fx_stderr_tail: lastLines(r.stderr),
+      fx_exit: r.code, fx_timed_out: r.timedOut, fx_stderr_tail: scrubSecrets(lastLines(r.stderr), env),
       latency_ms: Math.round(r.elapsedMs),
       model_ms: measured(t.has_measurement ? t.model_ms : null, "fx trace: provider_admitted to measurement"),
       tool_ms: measured(t.has_measurement ? t.tool_ms : null, "fx trace: execution_start to execution_result"),
@@ -270,8 +271,10 @@ export async function runModelTrial(task: ModelTask, config: ConfigId, provider:
       request_bytes_first: measured(first ? Number(first) : null, "fx trace: first measurement serialized_request_bytes"),
       appport_context_bytes: contextBytes,
       inference_required: (modelCalls ?? 0) > 0,
-      answer_tail: answer.slice(-600),
-      outcome: grade.outcome, failure: grade.failure, detail: grade.detail, observed: grade.observed ?? null,
+      answer_tail: scrubSecrets(answer.slice(-600), env),
+      outcome: grade.outcome, failure: grade.failure, detail: scrubSecrets(grade.detail, env),
+      // The observed answer is model output and can repeat anything it saw, so it is scrubbed too.
+      observed: grade.observed === undefined || grade.observed === null ? null : JSON.parse(scrubSecrets(JSON.stringify(grade.observed), env)),
       independently_verified: grade.failure !== "verification-unavailable",
     };
   } finally {

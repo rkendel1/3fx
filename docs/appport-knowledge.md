@@ -156,3 +156,8 @@ context configurations on the same tasks, provider, and limits, and reports
 verified completion, latency, model calls, tokens, and request size from the
 same trial records. See its
 [README](../tests/appport-effectiveness/README.md).
+
+Check provider readiness with `bun run.ts --preflight` and run the 9-trial
+smoke test with `bun run.ts --smoke` before a full comparison. The
+**AppPort benchmark (live model)** workflow runs the same profiles on manual
+dispatch only.

@@ -4,7 +4,7 @@
   "type": "module",
   "description": "Benchmark of AppPort-aware fx against baseline fx. Development-time only; never a runtime dependency of fx.",
   "scripts": {
-    "test": "bun test --max-concurrency 1 ./benchmark.test.ts",
+    "test": "bun test --max-concurrency 1 ./benchmark.test.ts ./runner.test.ts",
     "bench": "bun ./run.ts"
   },
   "devDependencies": {
