@@ -3,6 +3,7 @@ const debug_trace = @import("../core/shared/debug_trace.zig");
 const host = @import("../core/hosts/host.zig");
 const host_target = @import("../core/hosts/target.zig");
 const io_mod = @import("../core/shared/io.zig");
+const appport = @import("../core/appport/appport.zig");
 const model_context_encoding = @import("../core/shared/model_context_encoding.zig");
 const pathing = @import("../core/workspace/pathing.zig");
 const session_runtime = @import("../core/session/session.zig");
@@ -3024,6 +3025,10 @@ test "git worktree falls back to unknown for missing invalid locked and oversize
 fn appendStatic(input: StaticContextInput, arena: Allocator, messages: *std.ArrayList(ChatMessage)) !void {
     if (input.project_context.len > 0) {
         try messages.append(arena, .{ .role = .system, .content = input.project_context });
+    }
+    // Opt-in only: without FX_APPPORT_MANIFEST the prompt is unchanged.
+    if (try appport.modelContextFromEnvironment(arena, null)) |appport_context| {
+        try messages.append(arena, .{ .role = .system, .content = appport_context });
     }
 }
 

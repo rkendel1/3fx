@@ -195,6 +195,14 @@ and loads on demand. AppBoundry keeps authentication, scopes, and execution; fx
 sends the token only to the configured host. See
 [AppBoundry capability provider](docs/appboundry-provider.md).
 
+## AppPort contracts
+
+`fx appport` inspects AppPort contracts without a model call. It checks
+structure and the dependency model, derives the declared capability graph, and
+selects capabilities by published fields. Set `FX_APPPORT_MANIFEST` to a
+comma-separated list of contract files to give the model focused contract
+context in agent runs. See [AppPort contract knowledge](docs/appport-knowledge.md).
+
 ## Connect your Slack account
 
 Run `/mcp add slack` in an fx session, or `fx mcp add slack` from your terminal.

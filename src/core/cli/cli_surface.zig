@@ -54,6 +54,7 @@ const tool_set_contract = @import("../tooling/tool_set.zig");
 const workspace_access = @import("../workspace/workspace_access.zig");
 const workspace_commands = @import("../workspace/workspace_commands.zig");
 const usage_cli_runtime = @import("usage_cli_runtime.zig");
+const appport_cli = @import("appport_cli.zig");
 
 const slack_install = @import("../slack/install.zig");
 const Allocator = std.mem.Allocator;
@@ -87,6 +88,7 @@ pub const Command = union(enum) {
     upgrade: []const [:0]const u8,
     replay: []const [:0]const u8,
     workspace: []const [:0]const u8,
+    appport: []const [:0]const u8,
     unknown: []const u8,
 };
 
@@ -585,6 +587,7 @@ pub fn parse(command_catalog: CommandCatalog, args: []const [:0]const u8) Comman
         'a' => {
             if (command_specs.matchesTopLevel(command_catalog, command, .ask)) return .{ .ask = args[1..] };
             if (command_specs.matchesTopLevel(command_catalog, command, .acp)) return .{ .acp = args[1..] };
+            if (command_specs.matchesTopLevel(command_catalog, command, .appport)) return .{ .appport = args[1..] };
         },
         'b' => if (command_specs.matchesTopLevel(command_catalog, command, .credits)) return .{ .credits = args[1..] },
         'c' => {
@@ -1580,6 +1583,21 @@ fn runNonInteractiveWithDeps(
             defer alloc.free(text);
             try writeFormattedOutput(deps, text, opts.format);
             return .handled_success;
+        },
+        .appport => |rest| {
+            var arena_state = std.heap.ArenaAllocator.init(alloc);
+            defer arena_state.deinit();
+            const arena = arena_state.allocator();
+            const plain_args = try arena.alloc([]const u8, rest.len);
+            for (rest, plain_args) |arg, *plain| plain.* = arg;
+            const result = try appport_cli.run(arena, plain_args, null);
+            if (result.stdout.len > 0) try writeStdout(deps, result.stdout);
+            if (result.stderr.len > 0) try writeStderr(deps, result.stderr);
+            return switch (result.outcome) {
+                .success => .handled_success,
+                .failure => .handled_failure,
+                .usage => .handled_failure,
+            };
         },
         .doctor => |rest| {
             const opts = parseLocalSurfaceArgs(rest) catch |err| {

@@ -1,0 +1,645 @@
+{
+ "protocol": "appport/1",
+ "application": {
+  "id": "com.example.bad",
+  "name": "Bad",
+  "version": "0.1.0"
+ },
+ "capabilities": [
+  {
+   "name": "bad.get",
+   "versions": [
+    1
+   ],
+   "latestVersion": 1,
+   "kind": "request",
+   "inputSchema": {
+    "type": "object",
+    "properties": {
+     "id": {
+      "type": "string"
+     }
+    },
+    "required": [
+     "id"
+    ]
+   },
+   "outputSchema": {
+    "type": "object"
+   },
+   "authorization": [],
+   "effect": "observation",
+   "definitions": [
+    {
+     "version": 1,
+     "kind": "request",
+     "inputSchema": {
+      "type": "object",
+      "properties": {
+       "id": {
+        "type": "string"
+       }
+      },
+      "required": [
+       "id"
+      ]
+     },
+     "outputSchema": {
+      "type": "object"
+     },
+     "authorization": [],
+     "effect": "observation"
+    }
+   ]
+  },
+  {
+   "name": "bad.put",
+   "versions": [
+    1,
+    2
+   ],
+   "latestVersion": 2,
+   "kind": "request",
+   "inputSchema": {
+    "type": "object",
+    "properties": {
+     "id": {
+      "type": "string"
+     }
+    },
+    "required": [
+     "id"
+    ]
+   },
+   "outputSchema": {
+    "type": "object"
+   },
+   "authorization": [],
+   "effect": "consequential",
+   "definitions": [
+    {
+     "version": 1,
+     "kind": "request",
+     "inputSchema": {
+      "type": "object",
+      "properties": {
+       "id": {
+        "type": "string"
+       }
+      },
+      "required": [
+       "id"
+      ]
+     },
+     "outputSchema": {
+      "type": "object"
+     },
+     "authorization": [],
+     "effect": "consequential",
+     "deprecated": true
+    },
+    {
+     "version": 2,
+     "kind": "request",
+     "inputSchema": {
+      "type": "object",
+      "properties": {
+       "id": {
+        "type": "string"
+       }
+      },
+      "required": [
+       "id"
+      ]
+     },
+     "outputSchema": {
+      "type": "object"
+     },
+     "authorization": [],
+     "effect": "consequential"
+    }
+   ]
+  },
+  {
+   "name": "bad.stream",
+   "versions": [
+    1
+   ],
+   "latestVersion": 1,
+   "kind": "stream",
+   "inputSchema": {
+    "type": "object",
+    "properties": {
+     "id": {
+      "type": "string"
+     }
+    },
+    "required": [
+     "id"
+    ]
+   },
+   "outputSchema": {
+    "type": "object"
+   },
+   "authorization": [],
+   "effect": "observation",
+   "definitions": [
+    {
+     "version": 1,
+     "kind": "stream",
+     "inputSchema": {
+      "type": "object",
+      "properties": {
+       "id": {
+        "type": "string"
+       }
+      },
+      "required": [
+       "id"
+      ]
+     },
+     "outputSchema": {
+      "type": "object"
+     },
+     "authorization": [],
+     "effect": "observation"
+    }
+   ]
+  },
+  {
+   "name": "bad.loop.a",
+   "versions": [
+    1
+   ],
+   "latestVersion": 1,
+   "kind": "request",
+   "inputSchema": {
+    "type": "object",
+    "properties": {
+     "id": {
+      "type": "string"
+     }
+    },
+    "required": [
+     "id"
+    ]
+   },
+   "outputSchema": {
+    "type": "object"
+   },
+   "authorization": [],
+   "effect": "consequential",
+   "definitions": [
+    {
+     "version": 1,
+     "kind": "request",
+     "inputSchema": {
+      "type": "object",
+      "properties": {
+       "id": {
+        "type": "string"
+       }
+      },
+      "required": [
+       "id"
+      ]
+     },
+     "outputSchema": {
+      "type": "object"
+     },
+     "authorization": [],
+     "effect": "consequential"
+    }
+   ]
+  },
+  {
+   "name": "bad.loop.b",
+   "versions": [
+    1
+   ],
+   "latestVersion": 1,
+   "kind": "request",
+   "inputSchema": {
+    "type": "object",
+    "properties": {
+     "id": {
+      "type": "string"
+     }
+    },
+    "required": [
+     "id"
+    ]
+   },
+   "outputSchema": {
+    "type": "object"
+   },
+   "authorization": [],
+   "effect": "consequential",
+   "definitions": [
+    {
+     "version": 1,
+     "kind": "request",
+     "inputSchema": {
+      "type": "object",
+      "properties": {
+       "id": {
+        "type": "string"
+       }
+      },
+      "required": [
+       "id"
+      ]
+     },
+     "outputSchema": {
+      "type": "object"
+     },
+     "authorization": [],
+     "effect": "consequential"
+    }
+   ]
+  },
+  {
+   "name": "bad.loop.c",
+   "versions": [
+    1
+   ],
+   "latestVersion": 1,
+   "kind": "request",
+   "inputSchema": {
+    "type": "object",
+    "properties": {
+     "id": {
+      "type": "string"
+     }
+    },
+    "required": [
+     "id"
+    ]
+   },
+   "outputSchema": {
+    "type": "object"
+   },
+   "authorization": [],
+   "effect": "observation",
+   "definitions": [
+    {
+     "version": 1,
+     "kind": "request",
+     "inputSchema": {
+      "type": "object",
+      "properties": {
+       "id": {
+        "type": "string"
+       }
+      },
+      "required": [
+       "id"
+      ]
+     },
+     "outputSchema": {
+      "type": "object"
+     },
+     "authorization": [],
+     "effect": "observation"
+    }
+   ]
+  }
+ ],
+ "events": [
+  {
+   "name": "bad.changed",
+   "versions": [
+    1
+   ],
+   "latestVersion": 1,
+   "payloadSchema": {},
+   "authorization": [],
+   "definitions": []
+  }
+ ],
+ "transports": [],
+ "attributes": {
+  "appport.integration/1": {
+   "resources": [
+    {
+     "id": "postgres://db/x"
+    },
+    {
+     "id": "https://user:pw@example.com/r"
+    },
+    {
+     "id": "urn:bad:doc",
+     "kind": "blob",
+     "concept": "not an iri",
+     "owner": "someone"
+    },
+    {
+     "id": "urn:bad:doc"
+    },
+    {
+     "id": "relative/path"
+    },
+    {
+     "id": "urn:bad:own",
+     "owner": {
+      "application": "com.example.bad"
+     }
+    },
+    {
+     "kind": "entity"
+    },
+    {
+     "id": "FILE:///etc/x"
+    },
+    {
+     "id": "urn:bad:emptyowner",
+     "owner": {
+      "application": ""
+     }
+    }
+   ],
+   "requires": [
+    {
+     "id": "d",
+     "relationship": "delegates",
+     "target": {
+      "capability": "bad.put@2"
+     },
+     "required": false
+    },
+    {
+     "id": "d",
+     "relationship": "invokes",
+     "target": {
+      "capability": "bad.none@1"
+     },
+     "required": false
+    }
+   ],
+   "capabilities": {
+    "bad.get@1": {
+     "requires": [
+      {
+       "relationship": "invokes",
+       "target": {
+        "capability": "bad.put@2"
+       },
+       "required": true
+      },
+      {
+       "id": "x",
+       "relationship": "calls",
+       "target": {
+        "capability": "bad.put@2"
+       },
+       "required": "yes"
+      },
+      {
+       "id": "x",
+       "relationship": "invokes",
+       "target": {
+        "capability": "bad.put@2"
+       },
+       "required": true,
+       "versionConstraint": "=2"
+      },
+      {
+       "id": "t",
+       "relationship": "invokes",
+       "required": true
+      },
+      {
+       "id": "both",
+       "relationship": "invokes",
+       "target": {
+        "capability": "bad.put@2",
+        "event": "bad.changed"
+       },
+       "required": true
+      },
+      {
+       "id": "ev",
+       "relationship": "invokes",
+       "target": {
+        "event": "bad.changed"
+       },
+       "required": false
+      },
+      {
+       "id": "ev2",
+       "relationship": "consumes-event",
+       "target": {
+        "event": "bad.unknown"
+       },
+       "required": false
+      },
+      {
+       "id": "ce",
+       "relationship": "consumes-event",
+       "target": {
+        "capability": "bad.put@2"
+       },
+       "required": false
+      },
+      {
+       "id": "ref",
+       "relationship": "invokes",
+       "target": {
+        "capability": "Bad.Put"
+       },
+       "required": true
+      },
+      {
+       "id": "unp",
+       "relationship": "invokes",
+       "target": {
+        "capability": "bad.put"
+       },
+       "required": true
+      },
+      {
+       "id": "str",
+       "relationship": "invokes",
+       "target": {
+        "capability": "bad.stream@1"
+       },
+       "required": false
+      },
+      {
+       "id": "obs",
+       "relationship": "observes",
+       "target": {
+        "capability": "bad.put@2"
+       },
+       "required": false
+      },
+      {
+       "id": "dep",
+       "relationship": "invokes",
+       "target": {
+        "capability": "bad.put@1"
+       },
+       "required": false
+      },
+      {
+       "id": "self",
+       "relationship": "observes",
+       "target": {
+        "capability": "bad.get@1"
+       },
+       "required": true
+      },
+      {
+       "id": "app",
+       "relationship": "invokes",
+       "target": {
+        "application": "",
+        "capability": "x.y@1"
+       },
+       "required": false
+      },
+      {
+       "id": "remote",
+       "relationship": "invokes",
+       "target": {
+        "application": "com.example.other",
+        "capability": "other.do"
+       },
+       "required": true
+      },
+      {
+       "id": "cons",
+       "relationship": "invokes",
+       "target": {
+        "capability": "bad.put"
+       },
+       "versionConstraint": " ~2.5 ",
+       "required": false
+      },
+      {
+       "id": "",
+       "relationship": "invokes",
+       "target": {
+        "capability": "bad.put@2"
+       },
+       "required": false
+      },
+      {
+       "id": "evt-remote",
+       "relationship": "consumes-event",
+       "target": {
+        "application": "com.example.other",
+        "event": "other.done"
+       },
+       "required": false
+      },
+      {
+       "id": "wide",
+       "relationship": "invokes",
+       "target": {
+        "capability": "bad.put"
+       },
+       "versionConstraint": "<3",
+       "required": false
+      }
+     ],
+     "access": [
+      {
+       "resource": "urn:missing",
+       "mode": "reads"
+      },
+      {
+       "resource": "urn:bad:doc",
+       "mode": "writes"
+      },
+      {
+       "resource": "urn:bad:doc",
+       "mode": "reads",
+       "operations": [
+        "update"
+       ]
+      },
+      {
+       "resource": "urn:bad:doc",
+       "mode": "changes",
+       "operations": []
+      },
+      {
+       "resource": "urn:bad:doc",
+       "mode": "changes",
+       "operations": [
+        "upsert"
+       ]
+      }
+     ],
+     "coverage": {
+      "requires": "complete",
+      "access": "most",
+      "extra": "complete"
+     }
+    },
+    "bad.put@2": {
+     "coverage": {
+      "access": "complete"
+     },
+     "requires": [
+      {
+       "id": "a",
+       "relationship": "invokes",
+       "target": {
+        "capability": "bad.loop.a@1"
+       },
+       "required": true
+      }
+     ]
+    },
+    "bad.loop.a@1": {
+     "requires": [
+      {
+       "id": "b",
+       "relationship": "invokes",
+       "target": {
+        "capability": "bad.loop.b@1"
+       },
+       "required": true
+      }
+     ]
+    },
+    "bad.loop.b@1": {
+     "requires": [
+      {
+       "id": "c",
+       "relationship": "observes",
+       "target": {
+        "capability": "bad.loop.c@1"
+       },
+       "required": true
+      }
+     ]
+    },
+    "bad.loop.c@1": {
+     "requires": [
+      {
+       "id": "a",
+       "relationship": "invokes",
+       "target": {
+        "capability": "bad.loop.a@1"
+       },
+       "required": true
+      },
+      {
+       "id": "opt",
+       "relationship": "invokes",
+       "target": {
+        "capability": "bad.put@2"
+       },
+       "required": false
+      }
+     ]
+    },
+    "bad.unknown@1": {},
+    "notakey": {}
+   }
+  }
+ }
+}

@@ -1,0 +1,182 @@
+{
+ "protocol": "appport/1",
+ "application": {
+  "id": "com.example.billing",
+  "name": "Billing",
+  "version": "1.4.0"
+ },
+ "capabilities": [
+  {
+   "name": "billing.charge",
+   "versions": [
+    1
+   ],
+   "latestVersion": 1,
+   "kind": "request",
+   "inputSchema": {
+    "type": "object",
+    "properties": {
+     "id": {
+      "type": "string"
+     }
+    },
+    "required": [
+     "id"
+    ]
+   },
+   "outputSchema": {
+    "type": "object"
+   },
+   "authorization": [
+    "billing.write"
+   ],
+   "effect": "consequential",
+   "definitions": [
+    {
+     "version": 1,
+     "kind": "request",
+     "inputSchema": {
+      "type": "object",
+      "properties": {
+       "id": {
+        "type": "string"
+       }
+      },
+      "required": [
+       "id"
+      ]
+     },
+     "outputSchema": {
+      "type": "object"
+     },
+     "authorization": [
+      "billing.write"
+     ],
+     "effect": "consequential"
+    }
+   ]
+  },
+  {
+   "name": "billing.invoice.get",
+   "versions": [
+    1
+   ],
+   "latestVersion": 1,
+   "kind": "request",
+   "inputSchema": {
+    "type": "object",
+    "properties": {
+     "id": {
+      "type": "string"
+     }
+    },
+    "required": [
+     "id"
+    ]
+   },
+   "outputSchema": {
+    "type": "object"
+   },
+   "authorization": [
+    "billing.read"
+   ],
+   "effect": "observation",
+   "definitions": [
+    {
+     "version": 1,
+     "kind": "request",
+     "inputSchema": {
+      "type": "object",
+      "properties": {
+       "id": {
+        "type": "string"
+       }
+      },
+      "required": [
+       "id"
+      ]
+     },
+     "outputSchema": {
+      "type": "object"
+     },
+     "authorization": [
+      "billing.read"
+     ],
+     "effect": "observation"
+    }
+   ]
+  }
+ ],
+ "events": [],
+ "transports": [
+  {
+   "kind": "http",
+   "endpoint": "/appport"
+  }
+ ],
+ "extensions": [
+  "appport.integration/1"
+ ],
+ "attributes": {
+  "appport.integration/1": {
+   "resources": [
+    {
+     "id": "urn:example:billing:invoice",
+     "kind": "entity",
+     "owner": "self"
+    },
+    {
+     "id": "urn:example:billing:ledger",
+     "kind": "collection",
+     "concept": "urn:example:concept:ledger",
+     "owner": "self"
+    },
+    {
+     "id": "urn:example:docs:document",
+     "concept": "urn:example:concept:attachment",
+     "owner": "self"
+    }
+   ],
+   "capabilities": {
+    "billing.charge@1": {
+     "effects": [
+      {
+       "type": "urn:example:effect:charged"
+      }
+     ],
+     "requires": [
+      {
+       "id": "doc",
+       "relationship": "invokes",
+       "target": {
+        "application": "com.example.docs",
+        "capability": "docs.save@2"
+       },
+       "required": true
+      }
+     ],
+     "access": [
+      {
+       "resource": "urn:example:billing:invoice",
+       "mode": "changes",
+       "operations": [
+        "create"
+       ]
+      },
+      {
+       "resource": "urn:example:docs:document",
+       "mode": "changes",
+       "operations": [
+        "update"
+       ]
+      }
+     ],
+     "coverage": {
+      "requires": "complete",
+      "access": "complete"
+     }
+    }
+   }
+  }
+ }
+}

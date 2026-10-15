@@ -180,6 +180,31 @@ This E2E owner is verification-only in the PGSO corpus because it covers a rare
 workspace setup operation and security boundaries. Live Slack authorization and
 message attribution are not deterministic tests.
 
+## AppPort knowledge
+
+`src/core/appport/` owns native AppPort contract knowledge. Outside code
+imports only its front door, `appport.zig`. The module ports a listed subset of
+the published `@appport/protocol` and `@appport/integration` semantics; the
+binary never loads the AppPort JavaScript packages.
+
+When you change the port, run the Zig tests, then the parity suite against the
+freshly built binary:
+
+```bash
+zig build
+cd tests/appport-parity && bun install && bun test
+cd ../e2e && bun test appport.test.ts
+```
+
+The parity suite pins exact reference versions and records digests of the
+reference sources it follows. Adopting a new AppPort release means updating
+those pins, reviewing the reference changes, updating the port, and recording
+new digests together. See [AppPort contract knowledge](docs/appport-knowledge.md).
+
+`tests/e2e/appport.test.ts` is verification-only in the PGSO corpus because it
+covers contract correctness and an opt-in prompt path rather than common
+interactive behavior.
+
 ## MCP
 
 Native fx connections use MCP v1 initialization by default over stdio,

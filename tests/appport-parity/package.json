@@ -1,0 +1,18 @@
+{
+  "name": "fx-appport-parity",
+  "private": true,
+  "type": "module",
+  "description": "Development-time parity checks between fx's native AppPort knowledge and the published AppPort packages. Never a runtime dependency of fx.",
+  "scripts": {
+    "test": "bun test --max-concurrency 1 ./parity.test.ts"
+  },
+  "devDependencies": {
+    "@appport/client": "1.1.2",
+    "@appport/core": "1.2.0",
+    "@appport/integration": "1.1.0",
+    "@appport/protocol": "1.1.0",
+    "@appport/sdk": "1.2.4",
+    "@appport/server": "1.1.2",
+    "@appport/transport-http": "1.1.2"
+  }
+}
