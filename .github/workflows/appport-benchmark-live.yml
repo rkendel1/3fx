@@ -7,7 +7,8 @@ name: AppPort benchmark (live model)
 # confirmation box.
 #
 # Provider credentials come from repository or environment secrets you add:
-#   provider=gateway:  AI_GATEWAY_API_KEY, the Vercel AI Gateway key fx reads.
+#   provider=gateway:  AI_GATEWAY_API_KEY (or AI_PLATFORM_API_KEY), the Vercel AI
+#                      Gateway key; fx reads it as AI_GATEWAY_API_KEY.
 #   provider=settings: FX_BENCHMARK_SETTINGS_JSON, a complete ~/.fx/settings.json
 #                      for a custom connection whose auth reads the environment
 #                      variable FX_BENCHMARK_PROVIDER_TOKEN, plus that token as the
@@ -114,7 +115,7 @@ jobs:
         continue-on-error: true
         working-directory: tests/appport-effectiveness
         env:
-          AI_GATEWAY_API_KEY: ${{ inputs.provider == 'gateway' && secrets.AI_GATEWAY_API_KEY || '' }}
+          AI_GATEWAY_API_KEY: ${{ inputs.provider == 'gateway' && (secrets.AI_GATEWAY_API_KEY || secrets.AI_PLATFORM_API_KEY) || '' }}
           FX_BENCHMARK_PROVIDER_TOKEN: ${{ inputs.provider == 'settings' && secrets.FX_BENCHMARK_PROVIDER_TOKEN || '' }}
         run: bun run.ts --preflight ${MODEL:+--model "$MODEL"} --out "$OUT/preflight"
 
@@ -123,7 +124,7 @@ jobs:
         if: inputs.profile != 'preflight' && steps.preflight.outcome == 'success'
         working-directory: tests/appport-effectiveness
         env:
-          AI_GATEWAY_API_KEY: ${{ inputs.provider == 'gateway' && secrets.AI_GATEWAY_API_KEY || '' }}
+          AI_GATEWAY_API_KEY: ${{ inputs.provider == 'gateway' && (secrets.AI_GATEWAY_API_KEY || secrets.AI_PLATFORM_API_KEY) || '' }}
           FX_BENCHMARK_PROVIDER_TOKEN: ${{ inputs.provider == 'settings' && secrets.FX_BENCHMARK_PROVIDER_TOKEN || '' }}
         run: |
           if [ "$PROFILE" = smoke ]; then
